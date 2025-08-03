@@ -10,7 +10,7 @@
   <pre id="output">Loading...</pre>
   <script>
     async function fetchData() {
-      const res = await fetch("/api/trade-status");
+      const res = await fetch("/api/trade_status");
       const data = await res.json();
       document.getElementById("output").textContent = JSON.stringify(data, null, 2);
     }
