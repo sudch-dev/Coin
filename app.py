@@ -65,6 +65,7 @@ def place_order(side, symbol, amount):
         "Content-Type": "application/json"
     }
     res = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=payload_json)
+    print(response.json())
     return res.status_code == 200
 
 def load_status():
