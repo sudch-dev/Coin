@@ -14,7 +14,7 @@ API_SECRET = os.getenv("API_SECRET")
 BASE_URL = "https://api.coindcx.com"
 
 def get_signature(payload):
-    return hmac.new(bytes(API_SECRET, 'utf-8'), msg=bytes(payload, 'utf-8'), digestmod=hashlib.sha256).hexdigest()
+    return hmac.new(bytes(API_SECRET, 'utf-8'), msg = bytes(json.dumps(payload), 'utf-8'), digestmod=hashlib.sha256).hexdigest()
 
 def get_balances():
     try:
