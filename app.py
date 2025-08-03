@@ -98,6 +98,9 @@ def get_trade_status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run()
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))  # fallback to 10000 locally
+    app.run(host="0.0.0.0", port=port)
     
