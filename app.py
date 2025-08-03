@@ -1,139 +1,73 @@
+from flask import Flask, jsonify, render_template, request
 import os
-import time
-import json
-import hmac
-import hashlib
 import requests
-from flask import Flask, jsonify, render_template
+import json
+import time
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET")
-BASE_URL = "https://api.coindcx.com"
-TRADE_FILE = "trade_status.json"
+TRADE_STATUS_FILE = 'trade_status.json'
+COINS = ["BTCINR", "ETHINR"]
 
-def create_signature(payload):
-    return hmac.new(
-        bytes(API_SECRET, 'utf-8'),
-        msg=bytes(payload, 'utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
-
-def get_balances():
-    try:
-        payload = str(int(time.time() * 1000))
-        signature = create_signature(payload)
-        headers = {
-            "X-AUTH-APIKEY": API_KEY,
-            "X-AUTH-SIGNATURE": signature,
-            "X-AUTH-TIMESTAMP": payload
-        }
-        res = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers)
-        data = res.json()
-        balances = {}
-        for item in data:
-            currency = item.get("currency")
-            available = item.get("available") or item.get("available_balance") or item.get("balance") or 0
-            if currency:
-                balances[currency] = float(available)
-        return balances
-    except:
-        return {}
-
-def get_price(symbol):
-    try:
-        res = requests.get(f"{BASE_URL}/exchange/ticker", params={"market": symbol})
-        return float(res.json().get("last_price", 0))
-    except:
-        return 0
-
-def place_order(side, symbol, amount):
-    payload = {
-        "market": symbol,
-        "side": side,
-        "order_type": "market_order",
-        "total_quantity": None,
-        "total_amount": str(amount)
+def get_headers():
+    return {
+        "X-AUTH-APIKEY": os.getenv("API_KEY"),
+        "X-AUTH-SECRET": os.getenv("API_SECRET")
     }
-    payload_json = json.dumps(payload, separators=(',', ':'))
-    signature = create_signature(payload_json)
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature,
-        "X-AUTH-TIMESTAMP": str(int(time.time() * 1000)),
-        "Content-Type": "application/json"
-    }
-    res = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=payload_json)
-    print(response.json())
-    return res.status_code == 200
 
-def load_status():
-    if os.path.exists(TRADE_FILE):
-        with open(TRADE_FILE, "r") as f:
-            return json.load(f)
-    return []
+def get_balance():
+    url = "https://api.coindcx.com/exchange/v1/users/balances"
+    response = requests.get(url, headers=get_headers())
+    if response.status_code == 200:
+        balances = response.json()
+        return {item["currency"]: float(item["balance"]) for item in balances}
+    return {}
 
-def save_status(data):
-    with open(TRADE_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def get_latest_price(coin_symbol):
+    url = f"https://api.coindcx.com/market_data/current_price/{coin_symbol}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return float(response.json().get("price", 0))
+    return 0
 
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-@app.route("/api/trade-status")
-def trade_status():
-    balances = get_balances()
-    inr = balances.get("INR", 0)
-    status = load_status()
-
-    updated_status = []
-    for coin in ["BTCINR", "ETHINR"]:
-        coin_symbol = coin.replace("INR", "")
-        price = get_price(coin)
-        coin_bal = balances.get(coin_symbol, 0)
-
-        record = next((x for x in status if x["coin"] == coin), {
+def update_trade_status_file():
+    balances = get_balance()
+    data = []
+    for coin in COINS:
+        inr_balance = balances.get("INR", 0)
+        coin_balance = balances.get(coin.replace("INR", ""), 0)
+        price = get_latest_price(coin)
+        data.append({
             "coin": coin,
-            "coin_balance": 0,
-            "inr_balance": 0,
-            "price": 0,
+            "coin_balance": coin_balance,
+            "decision": "",
+            "inr_balance": inr_balance,
             "last_action": "",
             "last_buy_price": 0,
-            "decision": ""
+            "price": price
         })
+    with open(TRADE_STATUS_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
 
-        action = ""
-        if coin_bal == 0 and inr > 100:
-            buy_amt = round(0.3 * inr, 2)
-            if place_order("buy", coin, buy_amt):
-                action = "BUY"
-                record["last_buy_price"] = price
-        elif coin_bal > 0 and record.get("last_buy_price", 0) > 0:
-            gain = (price - record["last_buy_price"]) / record["last_buy_price"]
-            if gain >= 0.02:
-                sell_amt = round(price * coin_bal, 2)
-                if place_order("sell", coin, sell_amt):
-                    action = "SELL"
-                    record["last_buy_price"] = 0
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-        record.update({
-            "coin_balance": coin_bal,
-            "inr_balance": inr,
-            "price": price,
-            "last_action": action or record.get("last_action", ""),
-            "decision": action
-        })
-        updated_status.append(record)
+@app.route('/api/fetch-data', methods=['GET'])
+def fetch_data():
+    try:
+        update_trade_status_file()
+        return jsonify({'status': 'success', 'message': 'Data fetched and updated'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
-    save_status(updated_status)
-    return jsonify(updated_status)
+@app.route('/api/trade-status', methods=['GET'])
+def trade_status():
+    if not Path(TRADE_STATUS_FILE).exists():
+        return jsonify([])
+    with open(TRADE_STATUS_FILE, 'r') as f:
+        return jsonify(json.load(f))
 
-@app.route("/ping")
-def ping():
-    return "pong", 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
