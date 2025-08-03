@@ -4,6 +4,7 @@ import requests
 import json
 import time
 from pathlib import Path
+TRADE_STATUS_FILE = "trade_status.json"
 
 app = Flask(__name__)
 
