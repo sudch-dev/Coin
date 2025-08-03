@@ -1,14 +1,21 @@
-
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Trade Dashboard</title>
-    <link rel="stylesheet" href="/static/style.css">
+  <title>CoinDCX AutoTrader</title>
+  <style>body { font-family: Arial; padding: 20px; } pre { background: #eee; padding: 10px; }</style>
 </head>
 <body>
-    <h2>📊 CoinDCX Trade Status</h2>
-    <button onclick="fetchData()">🔄 Refresh</button>
-    <pre id="output">Loading...</pre>
-    <script src="/static/script.js"></script>
+  <h2>📈 Auto-Trading Dashboard</h2>
+  <button onclick="fetchData()">🔄 Refresh</button>
+  <pre id="output">Loading...</pre>
+  <script>
+    async function fetchData() {
+      const res = await fetch("/api/trade-status");
+      const data = await res.json();
+      document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+    }
+    fetchData();
+    setInterval(() => fetch('/ping'), 30000);
+  </script>
 </body>
 </html>
