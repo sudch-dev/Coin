@@ -70,6 +70,19 @@ def trade_status():
     with open(TRADE_STATUS_FILE, 'r') as f:
         return jsonify(json.load(f))
 
+@app.route('/ping')
+def ping():
+    return 'pong', 200
+
+def self_ping():
+    while True:
+        try:
+            requests.get("https://coin-4k37.onrender.com/ping")
+        except Exception as e:
+            print("Ping failed:", e)
+        time.sleep(30)
+
 if __name__ == '__main__':
+    threading.Thread(target=self_ping, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
