@@ -1,83 +1,55 @@
+import os
+import time
+import hashlib
+import hmac
+import json
+import requests
 
+# Base URL for authenticated API calls
+BASE_URL = "https://api.coindcx.com"  #
 
-from flask import Flask, request, jsonify, render_template
-import os, time, requests
-from datetime import datetime
-from pathlib import Path
+# Access API key and secret from environment variables
+api_key = os.environ.get("API_KEY")
+api_secret = os.environ.get("API_SECRET")
 
-app = Flask(__name__)
-COINS = ["BTCINR", "ETHINR"]
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+# Example: Get User's Wallet Balance (an authenticated endpoint)
+#
 
+def get_wallet_balance():
+    # Payload for the request (timestamp is crucial for security)
+    payload = {
+        "timestamp": int(time.time() * 1000)
+    }
+    json_payload = json.dumps(payload)
 
-import time, json, hmac, hashlib, os
-
-def get_headers(payload={}):
-    body = json.dumps(payload, separators=(',', ':'))
-    signature = hmac.new(
-        bytes(os.getenv('API_SECRET'), 'utf-8'),
-        msg=bytes(body, 'utf-8'),
-        digestmod=hashlib.sha256
-    ).hexdigest()
+    # Generate signature
+    signature = hmac.new(api_secret.encode('utf-8'), json_payload.encode('utf-8'), hashlib.sha256).hexdach('utf-8')
 
     headers = {
-        'X-AUTH-APIKEY': os.getenv('API_KEY'),
-        'X-AUTH-SIGNATURE': signature,
-        'Content-Type': 'application/json'
+        "X-AUTH-APIKEY": api_key,
+        "X-AUTH-SIGNATURE": signature,
+        "Content-Type": "application/json"
     }
-    return headers
 
-def get_price(coin):
-    url = f"https://public.coindcx.com/market_data/price_by_symbol?symbol={coin}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return float(response.json().get("price", 0))
-    return 0
+    try:
+        response = requests.post(f"{BASE_URL}/exchange/v1/users/me/accounts/balances", headers=headers, data=json_payload)
 
-def get_balances():
-    url = "https://api.coindcx.com/exchange/v1/users/balances"
-    response = requests.post(url, headers=get_headers())
-    if response.status_code == 200:
-        data = response.json()
-        return { item['currency']: float(item['balance']) for item in data }
-    return {}
+        # Check for successful response
+        response.raise_for_status()
 
-@app.route("/")
-def index():
-    return render_template("index.html", coins=COINS)
-
-@app.route("/api/init", methods=["POST"])
-def init_token():
-    token = generate_token()
-    return jsonify({"token": token} if token else {"error": "Token generation failed"})
-
-@app.route("/api/fetch", methods=["GET"])
-def fetch_data():
-    coin = request.args.get("coin", "BTCINR")
-    price = get_price(coin)
-    balances = get_balances()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    trend = "UP" if price % 2 == 0 else "DOWN"  # Dummy trend logic
-    return jsonify({
-        "coin": coin,
-        "price": price,
-        "timestamp": now,
-        "trend": trend,
-        "inr": balances.get("INR", 0),
-        "coin_balance": balances.get(coin.replace("INR", ""), 0)
-    })
-
-@app.route("/api/buy-strategy", methods=["POST"])
-def buy_strategy():
-    data = request.json
-    return jsonify({"status": "Buy order logic placeholder", "data": data})
-
-@app.route("/api/sell-strategy", methods=["POST"])
-def sell_strategy():
-    data = request.json
-    return jsonify({"status": "Sell order logic placeholder", "data": data})
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching wallet balance: {e}")
+        return None
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    if not api_key or not api_secret:
+        print("Error: API_KEY or API_SECRET not set in environment variables.")
+    else:
+        balances = get_wallet_balance()
+        if balances:
+            print("Wallet Balances:")
+            for balance in balances:
+                print(f"  {balance['currency']}: {balance['balance']}")
+
 
