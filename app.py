@@ -1,3 +1,4 @@
+
 import os
 import time
 import hashlib
@@ -10,40 +11,25 @@ BASE_URL = "https://api.coindcx.com"
 
 # Access API key and secret from environment variables
 api_key = os.environ.get("API_KEY")
-api_secret = os.environ.get("API_SECRET")
+api_secret = os.environ.get("API_SECRET").encode()  # Must be bytes for HMAC
 
 def get_wallet_balance():
-    # Step 1: Generate timestamp
-    timestamp = str(int(time.time() * 1000))
+    payload = {
+        "timestamp": int(time.time() * 1000)
+    }
+    json_payload = json.dumps(payload)
 
-    # Step 2: Payload string for HMAC signature (must be a string, not JSON)
-    payload = f"timestamp={timestamp}"
+    # Generate signature using HMAC SHA256
+    signature = hmac.new(api_secret, json_payload.encode(), hashlib.sha256).hexdigest()
 
-    # Step 3: Generate HMAC SHA256 signature
-    signature = hmac.new(
-        api_secret.encode(),  # convert secret to bytes
-        payload.encode(),     # encode payload
-        hashlib.sha256
-    ).hexdigest()
-
-    # Step 4: Set headers
     headers = {
         "X-AUTH-APIKEY": api_key,
         "X-AUTH-SIGNATURE": signature,
         "Content-Type": "application/json"
     }
 
-    # Step 5: Actual request body as JSON (with timestamp only)
-    body = {
-        "timestamp": int(timestamp)
-    }
-
     try:
-        response = requests.post(
-            f"{BASE_URL}/exchange/v1/users/me/accounts/balances",
-            headers=headers,
-            data=json.dumps(body)
-        )
+        response = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=json_payload)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
