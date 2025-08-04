@@ -23,7 +23,7 @@ def get_wallet_balance():
     json_payload = json.dumps(payload)
 
     # Generate signature
-    signature = hmac.new(api_secret.encode('utf-8'), json_payload.encode('utf-8'), hashlib.sha256).hexdach('utf-8')
+    signature = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
 
     headers = {
         "X-AUTH-APIKEY": api_key,
