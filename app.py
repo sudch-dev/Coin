@@ -19,7 +19,7 @@ def get_headers():
     }
 
 def get_balance():
-    url = "https://api.coindcx.com/exchange/v1/users/balances"
+    url = "https://public.coindcx.com/exchange/v1/users/balances"
     response = requests.get(url, headers=get_headers())
     if response.status_code == 200:
         balances = response.json()
@@ -27,7 +27,7 @@ def get_balance():
     return {}
 
 def get_latest_price(coin_symbol):
-    url = f"https://api.coindcx.com/market_data/current_price/{coin_symbol}"
+    url = f"https://public.coindcx.com/market_data/current_price/{coin_symbol}"
     response = requests.get(url)
     if response.status_code == 200:
         return float(response.json().get("price", 0))
