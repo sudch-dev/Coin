@@ -11,6 +11,7 @@ BASE_URL = "https://api.coindcx.com"  #
 # Access API key and secret from environment variables
 api_key = os.environ.get("API_KEY")
 api_secret = os.environ.get("API_SECRET")
+secret = os.environ.get("API_SECRET").encode()
 
 # Example: Get User's Wallet Balance (an authenticated endpoint)
 #
