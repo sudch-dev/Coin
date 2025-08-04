@@ -9,7 +9,7 @@ app = Flask(__name__)
 COINS = ["BTCINR", "ETHINR"]
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-TOKEN_URL = "https://api.coindcx.com/auth/authorize"
+
 
 import time, json, hmac, hashlib, os
 
