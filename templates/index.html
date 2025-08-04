@@ -1,21 +1,74 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>CoinDCX AutoTrader</title>
-  <style>body { font-family: Arial; padding: 20px; } pre { background: #eee; padding: 10px; }</style>
+  <title>CoinDCX Strategy</title>
 </head>
 <body>
-  <h2>📈 Auto-Trading Dashboard</h2>
-  <button onclick="fetchData()">🔄 Refresh</button>
-  <pre id="output">Loading...</pre>
-  <script>
-    async function fetchData() {
-      const res = await fetch("/api/trade_status");
-      const data = await res.json();
-      document.getElementById("output").textContent = JSON.stringify(data, null, 2);
-    }
-    fetchData();
-    setInterval(() => fetch('/ping'), 30000);
-  </script>
+  <h2>CoinDCX Trading App</h2>
+  <label>Select Coin:
+    <select id="coin">
+      <option value="BTCINR">BTCINR</option>
+      <option value="ETHINR">ETHINR</option>
+    </select>
+  </label>
+  <br/><br/>
+  <button onclick="initToken()">🔐 Init Token</button>
+  <button onclick="fetchData()">📈 Fetch Data</button>
+  <p id="info"></p>
+
+  <h3>Strategy</h3>
+  Hold Amount: <input id="hold" /> <br/>
+  Target Price: <input id="target" /> <br/>
+  Stop Loss: <input id="sl" /> <br/>
+  <button onclick="buy()">Buy Strategy</button>
+  <button onclick="sell()">Sell Strategy</button>
+
+<script>
+function initToken() {
+  fetch("/api/init", {method: "POST"})
+    .then(r => r.json()).then(d => alert("Token: " + (d.token || d.error)))
+}
+
+function fetchData() {
+  const coin = document.getElementById("coin").value;
+  fetch(`/api/fetch?coin=${coin}`)
+    .then(r => r.json()).then(d => {
+      document.getElementById("info").innerText = `
+        Price: ₹${d.price}, Trend: ${d.trend}, Time: ${d.timestamp}
+        INR: ₹${d.inr}, ${coin.replace("INR","")}: ${d.coin_balance}
+      `;
+    });
+}
+
+function buy() {
+  fetch("/api/buy-strategy", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      coin: document.getElementById("coin").value,
+      hold: document.getElementById("hold").value,
+      target: document.getElementById("target").value,
+      sl: document.getElementById("sl").value
+    })
+  }).then(r => r.json()).then(d => alert(d.status));
+}
+
+function sell() {
+  fetch("/api/sell-strategy", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      coin: document.getElementById("coin").value,
+      hold: document.getElementById("hold").value,
+      target: document.getElementById("target").value,
+      sl: document.getElementById("sl").value
+    })
+  }).then(r => r.json()).then(d => alert(d.status));
+}
+</script>
 </body>
 </html>
