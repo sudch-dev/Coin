@@ -59,10 +59,14 @@ def index():
 @app.route('/api/fetch-data', methods=['GET'])
 def fetch_data():
     try:
+        print("API Key:", os.getenv("API_KEY"))  # Debug
+        print("API Secret:", os.getenv("API_SECRET"))  # Debug
+
         update_trade_status_file()
         return jsonify({'status': 'success', 'message': 'Data fetched and updated'})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        print("Exception:", str(e))  # Debug
+        return jsonify({'status': 'error', 'message': str(e)})
 
 @app.route('/api/trade-status', methods=['GET'])
 def trade_status():
