@@ -1,74 +1,29 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>CoinDCX Strategy</title>
+    <meta charset="UTF-8">
+    <title>CoinDCX Wallet Balance</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; background: #f4f4f4; }
+        h1 { color: #333; }
+        table { border-collapse: collapse; width: 100%; background: #fff; }
+        th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+        th { background-color: #333; color: white; }
+    </style>
 </head>
 <body>
-  <h2>CoinDCX Trading App</h2>
-  <label>Select Coin:
-    <select id="coin">
-      <option value="BTCINR">BTCINR</option>
-      <option value="ETHINR">ETHINR</option>
-    </select>
-  </label>
-  <br/><br/>
-  <button onclick="initToken()">🔐 Init Token</button>
-  <button onclick="fetchData()">📈 Fetch Data</button>
-  <p id="info"></p>
-
-  <h3>Strategy</h3>
-  Hold Amount: <input id="hold" /> <br/>
-  Target Price: <input id="target" /> <br/>
-  Stop Loss: <input id="sl" /> <br/>
-  <button onclick="buy()">Buy Strategy</button>
-  <button onclick="sell()">Sell Strategy</button>
-
-<script>
-function initToken() {
-  fetch("/api/init", {method: "POST"})
-    .then(r => r.json()).then(d => alert("Token: " + (d.token || d.error)))
-}
-
-function fetchData() {
-  const coin = document.getElementById("coin").value;
-  fetch(`/api/fetch?coin=${coin}`)
-    .then(r => r.json()).then(d => {
-      document.getElementById("info").innerText = `
-        Price: ₹${d.price}, Trend: ${d.trend}, Time: ${d.timestamp}
-        INR: ₹${d.inr}, ${coin.replace("INR","")}: ${d.coin_balance}
-      `;
-    });
-}
-
-function buy() {
-  fetch("/api/buy-strategy", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      coin: document.getElementById("coin").value,
-      hold: document.getElementById("hold").value,
-      target: document.getElementById("target").value,
-      sl: document.getElementById("sl").value
-    })
-  }).then(r => r.json()).then(d => alert(d.status));
-}
-
-function sell() {
-  fetch("/api/sell-strategy", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      coin: document.getElementById("coin").value,
-      hold: document.getElementById("hold").value,
-      target: document.getElementById("target").value,
-      sl: document.getElementById("sl").value
-    })
-  }).then(r => r.json()).then(d => alert(d.status));
-}
-</script>
+    <h1>CoinDCX Wallet Balance</h1>
+    <table>
+        <tr>
+            <th>Currency</th>
+            <th>Balance</th>
+        </tr>
+        {% for entry in balances %}
+        <tr>
+            <td>{{ entry.currency }}</td>
+            <td>{{ entry.balance }}</td>
+        </tr>
+        {% endfor %}
+    </table>
 </body>
 </html>
