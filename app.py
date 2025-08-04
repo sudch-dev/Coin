@@ -11,23 +11,22 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 TOKEN_URL = "https://api.coindcx.com/auth/authorize"
 
-def generate_token():
-    payload = {
-        "api_key": API_KEY,
-        "api_secret": API_SECRET
-    }
-    response = requests.post(TOKEN_URL, json=payload)
-    if response.status_code == 200:
-        token = response.json().get("access_token")
-        os.environ["API_TOKEN"] = token
-        return token
-    return None
+import time, json, hmac, hashlib, os
 
-def get_headers():
-    return {
-        "Authorization": f"Bearer {os.getenv('API_TOKEN')}",
-        "Content-Type": "application/json"
+def get_headers(payload={}):
+    body = json.dumps(payload, separators=(',', ':'))
+    signature = hmac.new(
+        bytes(os.getenv('API_SECRET'), 'utf-8'),
+        msg=bytes(body, 'utf-8'),
+        digestmod=hashlib.sha256
+    ).hexdigest()
+
+    headers = {
+        'X-AUTH-APIKEY': os.getenv('API_KEY'),
+        'X-AUTH-SIGNATURE': signature,
+        'Content-Type': 'application/json'
     }
+    return headers
 
 def get_price(coin):
     url = f"https://public.coindcx.com/market_data/price_by_symbol?symbol={coin}"
