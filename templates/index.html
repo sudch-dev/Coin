@@ -1,29 +1,33 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>CoinDCX Wallet Balance</title>
-    <style>
-        body { font-family: Arial, sans-serif; padding: 20px; background: #f4f4f4; }
-        h1 { color: #333; }
-        table { border-collapse: collapse; width: 100%; background: #fff; }
-        th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
-        th { background-color: #333; color: white; }
-    </style>
+    <title>CoinDCX Real Trader</title>
 </head>
 <body>
-    <h1>CoinDCX Wallet Balance</h1>
-    <table>
-        <tr>
-            <th>Currency</th>
-            <th>Balance</th>
-        </tr>
-        {% for entry in balances %}
-        <tr>
-            <td>{{ entry.currency }}</td>
-            <td>{{ entry.balance }}</td>
-        </tr>
+    <h2>Live CoinDCX Wallet & Trader</h2>
+    <p><strong>Market:</strong> BTCINR</p>
+    <p><strong>Current Price:</strong> ₹{{ price }}</p>
+    <p><strong>Trend Prediction:</strong> {{ trend }}</p>
+
+    <h3>Wallet Balances</h3>
+    <ul>
+        {% for b in balances %}
+            <li>{{ b.currency }}: {{ b.balance }}</li>
         {% endfor %}
-    </table>
+    </ul>
+
+    <h3>Place Order</h3>
+    <form method="POST">
+        Quantity: <input name="quantity" type="number" step="0.0001" required><br>
+        Target Price: <input name="target" type="number" step="0.01" required><br>
+        Stop Loss: <input name="sl" type="number" step="0.01" required><br>
+        <button name="action" value="buy">Buy</button>
+        <button name="action" value="sell">Sell</button>
+    </form>
+
+    {% if result %}
+    <h4>Order Result:</h4>
+    <pre>{{ result }}</pre>
+    {% endif %}
 </body>
 </html>
