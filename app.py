@@ -1,90 +1,127 @@
 import os
 import time
-import hashlib
-import hmac
 import json
-from flask import Flask, render_template, request, redirect, url_for
+import hmac
+import hashlib
 import requests
+from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
-BASE_URL = "https://api.coindcx.com"
+PORT = 10000
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
+BASE_URL = "https://api.coindcx.com"
+CANDLE_URL = "https://public.coindcx.com/market_data/candles"
 
-def generate_signature(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+COINS = [
+    "BTCINR", "ETHINR", "XRPINR", "DOGEINR", "SHIBINR",
+    "TRXINR", "LTCINR", "BCHINR", "ADAINR", "MATICINR"
+]
 
-def get_wallet_balance():
-    payload = json.dumps({"timestamp": int(time.time() * 1000)})
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": generate_signature(payload),
-        "Content-Type": "application/json"
-    }
-    try:
-        res = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload)
-        return res.json()
-    except Exception as e:
-        return []
-
-def get_current_price(symbol):
-    try:
-        response = requests.get(f"https://api.coindcx.com/exchange/ticker")
-        data = response.json()
-        for item in data:
-            if item['market'] == symbol:
-                return float(item['last_price'])
-    except:
-        return 0.0
-
-def predict_trend(price):
-    # Simple OB dummy logic — enhance later
-    return "UP" if price % 2 < 1 else "DOWN"
-
-def place_order(market, side, price, quantity):
-    payload_dict = {
-        "market": market,
-        "total_quantity": quantity,
-        "price_per_unit": price,
-        "order_type": "limit_order",
-        "side": side,
-        "timestamp": int(time.time() * 1000)
-    }
-    payload = json.dumps(payload_dict)
-    signature = generate_signature(payload)
-
+def get_balances():
+    payload = {"timestamp": int(time.time() * 1000)}
+    body = json.dumps(payload)
+    signature = hmac.new(API_SECRET, body.encode(), hashlib.sha256).hexdigest()
     headers = {
         "X-AUTH-APIKEY": API_KEY,
         "X-AUTH-SIGNATURE": signature,
         "Content-Type": "application/json"
     }
     try:
-        response = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=payload)
-        return response.json()
-    except Exception as e:
-        return {"error": str(e)}
+        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=body)
+        data = r.json()
+        return {item['currency']: float(item['balance']) for item in data}
+    except:
+        return {}
 
-@app.route("/", methods=["GET", "POST"])
+def fetch_candles(symbol, interval="15m", limit=40):
+    url = f"{CANDLE_URL}?pair={symbol}&interval={interval}&limit={limit}"
+    try:
+        r = requests.get(url)
+        return r.json()
+    except:
+        return []
+
+def detect_ob_smc(candles):
+    # SMC-style OB: Find last big bearish or bullish candle and confirm break/retest
+    bullish_ob = None
+    bearish_ob = None
+    reason = "No OB found"
+    trend = "SIDEWAYS"
+    n = len(candles)
+    # --- Find last bullish OB (down candle before big up move) ---
+    for i in range(n-3, 3, -1):
+        o = float(candles[i][1])
+        h = float(candles[i][2])
+        l = float(candles[i][3])
+        c = float(candles[i][4])
+        v = float(candles[i][5])
+        next_c = float(candles[i+1][4])
+        if c < o and next_c > o and (o-c)/o > 0.004:
+            # Down candle, next closes above open = OB
+            bullish_ob = {"idx": i, "open": o, "low": l, "high": h, "vol": v}
+            break
+    # --- Find last bearish OB (up candle before big drop) ---
+    for i in range(n-3, 3, -1):
+        o = float(candles[i][1])
+        h = float(candles[i][2])
+        l = float(candles[i][3])
+        c = float(candles[i][4])
+        v = float(candles[i][5])
+        next_c = float(candles[i+1][4])
+        if c > o and next_c < o and (c-o)/o > 0.004:
+            bearish_ob = {"idx": i, "open": o, "high": h, "low": l, "vol": v}
+            break
+    last_close = float(candles[-1][4])
+    last_vol = float(candles[-1][5])
+    # --- Confirm mitigation and volume ---
+    if bullish_ob:
+        # If price touches OB zone and bounces, with above avg vol, call UP
+        for i in range(bullish_ob["idx"], n):
+            low = float(candles[i][3])
+            close = float(candles[i][4])
+            vol = float(candles[i][5])
+            if bullish_ob["low"] <= low <= bullish_ob["open"]:
+                if close > bullish_ob["open"] and vol > bullish_ob["vol"]:
+                    trend = "UP"
+                    reason = "Bullish OB zone mitigated & volume up"
+                    break
+    if trend == "SIDEWAYS" and bearish_ob:
+        for i in range(bearish_ob["idx"], n):
+            high = float(candles[i][2])
+            close = float(candles[i][4])
+            vol = float(candles[i][5])
+            if bearish_ob["open"] <= high <= bearish_ob["high"]:
+                if close < bearish_ob["open"] and vol > bearish_ob["vol"]:
+                    trend = "DOWN"
+                    reason = "Bearish OB zone mitigated & volume up"
+                    break
+    return trend, reason
+
+@app.route("/")
 def index():
-    market = "BTCINR"
-    price = get_current_price(market)
-    trend = predict_trend(price)
-    balances = get_wallet_balance()
+    return render_template("index.html", coins=COINS)
 
-    if request.method == "POST":
-        action = request.form.get("action")
-        qty = float(request.form.get("quantity"))
-        target = float(request.form.get("target"))
-        sl = float(request.form.get("sl"))
-        if action == "buy":
-            result = place_order(market, "buy", price, qty)
-        else:
-            result = place_order(market, "sell", price, qty)
-        return render_template("index.html", balances=balances, price=price, trend=trend, result=result)
+@app.route("/api/ob_predict", methods=["POST"])
+def ob_predict():
+    symbol = request.json.get("symbol", "BTCINR")
+    candles = fetch_candles(symbol)
+    if not candles or len(candles) < 10:
+        return jsonify({"trend": "N/A", "reason": "No candle data"})
+    trend, reason = detect_ob_smc(candles)
+    last = candles[-1]
+    return jsonify({
+        "trend": trend,
+        "reason": reason,
+        "price": float(last[4]),
+        "time": time.strftime('%Y-%m-%d %H:%M', time.localtime(last[0]/1000))
+    })
 
-    return render_template("index.html", balances=balances, price=price, trend=trend, result=None)
+@app.route("/api/balance", methods=["POST"])
+def api_balance():
+    balances = get_balances()
+    return jsonify(balances)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
