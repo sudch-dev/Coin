@@ -1,59 +1,63 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Lux Algo SMC OB Trader</title>
-    <script>
-        async function fetchOB() {
-            let coin = document.getElementById("coin").value;
-            let res = await fetch("/api/ob_predict", {
-                method: "POST",
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({symbol: coin})
-            });
-            let data = await res.json();
-            document.getElementById("obout").innerHTML =
-              `<b>Trend:</b> ${data.trend}<br>
-               <b>Reason:</b> ${data.reason}<br>
-               <b>Price:</b> ₹${data.price} <br>
-               <b>Time:</b> ${data.time}`;
-        }
-        async function fetchBalance() {
-            let res = await fetch("/api/balance", {method: "POST"});
-            let data = await res.json();
-            let html = "";
-            for (const [k, v] of Object.entries(data)) {
-                html += `${k}: ${v} <br>`;
-            }
-            document.getElementById("bal").innerHTML = html;
-        }
-        window.onload = function() {
-            fetchOB(); fetchBalance();
-            setInterval(fetchOB, 30000);
-            setInterval(fetchBalance, 60000);
-        }
-    </script>
+    <title>CoinDCX SMC OB+EMA Spot Auto-Trader</title>
+    <style>
+        body { font-family:sans-serif; background:#fafbfc; color:#2d2d2d; margin:0; }
+        #box { max-width:600px; margin:30px auto; padding:30px; background:white; border-radius:8px; box-shadow:0 0 8px #eee; }
+        button { padding:10px 30px; margin:10px 10px 20px 0; font-size:16px; border-radius:5px; border:1px solid #888; background:#0a6cf1; color:white; cursor:pointer;}
+        button:disabled {background:#aaa;}
+        h2 {margin-top:0;}
+        #log {background:#f2f4fa;padding:10px;margin-top:20px;border-radius:6px;max-height:220px;overflow:auto;}
+        .pnl {font-size:2em;color:#2cb85c;}
+    </style>
 </head>
 <body>
-    <h2>CoinDCX Lux Algo SMC OB Trader</h2>
-    <label>Coin: </label>
-    <select id="coin" onchange="fetchOB()">
-        {% for coin in coins %}
-        <option value="{{ coin }}">{{ coin }}</option>
-        {% endfor %}
-    </select>
-    <button onclick="fetchOB()">Refresh</button>
-    <div id="obout" style="margin-top:15px; margin-bottom:15px;"></div>
-    <h4>Your Balances</h4>
-    <div id="bal" style="margin-bottom:15px;"></div>
-    <hr>
-    <form action="#" method="POST" onsubmit="return false;">
-        <b>BUY/SELL DEMO (logic to be added):</b><br>
-        Amount: <input type="number" step="0.0001" min="0.0001"><br>
-        Target: <input type="number"><br>
-        Stop Loss: <input type="number"><br>
-        <button disabled>Buy</button>
-        <button disabled>Sell</button>
-        <span style="color:gray;">(demo; enable and wire logic as needed)</span>
-    </form>
+    <div id="box">
+        <h2>CoinDCX SMC OB+EMA Spot Auto-Trader</h2>
+        <button id="startBtn" onclick="startAlgo()">START</button>
+        <button id="stopBtn" onclick="stopAlgo()" disabled>STOP</button>
+        <div style="margin:18px 0 6px 0;">
+            <b>Status:</b> <span id="status">Idle</span>
+        </div>
+        <div style="margin:8px 0;">
+            <b>USDT Balance:</b> <span id="usdt">-</span>
+        </div>
+        <div style="margin:10px 0;">
+            <b>Last 1hr P&L:</b> <span class="pnl" id="pnl">0</span>
+        </div>
+        <div>
+            <b>Recent Trades</b>
+            <div id="log"></div>
+        </div>
+    </div>
+    <script>
+        let running = false;
+        async function startAlgo() {
+            document.getElementById("startBtn").disabled = true;
+            document.getElementById("stopBtn").disabled = false;
+            running = true;
+            await fetch("/start", {method:"POST"});
+        }
+        async function stopAlgo() {
+            document.getElementById("startBtn").disabled = false;
+            document.getElementById("stopBtn").disabled = true;
+            running = false;
+            await fetch("/stop", {method:"POST"});
+        }
+        async function updateStatus() {
+            let r = await fetch("/status");
+            let j = await r.json();
+            document.getElementById("status").innerText = j.status;
+            document.getElementById("usdt").innerText = j.usdt;
+            document.getElementById("pnl").innerText = j.pnl;
+            let log = j.trades.map(x =>
+                `<div><b>${x.ts}</b> ${x.symbol} <b>${x.side}</b> qty:${x.qty} entry:${x.entry} TP:${x.tp} SL:${x.sl}</div>`
+            ).join('');
+            document.getElementById("log").innerHTML = log || 'No trades yet.';
+        }
+        setInterval(()=>{updateStatus(); fetch("/ping");}, 5000);
+        updateStatus();
+    </script>
 </body>
 </html>
