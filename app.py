@@ -3,125 +3,196 @@ import time
 import json
 import hmac
 import hashlib
+import threading
+from datetime import datetime, timedelta
 import requests
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, jsonify
 
 app = Flask(__name__)
 
-PORT = 10000
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
-CANDLE_URL = "https://public.coindcx.com/market_data/candles"
-
-COINS = [
-    "BTCINR", "ETHINR", "XRPINR", "DOGEINR", "SHIBINR",
-    "TRXINR", "LTCINR", "BCHINR", "ADAINR", "MATICINR"
+PUBLIC_URL = "https://public.coindcx.com"
+PAIRS = [
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
+    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-def get_balances():
-    payload = {"timestamp": int(time.time() * 1000)}
-    body = json.dumps(payload)
-    signature = hmac.new(API_SECRET, body.encode(), hashlib.sha256).hexdigest()
+scan_interval = 30  # seconds
+trade_log = []
+running = False
+status = {"msg": "Idle"}
+
+def hmac_signature(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+def get_balance():
+    payload = json.dumps({"timestamp": int(time.time() * 1000)})
+    sig = hmac_signature(payload)
     headers = {
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-SIGNATURE": sig,
         "Content-Type": "application/json"
     }
     try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=body)
-        data = r.json()
-        return {item['currency']: float(item['balance']) for item in data}
-    except:
-        return {}
+        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
+        if r.ok: return r.json()
+    except Exception: pass
+    return []
 
 def fetch_candles(symbol, interval="15m", limit=40):
-    url = f"{CANDLE_URL}?pair={symbol}&interval={interval}&limit={limit}"
+    url = f"{PUBLIC_URL}/market_data/candles?pair={symbol}&interval={interval}&limit={limit}"
     try:
-        r = requests.get(url)
-        return r.json()
-    except:
-        return []
+        r = requests.get(url, timeout=10)
+        if r.ok and r.json(): return r.json()
+    except Exception: pass
+    return []
 
-def detect_ob_smc(candles):
-    # SMC-style OB: Find last big bearish or bullish candle and confirm break/retest
-    bullish_ob = None
-    bearish_ob = None
-    reason = "No OB found"
-    trend = "SIDEWAYS"
-    n = len(candles)
-    # --- Find last bullish OB (down candle before big up move) ---
-    for i in range(n-3, 3, -1):
-        o = float(candles[i][1])
-        h = float(candles[i][2])
-        l = float(candles[i][3])
-        c = float(candles[i][4])
-        v = float(candles[i][5])
-        next_c = float(candles[i+1][4])
-        if c < o and next_c > o and (o-c)/o > 0.004:
-            # Down candle, next closes above open = OB
-            bullish_ob = {"idx": i, "open": o, "low": l, "high": h, "vol": v}
-            break
-    # --- Find last bearish OB (up candle before big drop) ---
-    for i in range(n-3, 3, -1):
-        o = float(candles[i][1])
-        h = float(candles[i][2])
-        l = float(candles[i][3])
-        c = float(candles[i][4])
-        v = float(candles[i][5])
-        next_c = float(candles[i+1][4])
-        if c > o and next_c < o and (c-o)/o > 0.004:
-            bearish_ob = {"idx": i, "open": o, "high": h, "low": l, "vol": v}
-            break
-    last_close = float(candles[-1][4])
-    last_vol = float(candles[-1][5])
-    # --- Confirm mitigation and volume ---
-    if bullish_ob:
-        # If price touches OB zone and bounces, with above avg vol, call UP
-        for i in range(bullish_ob["idx"], n):
-            low = float(candles[i][3])
-            close = float(candles[i][4])
-            vol = float(candles[i][5])
-            if bullish_ob["low"] <= low <= bullish_ob["open"]:
-                if close > bullish_ob["open"] and vol > bullish_ob["vol"]:
-                    trend = "UP"
-                    reason = "Bullish OB zone mitigated & volume up"
-                    break
-    if trend == "SIDEWAYS" and bearish_ob:
-        for i in range(bearish_ob["idx"], n):
-            high = float(candles[i][2])
-            close = float(candles[i][4])
-            vol = float(candles[i][5])
-            if bearish_ob["open"] <= high <= bearish_ob["high"]:
-                if close < bearish_ob["open"] and vol > bearish_ob["vol"]:
-                    trend = "DOWN"
-                    reason = "Bearish OB zone mitigated & volume up"
-                    break
-    return trend, reason
+def ema(vals, n):
+    if len(vals) < n: return []
+    alpha = 2 / (n + 1)
+    result = []
+    ema_val = sum(vals[:n]) / n
+    result.append(ema_val)
+    for price in vals[n:]:
+        ema_val = (price - ema_val) * alpha + ema_val
+        result.append(ema_val)
+    return result
+
+def ob_ema_signal(candles):
+    closes = [float(c[4]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+    # EMA
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    if not ema9 or not ema21 or len(ema9) < 1 or len(ema21) < 1:
+        return None
+    # Last OB detection (bullish/bearish)
+    signal = None
+    for i in reversed(range(21, len(candles)-1)):
+        # Bullish OB
+        o, c, v = float(candles[i][1]), float(candles[i][4]), float(candles[i][5])
+        if c < o and float(candles[i+1][4]) > o and v > sum(volumes)/len(volumes):
+            # OB+EMA cross up
+            if ema9[i-9] > ema21[i-21] and ema9[i-10] < ema21[i-22]:
+                signal = {"side": "BUY", "entry": float(candles[-1][4]), "idx": i}
+                break
+        # Bearish OB
+        if c > o and float(candles[i+1][4]) < o and v > sum(volumes)/len(volumes):
+            if ema9[i-9] < ema21[i-21] and ema9[i-10] > ema21[i-22]:
+                signal = {"side": "SELL", "entry": float(candles[-1][4]), "idx": i}
+                break
+    return signal
+
+def place_order(symbol, side, qty, entry, tp, sl):
+    payload = {
+        "market": symbol,
+        "side": "buy" if side == "BUY" else "sell",
+        "order_type": "market_order",
+        "total_quantity": str(qty),
+        "timestamp": int(time.time() * 1000)
+    }
+    body = json.dumps(payload)
+    sig = hmac_signature(body)
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sig,
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
+        result = r.json()
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+def scan_loop():
+    global running, trade_log, status
+    while running:
+        status["msg"] = "Scanning pairs"
+        balances = get_balance()
+        usdt = 0
+        for b in balances:
+            if b['currency'] == 'USDT': usdt = float(b['balance'])
+        for symbol in PAIRS:
+            if not running: break
+            candles = fetch_candles(symbol)
+            if not candles or len(candles) < 30: continue
+            sig = ob_ema_signal(candles)
+            if sig and usdt > 5:
+                side = sig["side"]
+                entry = sig["entry"]
+                qty = round((0.3 * usdt) / entry, 5)
+                tp = round(entry * 1.005, 2)
+                sl = round(entry * 0.99, 2)
+                result = place_order(symbol, side, qty, entry, tp, sl)
+                trade_log.append({
+                    "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry": entry,
+                    "tp": tp,
+                    "sl": sl,
+                    "result": result
+                })
+                status["msg"] = f"Traded {symbol} {side} {qty} at {entry}"
+        status["msg"] = "Idle"
+        for _ in range(int(scan_interval)):
+            if not running: break
+            time.sleep(1)
 
 @app.route("/")
 def index():
-    return render_template("index.html", coins=COINS)
+    return render_template("index.html")
 
-@app.route("/api/ob_predict", methods=["POST"])
-def ob_predict():
-    symbol = request.json.get("symbol", "BTCINR")
-    candles = fetch_candles(symbol)
-    if not candles or len(candles) < 10:
-        return jsonify({"trend": "N/A", "reason": "No candle data"})
-    trend, reason = detect_ob_smc(candles)
-    last = candles[-1]
+@app.route("/start", methods=["POST"])
+def start():
+    global running
+    if not running:
+        running = True
+        thread = threading.Thread(target=scan_loop)
+        thread.daemon = True
+        thread.start()
+    return jsonify({"status": "started"})
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
+
+@app.route("/status")
+def get_status():
+    balances = get_balance()
+    usdt_bal = 0
+    for b in balances:
+        if b['currency'] == 'USDT': usdt_bal = b['balance']
+    cutoff = datetime.now() - timedelta(hours=1)
+    pnl = 0
+    for trade in trade_log[-30:]:
+        if datetime.strptime(trade["ts"], '%Y-%m-%d %H:%M:%S') > cutoff:
+            if "result" in trade and "order_id" in trade["result"]:
+                side = trade["side"]
+                entry = trade["entry"]
+                qty = trade["qty"]
+                if side == "BUY":
+                    pnl += (trade["tp"] - entry) * qty
+                elif side == "SELL":
+                    pnl += (entry - trade["tp"]) * qty
     return jsonify({
-        "trend": trend,
-        "reason": reason,
-        "price": float(last[4]),
-        "time": time.strftime('%Y-%m-%d %H:%M', time.localtime(last[0]/1000))
+        "status": status["msg"],
+        "usdt": usdt_bal,
+        "trades": trade_log[-10:][::-1],
+        "pnl": round(pnl, 2)
     })
 
-@app.route("/api/balance", methods=["POST"])
-def api_balance():
-    balances = get_balances()
-    return jsonify(balances)
+@app.route("/ping")
+def ping():
+    return "pong"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(host="0.0.0.0", port=10000)
