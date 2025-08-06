@@ -58,7 +58,7 @@ function toIST(utcString) {
 // Converts unix timestamp (seconds) to IST string
 function tsToIST(ts) {
     let dt = new Date(ts*1000);
-    dt.setMinutes(dt.getMinutes() + 330);
+    dt.setMinutes(dt.getMinutes());
     let pad = n => n.toString().padStart(2, '0');
     return dt.getFullYear() + "-" +
         pad(dt.getMonth() + 1) + "-" +
