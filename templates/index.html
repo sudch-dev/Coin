@@ -46,7 +46,7 @@
 // Converts "YYYY-MM-DD HH:mm:ss" UTC to IST (GMT+5:30)
 function toIST(utcString) {
     let dt = new Date(utcString.replace(" ", "T") + "Z");
-    dt.setMinutes(dt.getMinutes() + 330);
+    dt.setMinutes(dt.getMinutes());
     let pad = n => n.toString().padStart(2, '0');
     return dt.getFullYear() + "-" +
         pad(dt.getMonth() + 1) + "-" +
