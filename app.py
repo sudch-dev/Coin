@@ -41,7 +41,7 @@ def get_balance():
     except Exception: pass
     return []
 
-def fetch_candles(symbol, interval="15m", limit=40):
+def fetch_candles(symbol, interval="5m", limit=40):
     url = f"{PUBLIC_URL}/market_data/candles?pair={symbol}&interval={interval}&limit={limit}"
     try:
         r = requests.get(url, timeout=10)
@@ -60,32 +60,20 @@ def ema(vals, n):
         result.append(ema_val)
     return result
 
-def ob_ema_signal(candles):
+def simple_ema_signal(candles):
     closes = [float(c[4]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    volumes = [float(c[5]) for c in candles]
-    # EMA (changed: now 5/10)
     ema5 = ema(closes, 5)
     ema10 = ema(closes, 10)
-    if not ema5 or not ema10 or len(ema5) < 1 or len(ema10) < 1:
+    if not ema5 or not ema10 or len(ema5) < 2 or len(ema10) < 2:
         return None
-    # Last OB detection (bullish/bearish)
-    signal = None
-    for i in reversed(range(10, len(candles)-1)):
-        # Bullish OB
-        o, c, v = float(candles[i][1]), float(candles[i][4]), float(candles[i][5])
-        if c < o and float(candles[i+1][4]) > o and v > sum(volumes)/len(volumes):
-            # OB+EMA cross up
-            if ema5[i-5] > ema10[i-10] and ema5[i-6] < ema10[i-11]:
-                signal = {"side": "BUY", "entry": float(candles[-1][4]), "idx": i}
-                break
-        # Bearish OB
-        if c > o and float(candles[i+1][4]) < o and v > sum(volumes)/len(volumes):
-            if ema5[i-5] < ema10[i-10] and ema5[i-6] > ema10[i-11]:
-                signal = {"side": "SELL", "entry": float(candles[-1][4]), "idx": i}
-                break
-    return signal
+    i = len(closes) - 1
+    # Bullish crossover
+    if ema5[i-1] < ema10[i-1] and ema5[i] > ema10[i]:
+        return {"side": "BUY", "entry": closes[-1], "idx": i}
+    # Bearish crossover
+    elif ema5[i-1] > ema10[i-1] and ema5[i] < ema10[i]:
+        return {"side": "SELL", "entry": closes[-1], "idx": i}
+    return None
 
 def place_order(symbol, side, qty, entry, tp, sl):
     payload = {
@@ -119,15 +107,15 @@ def scan_loop():
             if b['currency'] == 'USDT': usdt = float(b['balance'])
         for symbol in PAIRS:
             if not running: break
-            candles = fetch_candles(symbol)
-            if not candles or len(candles) < 30: continue
-            sig = ob_ema_signal(candles)
+            candles = fetch_candles(symbol, interval="5m", limit=40)
+            if not candles or len(candles) < 12: continue
+            sig = simple_ema_signal(candles)
             if sig and usdt > 5:
                 side = sig["side"]
                 entry = sig["entry"]
                 qty = round((0.3 * usdt) / entry, 5)
-                tp = round(entry * 1.005, 2)
-                sl = round(entry * 0.99, 2)
+                tp = round(entry * 1.002, 5)  # Target 0.2% above entry
+                sl = round(entry * 0.99, 5)   # Stop loss 1% below entry
                 result = place_order(symbol, side, qty, entry, tp, sl)
                 trade_log.append({
                     "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
