@@ -16,8 +16,7 @@ BASE_URL = "https://api.coindcx.com"
 PUBLIC_URL = "https://public.coindcx.com"
 
 PAIRS = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
+    "BTCUSDT", "ETHUSDT","SOLUSDT","DOGEUSDT"
 ]
 
 PAIR_PRECISION = {
