@@ -33,17 +33,38 @@
         </div>
     </div>
 <script>
+function toIST(utcStr) {
+    // utcStr in format "2025-08-06 03:31:52"
+    let d = new Date(utcStr.replace(" ", "T") + "Z");
+    d.setMinutes(d.getMinutes() + 330); // add 5*60 + 30 min
+    let y = d.getFullYear();
+    let m = (d.getMonth()+1).toString().padStart(2,"0");
+    let da = d.getDate().toString().padStart(2,"0");
+    let h = d.getHours().toString().padStart(2,"0");
+    let mi = d.getMinutes().toString().padStart(2,"0");
+    let s = d.getSeconds().toString().padStart(2,"0");
+    return `${y}-${m}-${da} ${h}:${mi}:${s}`;
+}
+function extractTime(line) {
+    // expects format: "YYYY-MM-DD HH:MM:SS | ...", returns IST-formatted
+    let m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+    if (m) {
+        let ist = toIST(m[1]);
+        return line.replace(m[1], ist);
+    }
+    return line;
+}
 function update() {
     fetch('/status').then(x => x.json()).then(d => {
         document.getElementById('status').innerText = d.status;
         document.getElementById('usdt').innerText = d.usdt;
-        document.getElementById('last').innerText = d.last;
+        document.getElementById('last').innerText = toIST(d.last);
         let logs = "";
-        d.scans.forEach(l => { logs += `<div class='log'>${l}</div>`; });
+        d.scans.forEach(l => { logs += `<div class='log'>${extractTime(l)}</div>`; });
         document.getElementById('scans').innerHTML = logs;
         let tr = "";
         d.trades.forEach(t => {
-            tr += `<div class='log'><b>${t.time}</b> <span class="${t.side=='BUY'?'buy':'sell'}">${t.pair} ${t.side}</span> @ ${t.entry} (${t.msg})</div>`;
+            tr += `<div class='log'><b>${toIST(t.time)}</b> <span class="${t.side=='BUY'?'buy':'sell'}">${t.pair} ${t.side}</span> @ ${t.entry} (${t.msg})</div>`;
         });
         document.getElementById('trades').innerHTML = tr || "<i>No trades yet.</i>";
     });
