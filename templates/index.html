@@ -1,53 +1,69 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX EMA(5,10) Spot Auto-Trader</title>
+    <title>CoinDCX Live EMA(5,10) Spot Scanner</title>
+    <meta charset="utf-8"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"/>
     <style>
-        body { background: #f6fbfd; font-family: Arial; }
-        .box { background: #fff; max-width: 500px; margin: 40px auto; padding: 28px 22px; border-radius: 10px; box-shadow: 0 6px 30px #ccd; }
-        .log { background: #f6f6f6; font-size: 14px; padding: 8px; border-radius: 6px; margin-bottom: 7px; }
-        .row { margin-bottom: 11px; }
-        .btn { background: #3c8efc; color: #fff; border: none; border-radius: 5px; padding: 6px 24px; margin-right: 7px; font-size: 15px; cursor: pointer; }
-        .btn:disabled { background: #ddd; color: #aaa; }
-        .pnl { color: green; font-weight: bold; }
-        .stat { font-size: 15px; }
+        body { background: #f8fcfd; }
+        .logbox { background: #f4f1fb; font-family: monospace; padding: 5px 12px; margin-bottom: 10px; border-radius: 6px;}
+        .tradebox { background: #e5fff3; font-family: monospace; padding: 5px 12px; border-radius: 6px;}
     </style>
 </head>
 <body>
-    <div class="box">
-        <h3>CoinDCX EMA(5,10) Spot Auto-Trader</h3>
-        <div class="row">
-            <button id="start" class="btn">START</button>
-            <button id="stop" class="btn">STOP</button>
-        </div>
-        <div class="row stat"><b>Status:</b> <span id="status"></span></div>
-        <div class="row"><b>USDT Balance:</b> <span id="usdt"></span></div>
-        <div class="row"><b>Last 1hr P&L:</b> <span id="pnl" class="pnl"></span></div>
-        <div class="row"><b>Recent Trades</b>
-            <div id="trades" class="log"></div>
-        </div>
-        <div class="row"><b>Recent Scans</b>
-            <div id="scans" class="log"></div>
-        </div>
+<div class="container mt-5" style="max-width:600px">
+    <h5 class="mb-2">CoinDCX Live EMA(5,10) Spot Scanner</h5>
+    <div>
+        <button class="btn btn-primary btn-sm" id="startBtn">START</button>
+        <button class="btn btn-secondary btn-sm" id="stopBtn">STOP</button>
+        <span class="ms-4 fw-bold">Status:</span> <span id="statustxt">Idle</span>
     </div>
-    <script>
-        function loadStatus() {
-            fetch("/status").then(r=>r.json()).then(d=>{
-                document.getElementById("status").textContent = d.status;
-                document.getElementById("usdt").textContent = d.usdt;
-                document.getElementById("pnl").textContent = d.pnl;
-                document.getElementById("trades").innerHTML = (d.trades.length ? d.trades.map(t=>`${t.ts} ${t.symbol} ${t.side} ${t.qty} @${t.entry}`).join("<br>") : "No trades yet.");
-                document.getElementById("scans").innerHTML = (d.scans.length ? d.scans.join("<br>") : "No scans yet.");
-            });
+    <hr/>
+    <div>
+        <b>USDT Balance:</b> <span id="usdt"></span><br/>
+        <b>Last 1hr P&L:</b> <span id="pnl"></span>
+    </div>
+    <hr/>
+    <div>
+        <b>Recent Trades</b>
+        <div id="trades"></div>
+    </div>
+    <hr/>
+    <div>
+        <b>Live Price Logs and Signals</b>
+        <div id="logs"></div>
+    </div>
+</div>
+<script>
+let PAIRS = {{ pairs|tojson }};
+function refresh(){
+    fetch("/status").then(x=>x.json()).then(d=>{
+        document.getElementById("statustxt").textContent = d.status;
+        document.getElementById("usdt").textContent = d.usdt;
+        document.getElementById("pnl").textContent = d.pnl;
+        // trades
+        let trs = "";
+        for (let t of d.trades) {
+            trs += `<div class='tradebox mb-2'>[${t.ts}] ${t.side} ${t.qty} ${t.symbol} @${t.entry} (TP:${t.tp}, SL:${t.sl}) <br>Result: ${JSON.stringify(t.result)}</div>`;
         }
-        document.getElementById("start").onclick = function(){
-            fetch("/start", {method:"POST"}).then(()=>setTimeout(loadStatus, 800));
+        document.getElementById("trades").innerHTML = trs || "No trades yet.";
+        // logs
+        let logHtml = "";
+        for (let pair of PAIRS) {
+            logHtml += `<b>${pair}</b><div class="logbox">`;
+            let logs = (d.scans[pair]||[]);
+            for (let l of logs) {
+                logHtml += `${l.time} | ${l.msg}<br/>`;
+            }
+            logHtml += "</div>";
         }
-        document.getElementById("stop").onclick = function(){
-            fetch("/stop", {method:"POST"}).then(()=>setTimeout(loadStatus, 800));
-        }
-        setInterval(loadStatus, 2000);
-        loadStatus();
-    </script>
+        document.getElementById("logs").innerHTML = logHtml;
+    });
+}
+refresh();
+setInterval(refresh, 4000);
+document.getElementById("startBtn").onclick = ()=>fetch("/start", {method:"POST"}).then(refresh);
+document.getElementById("stopBtn").onclick = ()=>fetch("/stop", {method:"POST"}).then(refresh);
+</script>
 </body>
 </html>
