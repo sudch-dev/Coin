@@ -1,63 +1,75 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>CoinDCX Auto-Trader Dashboard</title>
-    <meta charset="utf-8" />
-    <style>
-        body { font-family: Arial, sans-serif; background: #f6f7fa; color: #222; }
-        .card { background: #fff; border-radius: 8px; padding: 18px; margin: 18px auto; width: 90%; max-width: 600px; box-shadow: 0 2px 6px #aaa3; }
-        button { padding: 8px 24px; border: none; background: #4CAF50; color: #fff; border-radius: 4px; font-size: 1em; cursor: pointer; margin-right: 10px;}
-        button:disabled { opacity: .5; }
-        .section-title { font-weight: bold; margin-top: 18px; }
-        .mono { font-family: Consolas, monospace; font-size: 0.95em; background: #f0f0f0; border-radius: 4px; padding: 5px 10px; }
-        .pnlbox { font-size: 1.15em; margin-bottom: 10px; }
-    </style>
+  <meta charset="UTF-8">
+  <title>CoinDCX Auto Trader</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #121212;
+      color: #eee;
+      padding: 20px;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      font-size: 16px;
+    }
+    pre {
+      background-color: #1e1e1e;
+      padding: 10px;
+      max-height: 400px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+  </style>
 </head>
 <body>
-    <div class="card">
-        <h2>CoinDCX Auto-Trader Dashboard</h2>
-        <div>
-            <button onclick="startBot()" id="startbtn">START</button>
-            <button onclick="stopBot()" id="stopbtn">STOP</button>
-        </div>
-        <div class="pnlbox">
-            <b>USDT Balance:</b> <span id="usdt"></span><br>
-            <b>Last 1hr P&amp;L:</b> <span id="pnl"></span><br>
-            <b>Last 15min P&amp;L:</b> <span id="pnl15"></span><br>
-            <b>Status:</b> <span id="status"></span>
-        </div>
-        <div class="section-title">Recent Trades:</div>
-        <pre class="mono" id="trades"></pre>
-        <div class="section-title">Live Scan Log:</div>
-        <pre class="mono" id="scanlog"></pre>
-    </div>
-<script>
-function refreshStatus() {
-    fetch('/status').then(r => r.json()).then(data => {
-        document.getElementById('usdt').innerText = data.usdt;
-        document.getElementById('pnl').innerText = data.pnl;
-        document.getElementById('pnl15').innerText = data.last_15m_pnl;
-        document.getElementById('status').innerText = data.status;
-        let trades = "";
-        (data.trades || []).forEach(function(t) {
-            trades += `[${t.ts || t.time}] ${t.symbol || t.pair || ""} ${t.side || ""} qty=${t.qty || ""} entry=${t.entry || ""}\n`;
-        });
-        document.getElementById('trades').innerText = trades || "No recent trades.";
-        let scans = "";
-        (data.scan_log || []).forEach(function(line) {
-            scans += line + "\n";
-        });
-        document.getElementById('scanlog').innerText = scans || "No scan log yet.";
-    });
-}
-function startBot() {
-    fetch('/start', {method: "POST"}).then(() => setTimeout(refreshStatus, 500));
-}
-function stopBot() {
-    fetch('/stop', {method: "POST"}).then(() => setTimeout(refreshStatus, 500));
-}
-setInterval(refreshStatus, 3000);
-window.onload = refreshStatus;
-</script>
+  <h1>🪙 CoinDCX Trading Bot Dashboard</h1>
+
+  <button onclick="startBot()">▶ Start Bot</button>
+  <button onclick="stopBot()">⏹ Stop Bot</button>
+  <button onclick="refreshStatus()">🔄 Refresh Status</button>
+
+  <h2>📈 Status</h2>
+  <div id="status">Loading...</div>
+
+  <h2>💹 Last 10 Trades</h2>
+  <pre id="trades">Loading...</pre>
+
+  <h2>🧾 Scan Log (Last 40)</h2>
+  <pre id="scan_log">Loading...</pre>
+
+  <h2>💰 P&L Summary</h2>
+  <div id="pnl">Loading...</div>
+
+  <script>
+    async function startBot() {
+      await fetch("/start", { method: "POST" });
+      refreshStatus();
+    }
+
+    async function stopBot() {
+      await fetch("/stop", { method: "POST" });
+      refreshStatus();
+    }
+
+    async function refreshStatus() {
+      const res = await fetch("/status");
+      const data = await res.json();
+
+      document.getElementById("status").innerText = `${data.status} | USDT Balance: $${data.usdt}`;
+      document.getElementById("pnl").innerText = `Last 1h P&L: $${data.pnl} | Last 15m P&L: $${data.last_15m_pnl}`;
+
+      document.getElementById("trades").innerText = data.trades.map(t =>
+        `${t.ts} | ${t.symbol} | ${t.side} @ ${t.entry} | Qty: ${t.qty} | TP: ${t.tp} | SL: ${t.sl}`
+      ).join('\n');
+
+      document.getElementById("scan_log").innerText = data.scan_log.join('\n');
+    }
+
+    refreshStatus(); // initial load
+    setInterval(refreshStatus, 15000); // auto-refresh every 15 seconds
+  </script>
 </body>
 </html>
