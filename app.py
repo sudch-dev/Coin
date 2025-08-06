@@ -106,19 +106,48 @@ def aggregate_candles(pair, interval=60):
     candle_logs[pair] = candles[-50:]
 
 def pa_buy_sell_signal(pair):
-    candles = candle_logs[pair]
-    if len(candles) < 2:
+    candles = candle_logs.get(pair, [])
+    if len(candles) < 10:
         return None
+
     prev = candles[-2]
     curr = candles[-1]
-    mid = (prev["high"] + curr["high"]) / 2
 
-    # BUY
-    if curr["open"] < prev["close"] and curr["high"] > mid:
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > prev midpoint"}
-    # SELL
-    if curr["open"] > prev["close"] and curr["high"] < mid:
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
+    # Internal OB detector
+    def find_last_order_block(candles, direction="bullish"):
+        for i in range(len(candles) - 3, -1, -1):
+            c = candles[i]
+            if direction == "bullish" and c["open"] > c["close"]:
+                if candles[i+1]["close"] > c["high"] and candles[i+2]["close"] > candles[i+1]["close"]:
+                    return {"low": c["low"], "high": c["high"]}
+            if direction == "bearish" and c["close"] > c["open"]:
+                if candles[i+1]["close"] < c["low"] and candles[i+2]["close"] < candles[i+1]["close"]:
+                    return {"low": c["low"], "high": c["high"]}
+        return None
+
+    ob_bull = find_last_order_block(candles, "bullish")
+    ob_bear = find_last_order_block(candles, "bearish")
+
+    # ➤ BUY condition
+    if curr["close"] > curr["open"] and \
+       curr["open"] < prev["low"] and curr["close"] > prev["high"]:
+        if ob_bull and ob_bull["low"] <= curr["low"] <= ob_bull["high"]:
+            return {
+                "side": "BUY",
+                "entry": curr["close"],
+                "msg": f"PA BUY: Bullish engulfing + OB zone {ob_bull['low']}–{ob_bull['high']}"
+            }
+
+    # ➤ SELL condition
+    if curr["close"] < curr["open"] and \
+       curr["open"] > prev["high"] and curr["close"] < prev["low"]:
+        if ob_bear and ob_bear["low"] <= curr["high"] <= ob_bear["high"]:
+            return {
+                "side": "SELL",
+                "entry": curr["close"],
+                "msg": f"PA SELL: Bearish engulfing + OB zone {ob_bear['low']}–{ob_bear['high']}"
+            }
+
     return None
 
 def place_order(symbol, side, qty):
