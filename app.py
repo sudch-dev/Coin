@@ -65,24 +65,24 @@ def ob_ema_signal(candles):
     lows = [float(c[3]) for c in candles]
     highs = [float(c[2]) for c in candles]
     volumes = [float(c[5]) for c in candles]
-    # EMA
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    if not ema9 or not ema21 or len(ema9) < 1 or len(ema21) < 1:
+    # EMA (changed: now 5/10)
+    ema5 = ema(closes, 5)
+    ema10 = ema(closes, 10)
+    if not ema5 or not ema10 or len(ema5) < 1 or len(ema10) < 1:
         return None
     # Last OB detection (bullish/bearish)
     signal = None
-    for i in reversed(range(21, len(candles)-1)):
+    for i in reversed(range(10, len(candles)-1)):
         # Bullish OB
         o, c, v = float(candles[i][1]), float(candles[i][4]), float(candles[i][5])
         if c < o and float(candles[i+1][4]) > o and v > sum(volumes)/len(volumes):
             # OB+EMA cross up
-            if ema9[i-9] > ema21[i-21] and ema9[i-10] < ema21[i-22]:
+            if ema5[i-5] > ema10[i-10] and ema5[i-6] < ema10[i-11]:
                 signal = {"side": "BUY", "entry": float(candles[-1][4]), "idx": i}
                 break
         # Bearish OB
         if c > o and float(candles[i+1][4]) < o and v > sum(volumes)/len(volumes):
-            if ema9[i-9] < ema21[i-21] and ema9[i-10] > ema21[i-22]:
+            if ema5[i-5] < ema10[i-10] and ema5[i-6] > ema10[i-11]:
                 signal = {"side": "SELL", "entry": float(candles[-1][4]), "idx": i}
                 break
     return signal
