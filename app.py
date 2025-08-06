@@ -22,6 +22,7 @@ tick_logs = {pair: [] for pair in PAIRS}
 candle_logs = {pair: [] for pair in PAIRS}
 scan_log = []
 trade_log = []
+exit_orders = []  # Format: dict with 'pair', 'side', 'qty', 'tp', 'sl', 'entry'
 running = False
 status = {"msg": "Idle", "last": ""}
 
@@ -106,21 +107,19 @@ def ema(vals, n):
         result.append(ema_val)
     return result
 
-def ob_ema_signal(pair):
+def ema_cross_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 12:
+    if len(candles) < 6:
         return None
     closes = [c["close"] for c in candles]
+    ema3 = ema(closes, 3)
     ema5 = ema(closes, 5)
-    ema10 = ema(closes, 10)
-    if not ema5 or not ema10 or len(ema5) < 2 or len(ema10) < 2:
+    if len(ema3) < 2 or len(ema5) < 2:
         return None
-    # Buy: last EMA5 crosses above EMA10, last candle is green
-    # Sell: last EMA5 crosses below EMA10, last candle is red
-    if ema5[-2] < ema10[-2] and ema5[-1] > ema10[-1] and candles[-1]["close"] > candles[-1]["open"]:
-        return {"side": "BUY", "entry": candles[-1]["close"], "msg": "EMA5 crossed above EMA10 (Bullish)"}
-    if ema5[-2] > ema10[-2] and ema5[-1] < ema10[-1] and candles[-1]["close"] < candles[-1]["open"]:
-        return {"side": "SELL", "entry": candles[-1]["close"], "msg": "EMA5 crossed below EMA10 (Bearish)"}
+    if ema3[-2] < ema5[-2] and ema3[-1] > ema5[-1] and candles[-1]["close"] > candles[-1]["open"]:
+        return {"side": "BUY", "entry": candles[-1]["close"], "msg": "EMA3 crossed above EMA5"}
+    if ema3[-2] > ema5[-2] and ema3[-1] < ema5[-1] and candles[-1]["close"] < candles[-1]["open"]:
+        return {"side": "SELL", "entry": candles[-1]["close"], "msg": "EMA3 crossed below EMA5"}
     return None
 
 def place_order(pair, side, qty):
@@ -144,6 +143,24 @@ def place_order(pair, side, qty):
     except Exception as e:
         return {"error": str(e)}
 
+def monitor_exits(prices):
+    to_remove = []
+    for ex in exit_orders:
+        pair, side, qty, tp, sl, entry = ex["pair"], ex["side"], ex["qty"], ex["tp"], ex["sl"], ex["entry"]
+        price = prices.get(pair, {}).get("price")
+        if price:
+            # For spot, to exit a buy, you "sell"; to exit a sell, you "buy"
+            if side == "BUY" and (price >= tp or price <= sl):
+                result = place_order(pair, "SELL", qty)
+                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT SELL {qty} at {price} (TP/SL) | Result: {result}")
+                to_remove.append(ex)
+            elif side == "SELL" and (price <= tp or price >= sl):
+                result = place_order(pair, "BUY", qty)
+                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT BUY {qty} at {price} (TP/SL) | Result: {result}")
+                to_remove.append(ex)
+    for ex in to_remove:
+        exit_orders.remove(ex)
+
 def scan_loop():
     global running, scan_log, status
     scan_log.clear()
@@ -152,6 +169,7 @@ def scan_loop():
         prices = fetch_all_prices()
         now = int(time.time())
         log_lines = []
+        monitor_exits(prices)  # Check all open trades for TP/SL
         for pair in PAIRS:
             if pair in prices:
                 price = prices[pair]["price"]
@@ -159,16 +177,16 @@ def scan_loop():
                 if len(tick_logs[pair]) > 1000:
                     tick_logs[pair] = tick_logs[pair][-1000:]
                 log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
-                # Aggregate candles every tick
                 aggregate_candles(pair)
-                # Check for new 5-min candle
                 last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
                 if last_candle and last_candle["start"] != last_candle_ts[pair]:
                     last_candle_ts[pair] = last_candle["start"]
-                    signal = ob_ema_signal(pair)
+                    signal = ema_cross_signal(pair)
                     if signal:
                         usdt = get_wallet_balance()
                         qty = round((0.3 * usdt) / signal['entry'], 6)
+                        tp = round(signal['entry'] * 1.002, 6)
+                        sl = round(signal['entry'] * 0.995, 6)
                         result = place_order(pair, signal['side'], qty)
                         scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
                         trade = {
@@ -177,9 +195,20 @@ def scan_loop():
                             "side": signal['side'],
                             "entry": signal['entry'],
                             "msg": signal['msg'],
+                            "tp": tp,
+                            "sl": sl,
+                            "qty": qty,
                             "order_result": result
                         }
                         trade_log.append(trade)
+                        exit_orders.append({
+                            "pair": pair,
+                            "side": signal['side'],
+                            "qty": qty,
+                            "tp": tp,
+                            "sl": sl,
+                            "entry": signal['entry']
+                        })
                         if len(trade_log) > 20:
                             trade_log[:] = trade_log[-20:]
             else:
