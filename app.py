@@ -22,7 +22,7 @@ tick_logs = {pair: [] for pair in PAIRS}
 candle_logs = {pair: [] for pair in PAIRS}
 scan_log = []
 trade_log = []
-exit_orders = []  # Format: dict with 'pair', 'side', 'qty', 'tp', 'sl', 'entry'
+exit_orders = []  # Each: {'pair', 'side', 'qty', 'tp', 'sl', 'entry'}
 running = False
 status = {"msg": "Idle", "last": ""}
 
@@ -43,7 +43,7 @@ def get_wallet_balance():
             for b in r.json():
                 if b['currency'] == "USDT":
                     return float(b['balance'])
-    except Exception as e:
+    except Exception:
         pass
     return 0.0
 
@@ -59,15 +59,15 @@ def fetch_all_prices():
                 if m in PAIRS:
                     price_map[m] = {"price": float(item["last_price"]), "ts": now}
             return price_map
-    except Exception as e:
+    except Exception:
         pass
     return {}
 
-def aggregate_candles(pair):
+def aggregate_candles(pair, interval=60):
     ticks = tick_logs[pair]
     if not ticks:
         return
-    window = 5 * 60
+    window = interval  # 1 minute = 60 seconds
     candles = []
     ticks_sorted = sorted(ticks, key=lambda x: x[0])
     candle = None
@@ -95,31 +95,20 @@ def aggregate_candles(pair):
         candles.append(candle)
     candle_logs[pair] = candles[-50:]
 
-def ema(vals, n):
-    if len(vals) < n:
-        return []
-    alpha = 2 / (n + 1)
-    result = []
-    ema_val = sum(vals[:n]) / n
-    result.append(ema_val)
-    for price in vals[n:]:
-        ema_val = (price - ema_val) * alpha + ema_val
-        result.append(ema_val)
-    return result
-
-def ema_cross_signal(pair):
+def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 6:
+    if len(candles) < 2:
         return None
-    closes = [c["close"] for c in candles]
-    ema3 = ema(closes, 3)
-    ema5 = ema(closes, 5)
-    if len(ema3) < 2 or len(ema5) < 2:
-        return None
-    if ema3[-2] < ema5[-2] and ema3[-1] > ema5[-1] and candles[-1]["close"] > candles[-1]["open"]:
-        return {"side": "BUY", "entry": candles[-1]["close"], "msg": "EMA3 crossed above EMA5"}
-    if ema3[-2] > ema5[-2] and ema3[-1] < ema5[-1] and candles[-1]["close"] < candles[-1]["open"]:
-        return {"side": "SELL", "entry": candles[-1]["close"], "msg": "EMA3 crossed below EMA5"}
+    prev = candles[-2]
+    curr = candles[-1]
+    mid = (prev["high"] + prev["low"]) / 2
+
+    # BUY
+    if curr["open"] < prev["close"] and curr["high"] > mid:
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > prev midpoint"}
+    # SELL
+    if curr["open"] > prev["close"] and curr["low"] < mid:
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
     return None
 
 def place_order(pair, side, qty):
@@ -165,11 +154,12 @@ def scan_loop():
     global running, scan_log, status
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
+    interval = 60  # 1 min candles
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
         log_lines = []
-        monitor_exits(prices)  # Check all open trades for TP/SL
+        monitor_exits(prices)
         for pair in PAIRS:
             if pair in prices:
                 price = prices[pair]["price"]
@@ -177,16 +167,16 @@ def scan_loop():
                 if len(tick_logs[pair]) > 1000:
                     tick_logs[pair] = tick_logs[pair][-1000:]
                 log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
-                aggregate_candles(pair)
+                aggregate_candles(pair, interval)
                 last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
                 if last_candle and last_candle["start"] != last_candle_ts[pair]:
                     last_candle_ts[pair] = last_candle["start"]
-                    signal = ema_cross_signal(pair)
+                    signal = pa_buy_sell_signal(pair)
                     if signal:
                         usdt = get_wallet_balance()
                         qty = round((0.3 * usdt) / signal['entry'], 6)
-                        tp = round(signal['entry'] * 1.002, 6)
-                        sl = round(signal['entry'] * 0.995, 6)
+                        tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
+                        sl = round(signal['entry'] * 0.999, 6)   # -0.1%
                         result = place_order(pair, signal['side'], qty)
                         scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
                         trade = {
