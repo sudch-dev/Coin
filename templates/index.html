@@ -1,25 +1,29 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>CoinDCX Live EMA(5,10) Spot Scanner</title>
+    <meta charset="UTF-8">
+    <title>CoinDCX Live EMA(5,10) Spot Scanner (Auto-Execution)</title>
     <style>
         body { font-family: sans-serif; background: #f8fcfd; }
-        #mainbox { background: #fff; width: 500px; margin: 40px auto; padding: 24px; border-radius: 12px; box-shadow: 0 2px 16px #0001; }
+        #mainbox { background: #fff; width: 520px; margin: 40px auto; padding: 24px; border-radius: 12px; box-shadow: 0 2px 16px #0001; }
         button { padding: 8px 18px; font-size: 16px; margin: 4px; }
         .signal { color: #2196f3; }
         .buy { color: green; }
         .sell { color: red; }
         .log { font-family: monospace; background: #eef; padding: 6px; border-radius: 8px; margin-bottom: 7px; }
+        table { font-size:12px; border-collapse: collapse; margin-bottom: 18px;}
+        th, td { padding: 3px 7px; border: 1px solid #aaa;}
+        .orderresult { font-size:10px; color:#555; background:#f5f5f5; display:block; }
     </style>
 </head>
 <body>
     <div id="mainbox">
-        <h3>CoinDCX Live EMA(5,10) Spot Scanner</h3>
+        <h3>CoinDCX Live EMA(5,10) Spot Scanner <span style="color:#b00;">(Auto-Execution Enabled!)</span></h3>
         <button onclick="start()">START</button>
         <button onclick="stop()">STOP</button>
         <span style="margin-left:15px;">Status: <b id="status">Idle</b></span>
         <div style="margin:10px 0;">
-            <b>USDT Balance:</b> <span id="usdt">{{ usdt }}</span><br>
+            <b>USDT Balance:</b> <span id="usdt">0</span><br>
             <b>Last update:</b> <span id="last"></span>
         </div>
         <hr>
@@ -27,25 +31,92 @@
             <b>Recent Trades</b>
             <div id="trades"></div>
         </div>
-        <div style="margin-top:15px;">
+        <hr>
+        <div>
             <b>Live Scan Log</b>
             <div id="scans"></div>
         </div>
+        <hr>
+        <div>
+            <b>Recent 5-Min Candles (last 5 for each pair)</b>
+            <div id="candles"></div>
+        </div>
     </div>
 <script>
+// Converts "YYYY-MM-DD HH:mm:ss" UTC to IST (GMT+5:30)
+function toIST(utcString) {
+    let dt = new Date(utcString.replace(" ", "T") + "Z");
+    dt.setMinutes(dt.getMinutes() + 330);
+    let pad = n => n.toString().padStart(2, '0');
+    return dt.getFullYear() + "-" +
+        pad(dt.getMonth() + 1) + "-" +
+        pad(dt.getDate()) + " " +
+        pad(dt.getHours()) + ":" +
+        pad(dt.getMinutes()) + ":" +
+        pad(dt.getSeconds());
+}
+// Converts unix timestamp (seconds) to IST string
+function tsToIST(ts) {
+    let dt = new Date(ts*1000);
+    dt.setMinutes(dt.getMinutes() + 330);
+    let pad = n => n.toString().padStart(2, '0');
+    return dt.getFullYear() + "-" +
+        pad(dt.getMonth() + 1) + "-" +
+        pad(dt.getDate()) + " " +
+        pad(dt.getHours()) + ":" +
+        pad(dt.getMinutes()) + ":" +
+        pad(dt.getSeconds());
+}
 function update() {
     fetch('/status').then(x => x.json()).then(d => {
         document.getElementById('status').innerText = d.status;
         document.getElementById('usdt').innerText = d.usdt;
-        document.getElementById('last').innerText = d.last;
+        document.getElementById('last').innerText = toIST(d.last);
+
+        // Scan logs
         let logs = "";
-        d.scans.forEach(l => { logs += `<div class='log'>${l}</div>`; });
+        d.scans.forEach(l => {
+            let m = l.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+            if (m) {
+                let ist = toIST(m[1]);
+                logs += `<div class='log'>${l.replace(m[1], ist)}</div>`;
+            } else {
+                logs += `<div class='log'>${l}</div>`;
+            }
+        });
         document.getElementById('scans').innerHTML = logs;
+
+        // Trades
         let tr = "";
         d.trades.forEach(t => {
-            tr += `<div class='log'><b>${t.time}</b> <span class="${t.side=='BUY'?'buy':'sell'}">${t.pair} ${t.side}</span> @ ${t.entry} (${t.msg})</div>`;
+            tr += `<div class='log'><b>${toIST(t.time)}</b> <span class="${t.side=='BUY'?'buy':'sell'}">${t.pair} ${t.side}</span> @ ${t.entry} (${t.msg})`;
+            if(t.order_result){
+                let res = (typeof t.order_result === "object") ? JSON.stringify(t.order_result) : t.order_result;
+                tr += `<span class='orderresult'>Order Result: ${res}</span>`;
+            }
+            tr += `</div>`;
         });
         document.getElementById('trades').innerHTML = tr || "<i>No trades yet.</i>";
+
+        // Candle logs
+        let chtml = "";
+        for (let pair in d.candles) {
+            chtml += `<div style="margin-top:10px;"><b>${pair}</b><br><table><tr>
+                <th>Start (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Vol</th></tr>`;
+            d.candles[pair].forEach(c => {
+                let ist = tsToIST(c.start);
+                chtml += `<tr>
+                    <td>${ist}</td>
+                    <td>${c.open}</td>
+                    <td>${c.high}</td>
+                    <td>${c.low}</td>
+                    <td>${c.close}</td>
+                    <td>${c.volume}</td>
+                </tr>`;
+            });
+            chtml += "</table></div>";
+        }
+        document.getElementById('candles').innerHTML = chtml;
     });
 }
 function start() {
