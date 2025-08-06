@@ -75,7 +75,6 @@ def sell():
     log_trade({ "pair": pair, "side": "sell", "qty": qty, "price": price, "candles": data["candles"] })
     return jsonify(order)
 
-# Signal logic
 def pa_buy_sell_signal(pair, candles, current_price):
     if len(candles) < 2:
         return None
