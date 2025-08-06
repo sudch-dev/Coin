@@ -23,13 +23,11 @@ PAIRS = [
 PAIR_PRECISION = {
     'BTCUSDT': 4,
     'ETHUSDT': 4,
-    'XRPUSDT': 2,
-    'SHIBUSDT': 0,
     'SOLUSDT': 3,
     'DOGEUSDT': 2
 }
 
-scan_interval = 5
+scan_interval = 5  # seconds, for faster candle build
 trade_log = []
 scan_log = []
 exit_orders = []
@@ -80,7 +78,7 @@ def aggregate_candles(pair, interval=60):
     ticks = tick_logs[pair]
     if not ticks:
         return
-    window = interval
+    window = interval  # 1 minute = 60 seconds
     candles = []
     ticks_sorted = sorted(ticks, key=lambda x: x[0])
     candle = None
@@ -110,17 +108,18 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3:
+    if len(candles) < 2:
         return None
-    curr = candles[-1]
     prev = candles[-2]
-    prev_prev = candles[-3]
-    highest_prev_two_high = max(prev["high"], prev_prev["high"])
-    lowest_prev_two_low = min(prev["low"], prev_prev["low"])
-    if curr["close"] > highest_prev_two_high and curr["open"] < prev["close"]:
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: close > high of prev 2, open < prev close"}
-    if curr["close"] < lowest_prev_two_low and curr["open"] > prev["close"]:
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: close < low of prev 2, open > prev close"}
+    curr = candles[-1]
+    mid = (prev["high"] + curr["high"]) / 2
+
+    # BUY
+    if curr["open"] < prev["close"] and curr["high"] > mid:
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > prev midpoint"}
+    # SELL
+    if curr["open"] > prev["close"] and curr["high"] < mid:
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
     return None
 
 def place_order(symbol, side, qty):
@@ -151,75 +150,74 @@ def monitor_exits(prices):
         pair, side, qty, tp, sl, entry = ex["pair"], ex["side"], ex["qty"], ex["tp"], ex["sl"], ex["entry"]
         price = prices.get(pair, {}).get("price")
         if price:
+            # For spot, to exit a buy, you "sell"; to exit a sell, you "buy"
             if side == "BUY" and (price >= tp or price <= sl):
                 result = place_order(pair, "SELL", qty)
-                scan_log.append(f"{datetime.utcnow()} | {pair} | EXIT SELL {qty} @ {price} | {result}")
+                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT SELL {qty} at {price} (TP/SL) | Result: {result}")
                 to_remove.append(ex)
             elif side == "SELL" and (price <= tp or price >= sl):
                 result = place_order(pair, "BUY", qty)
-                scan_log.append(f"{datetime.utcnow()} | {pair} | EXIT BUY {qty} @ {price} | {result}")
+                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT BUY {qty} at {price} (TP/SL) | Result: {result}")
                 to_remove.append(ex)
     for ex in to_remove:
-        if ex in exit_orders:
-            exit_orders.remove(ex)
+        exit_orders.remove(ex)
 
 def scan_loop():
     global running, scan_log, status
     scan_log.clear()
-    interval = 60
+    interval = 60  # 1 min candles
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
         log_lines = []
         monitor_exits(prices)
         balances = get_balance()
-        balance_map = {b['currency']: float(b['balance']) for b in balances}
-        usdt_balance = balance_map.get('USDT', 0.0)
+        usdt = 0
+        for b in balances:
+            if b['currency'] == 'USDT': usdt = float(b['balance'])
         for pair in PAIRS:
             if pair in prices:
                 price = prices[pair]["price"]
                 tick_logs[pair].append((now, price))
                 if len(tick_logs[pair]) > 1000:
                     tick_logs[pair] = tick_logs[pair][-1000:]
+                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
                 aggregate_candles(pair, interval)
                 last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
                 if last_candle and last_candle["start"] != last_candle_ts[pair]:
                     last_candle_ts[pair] = last_candle["start"]
                     signal = pa_buy_sell_signal(pair)
-                    if signal:
-                        qty = 0
-                        if signal["side"] == "BUY" and usdt_balance > 5:
-                            qty = (0.3 * usdt_balance) / signal["entry"]
-                            qty = adjust_quantity_precision(pair, qty)
-                        elif signal["side"] == "SELL":
-                            coin = pair.replace("USDT", "")
-                            qty = adjust_quantity_precision(pair, balance_map.get(coin, 0.0))
-                        if qty > 0:
-                            tp = round(signal["entry"] * 1.0005, 6)
-                            sl = round(signal["entry"] * 0.999, 6)
-                            result = place_order(pair, signal["side"], qty)
-                            scan_log.append(f"{datetime.utcfromtimestamp(now)} | {pair} | {signal['side']} @ {signal['entry']} | {result}")
-                            trade_log.append({
-                                "ts": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
-                                "symbol": pair,
-                                "side": signal["side"],
-                                "entry": signal["entry"],
-                                "msg": signal["msg"],
-                                "tp": tp,
-                                "sl": sl,
-                                "qty": qty,
-                                "order_result": result
-                            })
-                            exit_orders.append({
-                                "pair": pair,
-                                "side": signal["side"],
-                                "qty": qty,
-                                "tp": tp,
-                                "sl": sl,
-                                "entry": signal["entry"]
-                            })
-                            if len(trade_log) > 30:
-                                trade_log[:] = trade_log[-30:]
+                    if signal and usdt > 5:
+                        qty = (0.3 * usdt) / signal['entry']
+                        qty = adjust_quantity_precision(pair, qty)
+                        tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
+                        sl = round(signal['entry'] * 0.999, 6)   # -0.1%
+                        result = place_order(pair, signal['side'], qty)
+                        scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
+                        trade = {
+                            "ts": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+                            "symbol": pair,
+                            "side": signal['side'],
+                            "entry": signal['entry'],
+                            "msg": signal['msg'],
+                            "tp": tp,
+                            "sl": sl,
+                            "qty": qty,
+                            "order_result": result
+                        }
+                        trade_log.append(trade)
+                        exit_orders.append({
+                            "pair": pair,
+                            "side": signal['side'],
+                            "qty": qty,
+                            "tp": tp,
+                            "sl": sl,
+                            "entry": signal['entry']
+                        })
+                        if len(trade_log) > 30:
+                            trade_log[:] = trade_log[-30:]
+            else:
+                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
         scan_log.extend(log_lines)
         if len(scan_log) > 120:
             scan_log[:] = scan_log[-120:]
@@ -260,10 +258,11 @@ def get_status():
     cutoff_15m = now - timedelta(minutes=15)
     pnl_1hr = 0
     pnl_15m = 0
+
     for trade in trade_log[-50:]:
         t_time = datetime.strptime(trade["ts"], '%Y-%m-%d %H:%M:%S')
         if "side" in trade and "qty" in trade and "entry" in trade:
-            exit_price = trade.get("tp", trade["entry"])
+            exit_price = trade.get("tp", trade["entry"])  # Use TP if available, else entry
             qty = trade["qty"]
             if trade["side"] == "BUY":
                 profit = (exit_price - trade["entry"]) * qty
@@ -273,6 +272,7 @@ def get_status():
                 pnl_1hr += profit
             if t_time > cutoff_15m:
                 pnl_15m += profit
+
     return jsonify({
         "status": status["msg"],
         "usdt": usdt_bal,
