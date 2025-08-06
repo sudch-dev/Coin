@@ -1,20 +1,21 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX SMC OB+EMA Spot Auto-Trader</title>
+    <title>CoinDCX EMA(5,10) Spot Auto-Trader</title>
     <style>
         body { font-family:sans-serif; background:#fafbfc; color:#2d2d2d; margin:0; }
         #box { max-width:600px; margin:30px auto; padding:30px; background:white; border-radius:8px; box-shadow:0 0 8px #eee; }
         button { padding:10px 30px; margin:10px 10px 20px 0; font-size:16px; border-radius:5px; border:1px solid #888; background:#0a6cf1; color:white; cursor:pointer;}
         button:disabled {background:#aaa;}
         h2 {margin-top:0;}
-        #log {background:#f2f4fa;padding:10px;margin-top:20px;border-radius:6px;max-height:220px;overflow:auto;}
+        #log {background:#f2f4fa;padding:10px;margin-top:20px;border-radius:6px;max-height:120px;overflow:auto;}
+        #scanlog {background:#f4f8fb;padding:10px;margin-top:10px;border-radius:6px;max-height:160px;overflow:auto;}
         .pnl {font-size:2em;color:#2cb85c;}
     </style>
 </head>
 <body>
     <div id="box">
-        <h2>CoinDCX SMC OB+EMA(5,10) Spot Auto-Trader</h2>
+        <h2>CoinDCX EMA(5,10) Spot Auto-Trader</h2>
         <button id="startBtn" onclick="startAlgo()">START</button>
         <button id="stopBtn" onclick="stopAlgo()" disabled>STOP</button>
         <div style="margin:18px 0 6px 0;">
@@ -29,6 +30,10 @@
         <div>
             <b>Recent Trades</b>
             <div id="log"></div>
+        </div>
+        <div style="margin-top:18px;">
+            <b>Recent Scans</b>
+            <div id="scanlog"></div>
         </div>
     </div>
     <script>
@@ -55,6 +60,11 @@
                 `<div><b>${x.ts}</b> ${x.symbol} <b>${x.side}</b> qty:${x.qty} entry:${x.entry} TP:${x.tp} SL:${x.sl}</div>`
             ).join('');
             document.getElementById("log").innerHTML = log || 'No trades yet.';
+            // --- Scan log rendering ---
+            let scanlog = j.scanlog.map(x =>
+                `<div><b>${x.ts}</b> ${x.symbol}: ${x.msg}</div>`
+            ).join('');
+            document.getElementById("scanlog").innerHTML = scanlog || 'No scans yet.';
         }
         setInterval(()=>{updateStatus(); fetch("/ping");}, 5000);
         updateStatus();
