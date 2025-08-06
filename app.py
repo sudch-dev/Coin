@@ -6,7 +6,7 @@ import hashlib
 import requests
 import json
 from datetime import datetime
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify
 
 app = Flask(__name__)
 
@@ -18,10 +18,10 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-tick_logs = {pair: [] for pair in PAIRS}         # list of (timestamp, price)
-candle_logs = {pair: [] for pair in PAIRS}       # list of dicts: {open,high,low,close,volume,start}
-scan_log = []                                   # list of strings (log lines)
-trade_log = []                                  # list of dicts (trade info)
+tick_logs = {pair: [] for pair in PAIRS}
+candle_logs = {pair: [] for pair in PAIRS}
+scan_log = []
+trade_log = []
 running = False
 status = {"msg": "Idle", "last": ""}
 
@@ -63,13 +63,11 @@ def fetch_all_prices():
     return {}
 
 def aggregate_candles(pair):
-    """Aggregate 5m candles from ticks, keep max 50 candles"""
     ticks = tick_logs[pair]
     if not ticks:
         return
-    # Group ticks by 5-min window
-    candles = []
     window = 5 * 60
+    candles = []
     ticks_sorted = sorted(ticks, key=lambda x: x[0])
     candle = None
     last_window = None
@@ -117,8 +115,6 @@ def ob_ema_signal(pair):
     ema10 = ema(closes, 10)
     if not ema5 or not ema10 or len(ema5) < 2 or len(ema10) < 2:
         return None
-    # Simple EMA cross and fake OB detection for demo
-    # You can refine this block!
     # Buy: last EMA5 crosses above EMA10, last candle is green
     # Sell: last EMA5 crosses below EMA10, last candle is red
     if ema5[-2] < ema10[-2] and ema5[-1] > ema10[-1] and candles[-1]["close"] > candles[-1]["open"]:
@@ -128,13 +124,28 @@ def ob_ema_signal(pair):
     return None
 
 def place_order(pair, side, qty):
-    # Example: you may want to wire this to /exchange/v1/orders/create endpoint
-    # Omitted here to prevent accidental real trades in demo!
-    return {"msg": f"Order {side} {qty} {pair} (demo mode)"}
+    payload = {
+        "market": pair,
+        "side": "buy" if side == "BUY" else "sell",
+        "order_type": "market_order",
+        "total_quantity": str(qty),
+        "timestamp": int(time.time() * 1000)
+    }
+    body = json.dumps(payload)
+    sig = hmac_signature(body)
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sig,
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 def scan_loop():
     global running, scan_log, status
-    usdt_bal = get_wallet_balance()
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
     while running:
@@ -145,11 +156,10 @@ def scan_loop():
             if pair in prices:
                 price = prices[pair]["price"]
                 tick_logs[pair].append((now, price))
-                # Keep max 1000 ticks per pair
                 if len(tick_logs[pair]) > 1000:
                     tick_logs[pair] = tick_logs[pair][-1000:]
-                log_lines.append(f"{datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
-                # Aggregate candles every 5 min
+                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
+                # Aggregate candles every tick
                 aggregate_candles(pair)
                 # Check for new 5-min candle
                 last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
@@ -157,25 +167,28 @@ def scan_loop():
                     last_candle_ts[pair] = last_candle["start"]
                     signal = ob_ema_signal(pair)
                     if signal:
-                        scan_log.append(f"{datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']})")
-                        # Place demo order
+                        usdt = get_wallet_balance()
+                        qty = round((0.3 * usdt) / signal['entry'], 6)
+                        result = place_order(pair, signal['side'], qty)
+                        scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
                         trade = {
-                            "time": datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+                            "time": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
                             "pair": pair,
                             "side": signal['side'],
                             "entry": signal['entry'],
-                            "msg": signal['msg']
+                            "msg": signal['msg'],
+                            "order_result": result
                         }
                         trade_log.append(trade)
                         if len(trade_log) > 20:
                             trade_log[:] = trade_log[-20:]
             else:
-                log_lines.append(f"{datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
+                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
         scan_log.extend(log_lines)
         if len(scan_log) > 100:
             scan_log[:] = scan_log[-100:]
         status["msg"] = "Running"
-        status["last"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        status["last"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
         time.sleep(5)
     status["msg"] = "Idle"
 
@@ -205,12 +218,14 @@ def get_status():
     usdt = get_wallet_balance()
     trades = trade_log[-10:]
     scans = scan_log[-30:]
+    candles_out = {p: candle_logs[p][-5:] for p in PAIRS}
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
         "usdt": usdt,
         "trades": trades[::-1],
-        "scans": scans[::-1]
+        "scans": scans[::-1],
+        "candles": candles_out
     })
 
 @app.route("/ping")
