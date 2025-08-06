@@ -21,6 +21,7 @@ PAIRS = [
 
 scan_interval = 30  # seconds
 trade_log = []
+scan_log = []     # NEW: store scan results for UI
 running = False
 status = {"msg": "Idle"}
 
@@ -98,7 +99,7 @@ def place_order(symbol, side, qty, entry, tp, sl):
         return {"error": str(e)}
 
 def scan_loop():
-    global running, trade_log, status
+    global running, trade_log, scan_log, status
     while running:
         status["msg"] = "Scanning pairs"
         balances = get_balance()
@@ -108,7 +109,13 @@ def scan_loop():
         for symbol in PAIRS:
             if not running: break
             candles = fetch_candles(symbol, interval="5m", limit=40)
-            if not candles or len(candles) < 12: continue
+            if not candles or len(candles) < 12: 
+                scan_log.append({
+                    "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "symbol": symbol,
+                    "msg": "No candles data"
+                })
+                continue
             sig = simple_ema_signal(candles)
             if sig and usdt > 5:
                 side = sig["side"]
@@ -127,7 +134,21 @@ def scan_loop():
                     "sl": sl,
                     "result": result
                 })
-                status["msg"] = f"Traded {symbol} {side} {qty} at {entry}"
+                scan_log.append({
+                    "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "symbol": symbol,
+                    "msg": f"Signal: {side} at {entry:.5f} (TRADE EXECUTED)"
+                })
+            else:
+                last_price = float(candles[-1][4]) if candles else None
+                scan_log.append({
+                    "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "symbol": symbol,
+                    "msg": f"No signal. Price: {last_price}"
+                })
+            # Keep scan_log manageable
+            if len(scan_log) > 100:
+                scan_log.pop(0)
         status["msg"] = "Idle"
         for _ in range(int(scan_interval)):
             if not running: break
@@ -175,6 +196,7 @@ def get_status():
         "status": status["msg"],
         "usdt": usdt_bal,
         "trades": trade_log[-10:][::-1],
+        "scanlog": scan_log[-25:][::-1],   # last 25 scans, newest first
         "pnl": round(pnl, 2)
     })
 
