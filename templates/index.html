@@ -1,62 +1,53 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Live EMA(5,10) Spot Trader</title>
+    <title>CoinDCX EMA(5,10) Spot Auto-Trader</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #f6fbfd; }
-        #box { background: #fff; max-width: 600px; margin: 40px auto; border-radius: 10px; box-shadow: 0 2px 8px #ddd; padding: 24px; }
-        .btn { border: none; background: #009; color: #fff; padding: 8px 16px; border-radius: 5px; cursor: pointer; margin-right: 8px;}
-        .btn:disabled { background: #888; }
-        h3 { margin-top: 24px;}
-        .log { font-size: 13px; background: #f7f7fc; border-radius: 4px; padding: 8px 12px; margin-bottom: 6px;}
-        .small { color: #666; font-size: 11px;}
+        body { background: #f6fbfd; font-family: Arial; }
+        .box { background: #fff; max-width: 500px; margin: 40px auto; padding: 28px 22px; border-radius: 10px; box-shadow: 0 6px 30px #ccd; }
+        .log { background: #f6f6f6; font-size: 14px; padding: 8px; border-radius: 6px; margin-bottom: 7px; }
+        .row { margin-bottom: 11px; }
+        .btn { background: #3c8efc; color: #fff; border: none; border-radius: 5px; padding: 6px 24px; margin-right: 7px; font-size: 15px; cursor: pointer; }
+        .btn:disabled { background: #ddd; color: #aaa; }
+        .pnl { color: green; font-weight: bold; }
+        .stat { font-size: 15px; }
     </style>
 </head>
 <body>
-<div id="box">
-    <h2>CoinDCX EMA(5,10) Spot Live Auto-Trader</h2>
-    <button id="start" class="btn">START</button>
-    <button id="stop" class="btn">STOP</button>
-    <div style="margin:12px 0;">
-        <b>Status:</b> <span id="status">Idle</span>
+    <div class="box">
+        <h3>CoinDCX EMA(5,10) Spot Auto-Trader</h3>
+        <div class="row">
+            <button id="start" class="btn">START</button>
+            <button id="stop" class="btn">STOP</button>
+        </div>
+        <div class="row stat"><b>Status:</b> <span id="status"></span></div>
+        <div class="row"><b>USDT Balance:</b> <span id="usdt"></span></div>
+        <div class="row"><b>Last 1hr P&L:</b> <span id="pnl" class="pnl"></span></div>
+        <div class="row"><b>Recent Trades</b>
+            <div id="trades" class="log"></div>
+        </div>
+        <div class="row"><b>Recent Scans</b>
+            <div id="scans" class="log"></div>
+        </div>
     </div>
-    <h3>Trades</h3>
-    <div id="trades"></div>
-    <h3>Recent Scans</h3>
-    <div id="scans"></div>
-    <h3>Last Candle per Pair</h3>
-    <div id="candles"></div>
-</div>
-<script>
-function refresh() {
-    fetch("/status").then(x => x.json()).then(data => {
-        document.getElementById("status").innerText = data.status;
-        // Trades
-        let tlog = data.trades.map(tr =>
-            `<div class="log"><b>${tr.side}</b> <b>${tr.pair}</b> at ${tr.price} <span class="small">[${tr.time}]</span> <br/>${tr.msg}</div>`
-        ).join("");
-        document.getElementById("trades").innerHTML = tlog || "<span class='small'>No trades yet.</span>";
-        // Scans
-        let slog = data.scans.map(s =>
-            `<div class="log"><b>${s.pair}</b>: ${s.price} <span class="small">[${s.time}]</span></div>`
-        ).join("");
-        document.getElementById("scans").innerHTML = slog || "<span class='small'>No scans yet.</span>";
-        // Candles
-        let clog = "";
-        for (const [p, arr] of Object.entries(data.candles)) {
-            for (const c of arr) {
-                if (!c) continue;
-                clog += `<div class="log"><b>${p}</b> | O:${c.open} H:${c.high} L:${c.low} C:${c.close} <span class="small">[${new Date(c.timestamp*1000).toLocaleTimeString()}]</span></div>`;
-            }
+    <script>
+        function loadStatus() {
+            fetch("/status").then(r=>r.json()).then(d=>{
+                document.getElementById("status").textContent = d.status;
+                document.getElementById("usdt").textContent = d.usdt;
+                document.getElementById("pnl").textContent = d.pnl;
+                document.getElementById("trades").innerHTML = (d.trades.length ? d.trades.map(t=>`${t.ts} ${t.symbol} ${t.side} ${t.qty} @${t.entry}`).join("<br>") : "No trades yet.");
+                document.getElementById("scans").innerHTML = (d.scans.length ? d.scans.join("<br>") : "No scans yet.");
+            });
         }
-        document.getElementById("candles").innerHTML = clog || "<span class='small'>No candles yet.</span>";
-    });
-}
-setInterval(refresh, 3000);
-refresh();
-
-document.getElementById("start").onclick = () => fetch("/start", {method: "POST"}).then(refresh);
-document.getElementById("stop").onclick = () => fetch("/stop", {method: "POST"}).then(refresh);
-</script>
+        document.getElementById("start").onclick = function(){
+            fetch("/start", {method:"POST"}).then(()=>setTimeout(loadStatus, 800));
+        }
+        document.getElementById("stop").onclick = function(){
+            fetch("/stop", {method:"POST"}).then(()=>setTimeout(loadStatus, 800));
+        }
+        setInterval(loadStatus, 2000);
+        loadStatus();
+    </script>
 </body>
 </html>
