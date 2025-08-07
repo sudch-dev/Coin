@@ -208,7 +208,9 @@ def scan_loop():
     sl = round(signal['entry'] * 0.999, 6)
     result = place_order(pair, signal['side'], qty)
 
-    scan_log.append(f"{now_ist} | {pair} | [{active_strategy['name']}] SIGNAL: {signal['side']} @ {signal['entry']} | {signal['msg']} | Result: {result}")
+    scan_log.append(
+    f"{now_ist} | {pair} | [{active_strategy[\"name\"]}] SIGNAL: {signal['side']} @ {signal['entry']} | {signal['msg']} | Result: {result}"
+)
     
     trade_log.append({
         "time": now_ist, "pair": pair, "side": signal['side"],
