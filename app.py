@@ -3,6 +3,11 @@ import os, hmac, hashlib, time, requests, json, sqlite3
 from flask import Flask, jsonify, request
 from datetime import datetime
 import pytz
+from flask import send_file
+
+@app.route("/")
+def home():
+    return send_file("index.html")
 
 app = Flask(__name__)
 API_KEY = os.environ.get('API_KEY')
