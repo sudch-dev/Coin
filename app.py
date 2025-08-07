@@ -115,7 +115,7 @@ def place_order(pair, side, qty):
     payload = {
         "market": pair,
         "side": "buy" if side == "BUY" else "sell",
-        "order_type": "market_order",
+        "order_type": "market",
         "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000)
     }
@@ -178,9 +178,9 @@ def scan_loop():
                         tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
                         sl = round(signal['entry'] * 0.999, 6)   # -0.1%
                         result = place_order(pair, signal['side'], qty)
-                        scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
+                        scan_log.append(f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
                         trade = {
-                            "time": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+                            "time": datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S'),
                             "pair": pair,
                             "side": signal['side'],
                             "entry": signal['entry'],
