@@ -101,7 +101,7 @@ def pa_buy_sell_signal(pair):
         return None
     prev = candles[-2]
     curr = candles[-1]
-    mid = (prev["high"] + prev["low"]) / 4 * 3
+    mid = (prev["high"] + prev["close"]) / 4 * 3
 
     # BUY
     if curr["open"] < prev["close"] and curr["high"] > mid:
