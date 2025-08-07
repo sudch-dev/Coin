@@ -107,48 +107,31 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs.get(pair, [])
-    if len(candles) < 10:
+    if len(candles) < 2:
         return None
 
     prev = candles[-2]
     curr = candles[-1]
 
-    # Internal OB detector
-    def find_last_order_block(candles, direction="bullish"):
-        for i in range(len(candles) - 3, -1, -1):
-            c = candles[i]
-            if direction == "bullish" and c["open"] > c["close"]:
-                if candles[i+1]["close"] > c["high"] and candles[i+2]["close"] > candles[i+1]["close"]:
-                    return {"low": c["low"], "high": c["high"]}
-            if direction == "bearish" and c["close"] > c["open"]:
-                if candles[i+1]["close"] < c["low"] and candles[i+2]["close"] < candles[i+1]["close"]:
-                    return {"low": c["low"], "high": c["high"]}
-        return None
-
-    ob_bull = find_last_order_block(candles, "bullish")
-    ob_bear = find_last_order_block(candles, "bearish")
-
-    # ✅ BUY: momentum breakout + OB bounce
+    # ✅ BUY Signal: Bullish breakout
     if curr["close"] > curr["open"] and \
        curr["close"] > prev["high"] and \
        curr["open"] <= prev["close"]:
-        if ob_bull and ob_bull["low"] <= curr["low"] <= ob_bull["high"]:
-            return {
-                "side": "BUY",
-                "entry": curr["close"],
-                "msg": f"PA BUY: Bullish breakout + OB zone {ob_bull['low']}–{ob_bull['high']}"
-            }
+        return {
+            "side": "BUY",
+            "entry": curr["close"],
+            "msg": "PA BUY: Bullish breakout over prev high with open below prev close"
+        }
 
-    # ✅ SELL: breakdown + OB rejection
+    # ✅ SELL Signal: Bearish breakdown
     if curr["close"] < curr["open"] and \
        curr["close"] < prev["low"] and \
        curr["open"] >= prev["close"]:
-        if ob_bear and ob_bear["low"] <= curr["high"] <= ob_bear["high"]:
-            return {
-                "side": "SELL",
-                "entry": curr["close"],
-                "msg": f"PA SELL: Bearish breakdown + OB zone {ob_bear['low']}–{ob_bear['high']}"
-            }
+        return {
+            "side": "SELL",
+            "entry": curr["close"],
+            "msg": "PA SELL: Bearish breakdown below prev low with open above prev close"
+        }
 
     return None
 
