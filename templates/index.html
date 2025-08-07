@@ -1,68 +1,95 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX HFT Signal Tracker</title>
-    <style>
-        body { font-family: Arial; padding: 20px; background: #f7f7f7; }
-        button { padding: 10px 20px; background: #28a745; color: white; border: none; border-radius: 5px; }
-        #results { margin-top: 20px; white-space: pre-wrap; background: #fff; padding: 10px; border: 1px solid #ccc; }
-    </style>
+  <title>CoinDCX Spot Bot</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f9f9f9;
+      padding: 20px;
+    }
+    h1 {
+      color: #2c3e50;
+    }
+    .button {
+      padding: 10px 20px;
+      font-size: 16px;
+      margin: 5px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background-color: #3498db;
+      color: white;
+    }
+    .button:disabled {
+      background-color: #ccc;
+    }
+    .section {
+      margin-top: 20px;
+      padding: 15px;
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+    }
+    pre {
+      background: #f0f0f0;
+      padding: 10px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+  </style>
 </head>
 <body>
-    <h2>📈 CoinDCX HFT Trading Dashboard (Frontend Signal)</h2>
-    <button onclick="simulateAndSend('BTCUSDT')">Scan BTCUSDT</button>
-    <button onclick="simulateAndSend('ETHUSDT')">Scan ETHUSDT</button>
-    <button onclick="simulateAndSend('DOGEUSDT')">Scan DOGEUSDT</button>
+  <h1>🪙 CoinDCX Spot Bot</h1>
 
-    <div id="results"></div>
+  <div>
+    <p><strong>USDT Balance:</strong> <span id="usdt">{{ usdt }}</span></p>
+    <button class="button" onclick="startBot()">▶️ Start</button>
+    <button class="button" onclick="stopBot()">⏹ Stop</button>
+  </div>
 
-    <script>
-        function simulateAndSend(pair) {
-            // Simulate 3 candles with random data
-            const candles = [];
-            let base = Math.random() * 100 + 1000;
-            for (let i = 0; i < 3; i++) {
-                const open = base + Math.random() * 10;
-                const close = open + Math.random() * 10;
-                const high = Math.max(open, close) + Math.random() * 5;
-                const low = Math.min(open, close) - Math.random() * 5;
-                const volume = Math.floor(Math.random() * 1000 + 500);
-                candles.push({ open, close, high, low, volume });
-                base = close;
-            }
+  <div class="section">
+    <p><strong>Status:</strong> <span id="status">Loading...</span></p>
+    <p><strong>Last Updated:</strong> <span id="last">--</span></p>
+  </div>
 
-            const p1 = parseFloat(candles[2].close);
-            const p2 = parseFloat(candles[1].close);
-            const p3 = parseFloat(candles[0].close);
-            const v1 = candles[2].volume;
-            const v2 = candles[1].volume;
-            const v3 = candles[0].volume;
+  <div class="section">
+    <h3>📊 Recent Trades</h3>
+    <pre id="trades">Loading...</pre>
+  </div>
 
-            const avgVol = (v2 + v3) / 2;
-            const bodySize = Math.abs(candles[2].close - candles[2].open);
-            const wickSize = Math.abs(candles[2].high - candles[2].low);
+  <div class="section">
+    <h3>🔍 Scan Logs</h3>
+    <pre id="scans">Loading...</pre>
+  </div>
 
-            let signal = null;
+  <script>
+    async function startBot() {
+      await fetch("/start", { method: "POST" });
+    }
+    async function stopBot() {
+      await fetch("/stop", { method: "POST" });
+    }
 
-            if (p1 > p2 && p2 > p3 && v1 > 1.2 * avgVol && bodySize > 0.3 * wickSize) {
-                signal = "buy";
-            } else if (p1 < p2 && p2 < p3 && bodySize > 0.7 * wickSize) {
-                signal = "sell";
-            }
+    async function refresh() {
+      const res = await fetch("/status");
+      const data = await res.json();
 
-            if (!signal) {
-                document.getElementById("results").innerText = "No trade signal for " + pair;
-                return;
-            }
+      document.getElementById("status").textContent = data.status;
+      document.getElementById("last").textContent = data.last;
+      document.getElementById("usdt").textContent = data.usdt.toFixed(2);
 
-            fetch("/api/" + signal, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ pair, candles })
-            }).then(res => res.json()).then(data => {
-                document.getElementById("results").innerText = JSON.stringify(data, null, 2);
-            });
-        }
-    </script>
+      let trades = data.trades.map(t => {
+        return `${t.time} | ${t.pair} | ${t.side} @ ${t.entry} | Qty: ${t.qty}\nMsg: ${t.msg}`;
+      }).join("\n");
+      document.getElementById("trades").textContent = trades || "No trades yet.";
+
+      let scans = data.scans.join("\n");
+      document.getElementById("scans").textContent = scans || "No scan data yet.";
+    }
+
+    setInterval(refresh, 3000);
+    refresh();
+  </script>
 </body>
 </html>
