@@ -128,24 +128,26 @@ def pa_buy_sell_signal(pair):
     ob_bull = find_last_order_block(candles, "bullish")
     ob_bear = find_last_order_block(candles, "bearish")
 
-    # ➤ BUY condition
+    # ✅ BUY: momentum breakout + OB bounce
     if curr["close"] > curr["open"] and \
-       curr["open"] < prev["low"] and curr["close"] > prev["high"]:
+       curr["close"] > prev["high"] and \
+       curr["open"] <= prev["close"]:
         if ob_bull and ob_bull["low"] <= curr["low"] <= ob_bull["high"]:
             return {
                 "side": "BUY",
                 "entry": curr["close"],
-                "msg": f"PA BUY: Bullish engulfing + OB zone {ob_bull['low']}–{ob_bull['high']}"
+                "msg": f"PA BUY: Bullish breakout + OB zone {ob_bull['low']}–{ob_bull['high']}"
             }
 
-    # ➤ SELL condition
+    # ✅ SELL: breakdown + OB rejection
     if curr["close"] < curr["open"] and \
-       curr["open"] > prev["high"] and curr["close"] < prev["low"]:
+       curr["close"] < prev["low"] and \
+       curr["open"] >= prev["close"]:
         if ob_bear and ob_bear["low"] <= curr["high"] <= ob_bear["high"]:
             return {
                 "side": "SELL",
                 "entry": curr["close"],
-                "msg": f"PA SELL: Bearish engulfing + OB zone {ob_bear['low']}–{ob_bear['high']}"
+                "msg": f"PA SELL: Bearish breakdown + OB zone {ob_bear['low']}–{ob_bear['high']}"
             }
 
     return None
