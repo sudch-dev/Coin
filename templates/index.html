@@ -1,63 +1,95 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Auto-Trader Dashboard</title>
-    <meta charset="utf-8" />
-    <style>
-        body { font-family: Arial, sans-serif; background: #f6f7fa; color: #222; }
-        .card { background: #fff; border-radius: 8px; padding: 18px; margin: 18px auto; width: 90%; max-width: 600px; box-shadow: 0 2px 6px #aaa3; }
-        button { padding: 8px 24px; border: none; background: #4CAF50; color: #fff; border-radius: 4px; font-size: 1em; cursor: pointer; margin-right: 10px;}
-        button:disabled { opacity: .5; }
-        .section-title { font-weight: bold; margin-top: 18px; }
-        .mono { font-family: Consolas, monospace; font-size: 0.95em; background: #f0f0f0; border-radius: 4px; padding: 5px 10px; }
-        .pnlbox { font-size: 1.15em; margin-bottom: 10px; }
-    </style>
+  <title>CoinDCX Spot Bot</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f9f9f9;
+      padding: 20px;
+    }
+    h1 {
+      color: #2c3e50;
+    }
+    .button {
+      padding: 10px 20px;
+      font-size: 16px;
+      margin: 5px;
+      cursor: pointer;
+      border: none;
+      border-radius: 4px;
+      background-color: #3498db;
+      color: white;
+    }
+    .button:disabled {
+      background-color: #ccc;
+    }
+    .section {
+      margin-top: 20px;
+      padding: 15px;
+      background: white;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+    }
+    pre {
+      background: #f0f0f0;
+      padding: 10px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+  </style>
 </head>
 <body>
-    <div class="card">
-        <h2>CoinDCX Auto-Trader Dashboard</h2>
-        <div>
-            <button onclick="startBot()" id="startbtn">START</button>
-            <button onclick="stopBot()" id="stopbtn">STOP</button>
-        </div>
-        <div class="pnlbox">
-            <b>USDT Balance:</b> <span id="usdt"></span><br>
-            <b>Last 1hr P&amp;L:</b> <span id="pnl"></span><br>
-            <b>Last 15min P&amp;L:</b> <span id="pnl15"></span><br>
-            <b>Status:</b> <span id="status"></span>
-        </div>
-        <div class="section-title">Recent Trades:</div>
-        <pre class="mono" id="trades"></pre>
-        <div class="section-title">Live Scan Log:</div>
-        <pre class="mono" id="scanlog"></pre>
-    </div>
-<script>
-function refreshStatus() {
-    fetch('/status').then(r => r.json()).then(data => {
-        document.getElementById('usdt').innerText = data.usdt;
-        document.getElementById('pnl').innerText = data.pnl;
-        document.getElementById('pnl15').innerText = data.last_15m_pnl;
-        document.getElementById('status').innerText = data.status;
-        let trades = "";
-        (data.trades || []).forEach(function(t) {
-            trades += `[${t.ts || t.time}] ${t.symbol || t.pair || ""} ${t.side || ""} qty=${t.qty || ""} entry=${t.entry || ""}\n`;
-        });
-        document.getElementById('trades').innerText = trades || "No recent trades.";
-        let scans = "";
-        (data.scan_log || []).forEach(function(line) {
-            scans += line + "\n";
-        });
-        document.getElementById('scanlog').innerText = scans || "No scan log yet.";
-    });
-}
-function startBot() {
-    fetch('/start', {method: "POST"}).then(() => setTimeout(refreshStatus, 500));
-}
-function stopBot() {
-    fetch('/stop', {method: "POST"}).then(() => setTimeout(refreshStatus, 500));
-}
-setInterval(refreshStatus, 3000);
-window.onload = refreshStatus;
-</script>
+  <h1>🪙 CoinDCX Spot Bot</h1>
+
+  <div>
+    <p><strong>USDT Balance:</strong> <span id="usdt">{{ usdt }}</span></p>
+    <button class="button" onclick="startBot()">▶️ Start</button>
+    <button class="button" onclick="stopBot()">⏹ Stop</button>
+  </div>
+
+  <div class="section">
+    <p><strong>Status:</strong> <span id="status">Loading...</span></p>
+    <p><strong>Last Updated:</strong> <span id="last">--</span></p>
+  </div>
+
+  <div class="section">
+    <h3>📊 Recent Trades</h3>
+    <pre id="trades">Loading...</pre>
+  </div>
+
+  <div class="section">
+    <h3>🔍 Scan Logs</h3>
+    <pre id="scans">Loading...</pre>
+  </div>
+
+  <script>
+    async function startBot() {
+      await fetch("/start", { method: "POST" });
+    }
+    async function stopBot() {
+      await fetch("/stop", { method: "POST" });
+    }
+
+    async function refresh() {
+      const res = await fetch("/status");
+      const data = await res.json();
+
+      document.getElementById("status").textContent = data.status;
+      document.getElementById("last").textContent = data.last;
+      document.getElementById("usdt").textContent = data.usdt.toFixed(2);
+
+      let trades = data.trades.map(t => {
+        return `${t.time} | ${t.pair} | ${t.side} @ ${t.entry} | Qty: ${t.qty}\nMsg: ${t.msg}`;
+      }).join("\n");
+      document.getElementById("trades").textContent = trades || "No trades yet.";
+
+      let scans = data.scans.join("\n");
+      document.getElementById("scans").textContent = scans || "No scan data yet.";
+    }
+
+    setInterval(refresh, 3000);
+    refresh();
+  </script>
 </body>
 </html>
