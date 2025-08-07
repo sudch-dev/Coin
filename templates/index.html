@@ -1,76 +1,39 @@
+
 <!DOCTYPE html>
 <html>
 <head>
-  <title>CoinDCX Spot Bot</title>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <style>
-    body { font-family: Arial, sans-serif; padding: 20px; background-color: #f4f4f4; }
-    h2 { margin-top: 30px; }
-    .section { background: white; padding: 15px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 0 5px #ccc; }
-    pre { background: #f9f9f9; padding: 10px; border-radius: 5px; max-height: 300px; overflow: auto; font-size: 14px; }
-    .balance-box { display: flex; flex-wrap: wrap; }
-    .balance-box div { width: 120px; margin: 5px 10px 5px 0; }
-  </style>
+    <title>CoinDCX Live Trader</title>
+    <script>
+        async function refreshStatus() {
+            let res = await fetch("/status");
+            let data = await res.json();
+            document.getElementById("status").innerText = data.status + " (" + data.last + ")";
+            document.getElementById("usdt").innerText = data.usdt.toFixed(2);
+            document.getElementById("pnl").innerText = data.net_pnl.toFixed(2);
+            document.getElementById("coins").innerText = JSON.stringify(data.coins);
+            let trades = data.trades.map(t => JSON.stringify(t)).join("<br>");
+            document.getElementById("trades").innerHTML = trades;
+        }
+        async function startBot() {
+            await fetch("/start", {method: "POST"});
+            refreshStatus();
+        }
+        async function stopBot() {
+            await fetch("/stop", {method: "POST"});
+            refreshStatus();
+        }
+        setInterval(refreshStatus, 5000);
+    </script>
 </head>
-<body>
-  <h1>🪙 CoinDCX Spot Bot</h1>
-
-  <div class="section">
-    <button onclick="sendCommand('/start')">▶ Start</button>
-    <button onclick="sendCommand('/stop')">⏹ Stop</button>
-    <p>Status: <span id="status">Loading...</span></p>
-    <p>Last Updated: <span id="last"></span></p>
-  </div>
-
-  <div class="section">
-    <h2>💰 Wallet Balances</h2>
-    <div class="balance-box" id="balances">Loading...</div>
-  </div>
-
-  <div class="section">
-    <h2>📊 Recent Trades</h2>
-    <pre id="trades">Loading...</pre>
-  </div>
-
-  <div class="section">
-    <h2>🔍 Scan Logs</h2>
-    <pre id="logs">Loading...</pre>
-  </div>
-
-  <script>
-    async function fetchStatus() {
-      const res = await fetch("/status");
-      const data = await res.json();
-
-      document.getElementById("status").innerText = data.status;
-      document.getElementById("last").innerText = data.last;
-
-      // Balances
-      const balances = data.balances || {};
-      const balanceBox = Object.keys(balances).map(
-        k => `<div><strong>${k}:</strong> ${balances[k]}</div>`
-      ).join('');
-      document.getElementById("balances").innerHTML = balanceBox;
-
-      // Trades
-      const trades = data.trades || [];
-      document.getElementById("trades").innerText = trades.map(
-        t => `${t.time} | ${t.pair} | ${t.side} @ ${t.entry} | Qty: ${t.qty}\nMsg: ${t.msg}\nResult: ${JSON.stringify(t.order_result)}\n`
-      ).join('\n');
-
-      // Logs
-      const logs = data.scans || [];
-      document.getElementById("logs").innerText = logs.join('\n');
-    }
-
-    function sendCommand(endpoint) {
-      fetch(endpoint, { method: 'POST' }).then(fetchStatus);
-    }
-
-    // Refresh every 10s
-    setInterval(fetchStatus, 10000);
-    fetchStatus();
-  </script>
+<body onload="refreshStatus()">
+    <h1>CoinDCX Live Trading Dashboard</h1>
+    <p>Status: <span id="status">-</span></p>
+    <p>USDT Balance: $<span id="usdt">-</span></p>
+    <p>Coin Balances: <span id="coins">-</span></p>
+    <p>Net P&L: $<span id="pnl">0.00</span></p>
+    <button onclick="startBot()">Start</button>
+    <button onclick="stopBot()">Stop</button>
+    <h3>Recent Trades:</h3>
+    <div id="trades"></div>
 </body>
 </html>
