@@ -110,7 +110,7 @@ def pa_buy_sell_signal(pair):
         return None
     prev = candles[-2]
     curr = candles[-1]
-    mid = (prev["high"] + prev["close"])
+    mid = (prev["high"] + prev["low"])
 
     if curr["open"] < prev["close"] and curr["high"] > mid:
         return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > mid"}
@@ -191,24 +191,38 @@ def scan_loop():
                     last_candle_ts[pair] = last_candle["start"]
                     signal = pa_buy_sell_signal(pair)
                     if signal:
-                        precision = PAIR_PRECISION.get(pair, 6)
-                        qty = round((0.3 * usdt) / signal['entry'], precision)
-                        tp = round(signal['entry'] * 1.0005, 6)
-                        sl = round(signal['entry'] * 0.999, 6)
-                        result = place_order(pair, signal['side'], qty)
-                        now_ist = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
-                        scan_log.append(f"{now_ist} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} | {signal['msg']} | Result: {result}")
-                        trade_log.append({
-                            "time": now_ist, "pair": pair, "side": signal['side'],
-                            "entry": signal['entry'], "msg": signal['msg'],
-                            "tp": tp, "sl": sl, "qty": qty, "order_result": result
-                        })
-                        exit_orders.append({
-                            "pair": pair, "side": signal['side'],
-                            "qty": qty, "tp": tp, "sl": sl, "entry": signal['entry']
-                        })
-                        if len(trade_log) > 20:
-                            trade_log[:] = trade_log[-20:]
+    precision = PAIR_PRECISION.get(pair, 6)
+    qty = round((0.3 * usdt) / signal['entry'], precision)
+    notional = qty * signal['entry']
+    
+    if notional < 0.12:
+        scan_log.append(f"{now_ist} | {pair} | Skipped ENTRY {signal['side']}: Qty {qty}, Notional {notional:.4f} too low")
+        continue
+
+    # 💡 [SMALL CHANGE] extra validation for BUY logic
+    if signal['side'] == "BUY" and signal['entry'] > prices[pair]["price"]:
+        scan_log.append(f"{now_ist} | {pair} | Skipped BUY: entry > current price (no momentum)")
+        continue
+
+    tp = round(signal['entry'] * 1.0005, 6)
+    sl = round(signal['entry'] * 0.999, 6)
+    result = place_order(pair, signal['side'], qty)
+
+    scan_log.append(f"{now_ist} | {pair} | [{active_strategy['name']}] SIGNAL: {signal['side']} @ {signal['entry']} | {signal['msg']} | Result: {result}")
+    
+    trade_log.append({
+        "time": now_ist, "pair": pair, "side": signal['side"],
+        "entry": signal['entry"], "msg": signal['msg"],
+        "tp": tp, "sl": sl, "qty": qty, "order_result": result
+    })
+
+    exit_orders.append({
+        "pair": pair, "side": signal['side"],
+        "qty": qty, "tp": tp, "sl": sl, "entry": signal['entry']
+    })
+
+    if len(trade_log) > 20:
+        trade_log[:] = trade_log[-20:]
             else:
                 scan_log.append(f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
         if len(scan_log) > 100:
