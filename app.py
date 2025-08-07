@@ -1,11 +1,11 @@
 import os
 import time
-import json
+import threading
 import hmac
 import hashlib
-import threading
-from datetime import datetime, timedelta
 import requests
+import json
+from datetime import datetime
 from flask import Flask, render_template, jsonify
 
 app = Flask(__name__)
@@ -13,45 +13,23 @@ app = Flask(__name__)
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
-PUBLIC_URL = "https://public.coindcx.com"
-
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-PAIR_PRECISION = {
-    'BTCUSDT': 4,
-    'ETHUSDT': 4,
-    'XRPUSDT': 2,
-    'SHIBUSDT': 0,
-    'SOLUSDT': 3,
-    'DOGEUSDT': 2,
-    'ADAUSDT': 2,
-    'MATICUSDT': 2,
-    'BNBUSDT': 3,
-    'LTCUSDT': 3,
-}
-
-scan_interval = 5  # seconds, for faster candle build
-trade_log = []
-scan_log = []
-exit_orders = []
-running = False
-status = {"msg": "Idle"}
-
 tick_logs = {pair: [] for pair in PAIRS}
 candle_logs = {pair: [] for pair in PAIRS}
-last_candle_ts = {pair: 0 for pair in PAIRS}
+scan_log = []
+trade_log = []
+exit_orders = []  # Each: {'pair', 'side', 'qty', 'tp', 'sl', 'entry'}
+running = False
+status = {"msg": "Idle", "last": ""}
 
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def adjust_quantity_precision(symbol, qty):
-    precision = PAIR_PRECISION.get(symbol, 4)
-    return float(f"{qty:.{precision}f}")
-
-def get_balance():
+def get_wallet_balance():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
     headers = {
@@ -61,9 +39,13 @@ def get_balance():
     }
     try:
         r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
-        if r.ok: return r.json()
-    except Exception: pass
-    return []
+        if r.ok:
+            for b in r.json():
+                if b['currency'] == "USDT":
+                    return float(b['balance'])
+    except Exception:
+        pass
+    return 0.0
 
 def fetch_all_prices():
     try:
@@ -77,7 +59,8 @@ def fetch_all_prices():
                 if m in PAIRS:
                     price_map[m] = {"price": float(item["last_price"]), "ts": now}
             return price_map
-    except Exception: pass
+    except Exception:
+        pass
     return {}
 
 def aggregate_candles(pair, interval=60):
@@ -118,7 +101,7 @@ def pa_buy_sell_signal(pair):
         return None
     prev = candles[-2]
     curr = candles[-1]
-    mid = (prev["high"] + prev["close"]) / 2
+    mid = (prev["high"] + prev["low"]) / 2
 
     # BUY
     if curr["open"] < prev["close"] and curr["high"] > mid:
@@ -128,10 +111,9 @@ def pa_buy_sell_signal(pair):
         return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
     return None
 
-def place_order(symbol, side, qty):
-    qty = adjust_quantity_precision(symbol, qty)
+def place_order(pair, side, qty):
     payload = {
-        "market": symbol,
+        "market": pair,
         "side": "buy" if side == "BUY" else "sell",
         "order_type": "market_order",
         "total_quantity": str(qty),
@@ -171,16 +153,13 @@ def monitor_exits(prices):
 def scan_loop():
     global running, scan_log, status
     scan_log.clear()
+    last_candle_ts = {p: 0 for p in PAIRS}
     interval = 60  # 1 min candles
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
         log_lines = []
         monitor_exits(prices)
-        balances = get_balance()
-        usdt = 0
-        for b in balances:
-            if b['currency'] == 'USDT': usdt = float(b['balance'])
         for pair in PAIRS:
             if pair in prices:
                 price = prices[pair]["price"]
@@ -193,16 +172,16 @@ def scan_loop():
                 if last_candle and last_candle["start"] != last_candle_ts[pair]:
                     last_candle_ts[pair] = last_candle["start"]
                     signal = pa_buy_sell_signal(pair)
-                    if signal and usdt > 5:
-                        qty = (0.1 * usdt) / signal['entry']
-                        qty = adjust_quantity_precision(pair, qty)
+                    if signal:
+                        usdt = get_wallet_balance()
+                        qty = round((0.3 * usdt) / signal['entry'], 6)
                         tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
                         sl = round(signal['entry'] * 0.999, 6)   # -0.1%
                         result = place_order(pair, signal['side'], qty)
                         scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
                         trade = {
-                            "ts": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
-                            "symbol": pair,
+                            "time": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+                            "pair": pair,
                             "side": signal['side'],
                             "entry": signal['entry'],
                             "msg": signal['msg'],
@@ -220,30 +199,31 @@ def scan_loop():
                             "sl": sl,
                             "entry": signal['entry']
                         })
-                        if len(trade_log) > 30:
-                            trade_log[:] = trade_log[-30:]
+                        if len(trade_log) > 20:
+                            trade_log[:] = trade_log[-20:]
             else:
                 log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
         scan_log.extend(log_lines)
-        if len(scan_log) > 120:
-            scan_log[:] = scan_log[-120:]
+        if len(scan_log) > 100:
+            scan_log[:] = scan_log[-100:]
         status["msg"] = "Running"
         status["last"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        time.sleep(scan_interval)
+        time.sleep(5)
     status["msg"] = "Idle"
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    usdt = get_wallet_balance()
+    return render_template("index.html", usdt=usdt)
 
 @app.route("/start", methods=["POST"])
 def start():
     global running
     if not running:
         running = True
-        thread = threading.Thread(target=scan_loop)
-        thread.daemon = True
-        thread.start()
+        t = threading.Thread(target=scan_loop)
+        t.daemon = True
+        t.start()
     return jsonify({"status": "started"})
 
 @app.route("/stop", methods=["POST"])
@@ -254,38 +234,17 @@ def stop():
 
 @app.route("/status")
 def get_status():
-    balances = get_balance()
-    usdt_bal = 0
-    for b in balances:
-        if b['currency'] == 'USDT':
-            usdt_bal = b['balance']
-    now = datetime.utcnow()
-    cutoff_1hr = now - timedelta(hours=1)
-    cutoff_15m = now - timedelta(minutes=15)
-    pnl_1hr = 0
-    pnl_15m = 0
-
-    for trade in trade_log[-50:]:
-        t_time = datetime.strptime(trade["ts"], '%Y-%m-%d %H:%M:%S')
-        if "side" in trade and "qty" in trade and "entry" in trade:
-            exit_price = trade.get("tp", trade["entry"])  # Use TP if available, else entry
-            qty = trade["qty"]
-            if trade["side"] == "BUY":
-                profit = (exit_price - trade["entry"]) * qty
-            else:
-                profit = (trade["entry"] - exit_price) * qty
-            if t_time > cutoff_1hr:
-                pnl_1hr += profit
-            if t_time > cutoff_15m:
-                pnl_15m += profit
-
+    usdt = get_wallet_balance()
+    trades = trade_log[-10:]
+    scans = scan_log[-30:]
+    candles_out = {p: candle_logs[p][-5:] for p in PAIRS}
     return jsonify({
         "status": status["msg"],
-        "usdt": usdt_bal,
-        "trades": trade_log[-10:][::-1],
-        "scan_log": scan_log[-40:][::-1],
-        "pnl": round(pnl_1hr, 2),
-        "last_15m_pnl": round(pnl_15m, 2)
+        "last": status["last"],
+        "usdt": usdt,
+        "trades": trades[::-1],
+        "scans": scans[::-1],
+        "candles": candles_out
     })
 
 @app.route("/ping")
