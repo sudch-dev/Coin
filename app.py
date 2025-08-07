@@ -1,26 +1,31 @@
 
-import os, hmac, hashlib, time, requests, json, sqlite3
-from flask import Flask, jsonify, request
+import os
+import hmac
+import hashlib
+import time
+import requests
+import json
+import sqlite3
+from flask import Flask, jsonify, request, send_file
 from datetime import datetime
 import pytz
-from flask import send_file
-
-
 
 app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return send_file(os.path.join(os.path.dirname(__file__), "index.html"))
+
 API_KEY = os.environ.get('API_KEY')
 API_SECRET = os.environ.get('API_SECRET').encode()
 BASE_URL = "https://api.coindcx.com"
-symbol = "BTCUSDT"; market = "BTC/USDT"
+symbol = "BTCUSDT"
+market = "BTC/USDT"
 
 conn = sqlite3.connect('trading_data.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS candle_data (timestamp TEXT PRIMARY KEY, symbol TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
 conn.commit()
-
-@app.route("/")
-def home():
-    return send_file("index.html")
 
 def get_ist_time():
     return datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
