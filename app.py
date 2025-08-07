@@ -114,9 +114,7 @@ def pa_buy_sell_signal(pair):
     curr = candles[-1]
 
     # ✅ BUY Signal: Bullish breakout
-    if curr["close"] > curr["open"] and \
-       curr["close"] > prev["high"] and \
-       curr["open"] <= prev["close"]:
+    if curr["close"] > curr["open"]:
         return {
             "side": "BUY",
             "entry": curr["close"],
@@ -124,9 +122,7 @@ def pa_buy_sell_signal(pair):
         }
 
     # ✅ SELL Signal: Bearish breakdown
-    if curr["close"] < curr["open"] and \
-       curr["close"] < prev["low"] and \
-       curr["open"] >= prev["close"]:
+    if curr["close"] < curr["open"]:
         return {
             "side": "SELL",
             "entry": curr["close"],
@@ -201,7 +197,7 @@ def scan_loop():
                     last_candle_ts[pair] = last_candle["start"]
                     signal = pa_buy_sell_signal(pair)
                     if signal and usdt > 5:
-                        qty = (0.3 * usdt) / signal['entry']
+                        qty = (0.05 * usdt) / signal['entry']
                         qty = adjust_quantity_precision(pair, qty)
                         tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
                         sl = round(signal['entry'] * 0.999, 6)   # -0.1%
