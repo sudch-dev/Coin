@@ -107,7 +107,7 @@ def pa_buy_sell_signal(pair):
     if curr["open"] < prev["close"] and curr["high"] > mid:
         return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > prev midpoint"}
     # SELL
-    if curr["open"] > prev["close"] and curr["low"] < mid * .998:
+    if curr["open"] > prev["close"] and curr["low"] < mid * 1.2:
         return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
     return None
 
