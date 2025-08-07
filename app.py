@@ -16,14 +16,21 @@ BASE_URL = "https://api.coindcx.com"
 PUBLIC_URL = "https://public.coindcx.com"
 
 PAIRS = [
-    "BTCUSDT", "ETHUSDT","SOLUSDT","DOGEUSDT"
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
+    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
 PAIR_PRECISION = {
     'BTCUSDT': 4,
     'ETHUSDT': 4,
+    'XRPUSDT': 2,
+    'SHIBUSDT': 0,
     'SOLUSDT': 3,
-    'DOGEUSDT': 2
+    'DOGEUSDT': 2,
+    'ADAUSDT': 2,
+    'MATICUSDT': 2,
+    'BNBUSDT': 3,
+    'LTCUSDT': 3,
 }
 
 scan_interval = 5  # seconds, for faster candle build
@@ -106,29 +113,19 @@ def aggregate_candles(pair, interval=60):
     candle_logs[pair] = candles[-50:]
 
 def pa_buy_sell_signal(pair):
-    candles = candle_logs.get(pair, [])
+    candles = candle_logs[pair]
     if len(candles) < 2:
         return None
-
     prev = candles[-2]
     curr = candles[-1]
+    mid = (prev["high"] + prev["close"]) / 2
 
-    # ✅ BUY Signal: Bullish breakout
-    if curr["close"] > curr["open"]:
-        return {
-            "side": "BUY",
-            "entry": curr["close"],
-            "msg": "PA BUY: Bullish breakout over prev high with open below prev close"
-        }
-
-    # ✅ SELL Signal: Bearish breakdown
-    if curr["close"] < curr["open"]:
-        return {
-            "side": "SELL",
-            "entry": curr["close"],
-            "msg": "PA SELL: Bearish breakdown below prev low with open above prev close"
-        }
-
+    # BUY
+    if curr["open"] < prev["close"] and curr["high"] > mid:
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: open < prev close & high > prev midpoint"}
+    # SELL
+    if curr["open"] > prev["close"] and curr["low"] < mid:
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: open > prev close & low < prev midpoint"}
     return None
 
 def place_order(symbol, side, qty):
@@ -197,7 +194,7 @@ def scan_loop():
                     last_candle_ts[pair] = last_candle["start"]
                     signal = pa_buy_sell_signal(pair)
                     if signal and usdt > 5:
-                        qty = (0.05 * usdt) / signal['entry']
+                        qty = (0.1 * usdt) / signal['entry']
                         qty = adjust_quantity_precision(pair, qty)
                         tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
                         sl = round(signal['entry'] * 0.999, 6)   # -0.1%
