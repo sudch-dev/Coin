@@ -1,118 +1,100 @@
-
 import os
+import time
 import hmac
 import hashlib
-import time
 import requests
 import json
-import sqlite3
-from flask import Flask, jsonify, request, send_file
-from datetime import datetime
-import pytz
+from flask import Flask, request, render_template, jsonify
 
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return send_file(os.path.join(os.path.dirname(__file__), "index.html"))
-
-API_KEY = os.environ.get('API_KEY')
-API_SECRET = os.environ.get('API_SECRET').encode()
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET", "").encode()
 BASE_URL = "https://api.coindcx.com"
-symbol = "BTCUSDT"
-market = "BTC/USDT"
 
-conn = sqlite3.connect('trading_data.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS candle_data (timestamp TEXT PRIMARY KEY, symbol TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
-conn.commit()
+def hmac_signature(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def get_ist_time():
-    return datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
-
-def save_candle_to_db(symbol, c):
-    cursor.execute("INSERT OR IGNORE INTO candle_data (timestamp, symbol, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (c['timestamp'], symbol, c['open'], c['high'], c['low'], c['close'], c['volume']))
-    conn.commit()
-
-def get_last_n_closes(symbol, n):
-    cursor.execute("SELECT close FROM candle_data WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?", (symbol, n))
-    return [row[0] for row in reversed(cursor.fetchall())]
-
-def calculate_ema(prices, window):
-    ema = prices[0]; k = 2 / (window + 1)
-    for price in prices[1:]: ema = price * k + ema * (1 - k)
-    return round(ema, 2)
+def get_headers(payload):
+    signature = hmac_signature(payload)
+    return {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+        "Content-Type": "application/json"
+    }
 
 def get_wallet_balances():
-    ts = int(time.time() * 1000)
-    body = {'timestamp': ts}
-    sig = hmac.new(API_SECRET, json.dumps(body, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
-    headers = {'X-AUTH-APIKEY': API_KEY, 'X-AUTH-SIGNATURE': sig, 'Content-Type': 'application/json'}
-    r = requests.post(BASE_URL + "/exchange/v1/users/balances", data=json.dumps(body), headers=headers)
-    if r.status_code == 200:
-        b = r.json()
-        usdt = next((float(x['balance']) for x in b if x['currency'] == 'USDT'), 0)
-        coin = next((float(x['balance']) for x in b if x['currency'] == 'BTC'), 0)
-        return usdt, coin
-    return 0, 0
+    payload = '{"timestamp":' + str(int(time.time() * 1000)) + '}'
+    headers = get_headers(payload)
+    response = requests.post(BASE_URL + "/api/v1/user/balances", data=payload, headers=headers)
+    return {item['currency']: float(item['balance']) for item in response.json()}
 
-def place_order(side, price, qty):
-    ts = int(time.time() * 1000)
-    body = {
-        "market": market, "side": side, "order_type": "market",
-        "price_per_unit": str(price), "total_quantity": str(qty), "timestamp": ts
+def place_market_order(side, pair, quantity):
+    payload = {
+        "side": side,
+        "order_type": "market_order",
+        "market": pair,
+        "total_quantity": quantity,
+        "timestamp": int(time.time() * 1000)
     }
-    sig = hmac.new(API_SECRET, json.dumps(body, separators=(',', ':')).encode(), hashlib.sha256).hexdigest()
-    headers = {'X-AUTH-APIKEY': API_KEY, 'X-AUTH-SIGNATURE': sig, 'Content-Type': 'application/json'}
-    return requests.post(BASE_URL + "/exchange/v1/orders/create", data=json.dumps(body), headers=headers).json()
+    payload_json = json.dumps(payload)
+    headers = get_headers(payload_json)
+    response = requests.post(BASE_URL + "/api/v1/orders/create", data=payload_json, headers=headers)
+    return response.json()
 
-def fetch_live_candle():
-    r = requests.get(f"https://public.coindcx.com/market_data/candles?pair={symbol}&interval=1m&limit=2")
-    if r.status_code == 200:
-        return [{
-            'timestamp': datetime.fromtimestamp(c[0] / 1000).strftime('%Y-%m-%d %H:%M:%S'),
-            'open': float(c[1]), 'high': float(c[2]), 'low': float(c[3]),
-            'close': float(c[4]), 'volume': float(c[5])
-        } for c in r.json()]
+def log_trade(entry):
+    entry["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open("trade_log.json", "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/buy", methods=["POST"])
+def buy():
+    data = request.json
+    pair = data["pair"]
+    price = float(data["candles"][-1]["close"])
+    balances = get_wallet_balances()
+    usdt = balances.get("USDT", 0.0)
+    qty = round((usdt * 0.3) / price, 6)
+    order = place_market_order("buy", pair, qty)
+    log_trade({ "pair": pair, "side": "buy", "qty": qty, "price": price, "candles": data["candles"] })
+    return jsonify(order)
+
+@app.route("/api/sell", methods=["POST"])
+def sell():
+    data = request.json
+    pair = data["pair"]
+    coin = pair.replace("USDT", "")
+    balances = get_wallet_balances()
+    qty = balances.get(coin, 0.0)
+    price = float(data["candles"][-1]["close"])
+    order = place_market_order("sell", pair, qty)
+    log_trade({ "pair": pair, "side": "sell", "qty": qty, "price": price, "candles": data["candles"] })
+    return jsonify(order)
+
+def pa_buy_sell_signal(pair, candles, current_price):
+    if len(candles) < 2:
+        return None
+    prev1 = candles[-1]
+    prev2 = candles[-2]
+
+    highest_high = max(prev1["high"], prev2["high"])
+    lowest_low = min(prev1["low"], prev2["low"])
+
+    if current_price > highest_high:
+        return {"side": "BUY", "entry": current_price, "msg": "Breakout above 2-candle high"}
+
+    if current_price < lowest_low:
+        return {"side": "SELL", "entry": current_price, "msg": "Breakdown below 2-candle low"}
+
     return None
 
-trades = []; bot_running = False; net_pnl = 0.0
-
-@app.route("/start", methods=["POST"])
-def start(): global bot_running; bot_running = True; return jsonify({"status": "started"})
-
-@app.route("/stop", methods=["POST"])
-def stop(): global bot_running; bot_running = False; return jsonify({"status": "stopped"})
-
-@app.route("/status")
-def status():
-    usdt, coin = get_wallet_balances()
-    return jsonify({"status": "Running" if bot_running else "Stopped", "last": get_ist_time(),
-                    "usdt": usdt, "coins": {"BTC": coin}, "net_pnl": net_pnl, "trades": trades[-5:]})
-
-@app.route("/scan")
-def scan():
-    global net_pnl
-    if not bot_running: return jsonify({"status": "Bot stopped"})
-    candles = fetch_live_candle()
-    if not candles: return jsonify({"status": "No candle"})
-    for c in candles: save_candle_to_db(symbol, c)
-    closes = get_last_n_closes(symbol, 10)
-    if len(closes) < 10: return jsonify({"status": "Need more data"})
-    ema5 = calculate_ema(closes[-5:], 5); ema10 = calculate_ema(closes, 10)
-    usdt, coin = get_wallet_balances(); decision = None
-    if ema5 > ema10 and usdt > 10:
-        qty = round((usdt * 0.3) / closes[-1], 6)
-        resp = place_order("buy", closes[-1], qty)
-        trades.append({"type": "BUY", "price": closes[-1], "time": get_ist_time()})
-        decision = f"BUY {qty} BTC"
-    elif ema5 < ema10 and coin > 0.001:
-        resp = place_order("sell", closes[-1], coin)
-        trades.append({"type": "SELL", "price": closes[-1], "time": get_ist_time()})
-        decision = f"SELL {coin} BTC"
-    return jsonify({"timestamp": get_ist_time(), "price": closes[-1], "ema5": ema5, "ema10": ema10,
-                    "decision": decision or "HOLD", "trades": trades[-5:]})
+@app.route("/ping")
+def ping():
+    return "pong"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
