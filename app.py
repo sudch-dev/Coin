@@ -5,9 +5,7 @@ from datetime import datetime
 import pytz
 from flask import send_file
 
-@app.route("/")
-def home():
-    return send_file("index.html")
+
 
 app = Flask(__name__)
 API_KEY = os.environ.get('API_KEY')
@@ -19,6 +17,10 @@ conn = sqlite3.connect('trading_data.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS candle_data (timestamp TEXT PRIMARY KEY, symbol TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL)")
 conn.commit()
+
+@app.route("/")
+def home():
+    return send_file("index.html")
 
 def get_ist_time():
     return datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
