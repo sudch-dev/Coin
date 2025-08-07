@@ -202,12 +202,12 @@ def scan_loop():
                         if len(trade_log) > 20:
                             trade_log[:] = trade_log[-20:]
             else:
-                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
+                log_lines.append(f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
         scan_log.extend(log_lines)
         if len(scan_log) > 100:
             scan_log[:] = scan_log[-100:]
         status["msg"] = "Running"
-        status["last"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        status["last"] = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
         time.sleep(5)
     status["msg"] = "Idle"
 
