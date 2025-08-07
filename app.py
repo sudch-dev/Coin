@@ -141,11 +141,11 @@ def monitor_exits(prices):
             # For spot, to exit a buy, you "sell"; to exit a sell, you "buy"
             if side == "BUY" and (price >= tp or price <= sl):
                 result = place_order(pair, "SELL", qty)
-                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT SELL {qty} at {price} (TP/SL) | Result: {result}")
+                scan_log.append(f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT SELL {qty} at {price} (TP/SL) | Result: {result}")
                 to_remove.append(ex)
             elif side == "SELL" and (price <= tp or price >= sl):
                 result = place_order(pair, "BUY", qty)
-                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT BUY {qty} at {price} (TP/SL) | Result: {result}")
+                scan_log.append(f"{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT BUY {qty} at {price} (TP/SL) | Result: {result}")
                 to_remove.append(ex)
     for ex in to_remove:
         exit_orders.remove(ex)
