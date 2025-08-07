@@ -114,7 +114,7 @@ def place_order(pair, side, qty):
     payload = {
         "market": pair,
         "side": "buy" if side == "BUY" else "sell",
-        "order_type": "market_order",
+        "order_type": "market",
         "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000)
     }
