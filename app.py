@@ -101,7 +101,7 @@ def pa_buy_sell_signal(pair):
         return None
     prev = candles[-2]
     curr = candles[-1]
-    mid = (prev["high"] + prev["low"]) / 2
+    mid = (prev["high"] + prev["low"]) / 4 * 3
 
     # BUY
     if curr["open"] < prev["close"] and curr["high"] > mid:
@@ -174,7 +174,7 @@ def scan_loop():
                     signal = pa_buy_sell_signal(pair)
                     if signal:
                         usdt = get_wallet_balance()
-                        qty = round((0.3 * usdt) / signal['entry'], 6)
+                        qty = round((0.1 * usdt) / signal['entry'], 6)
                         tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
                         sl = round(signal['entry'] * 0.999, 6)   # -0.1%
                         result = place_order(pair, signal['side'], qty)
