@@ -252,4 +252,4 @@ def ping():
     return "pong"
 
 if __name__ == "__main__":
-    apprun(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=10000)
