@@ -17,7 +17,7 @@ API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
 PAIRS = [
 
-PAIR_RULES = {
+PAIR_RULES == {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
