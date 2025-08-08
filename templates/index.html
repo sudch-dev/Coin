@@ -92,3 +92,15 @@ refreshData();
 </script>
 </body>
 </html>
+
+<!-- Auto-start every 5 minutes to prevent Render server from sleeping -->
+<script>
+setInterval(() => {
+    fetch('/start', { method: 'POST' })
+        .then(res => res.json())
+        .then(data => {
+            console.log("✅ Auto-start ping every 5 min:", data.status);
+        })
+        .catch(err => console.error("Auto-start error:", err));
+}, 300000); // 300000 ms = 5 minutes
+</script>
