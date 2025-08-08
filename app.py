@@ -1,3 +1,4 @@
+
 import os
 import time
 import threading
@@ -5,8 +6,9 @@ import hmac
 import hashlib
 import requests
 import json
-from datetime import datetime
 from flask import Flask, render_template, jsonify
+from datetime import datetime, timedelta
+from pytz import timezone
 
 app = Flask(__name__)
 
@@ -18,125 +20,87 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-tick_logs = {pair: [] for pair in PAIRS}
-candle_logs = {pair: [] for pair in PAIRS}
-scan_log = []
-trade_log = []
-exit_orders = []  # Each: {'pair', 'side', 'qty', 'tp', 'sl', 'entry'}
+IST = timezone('Asia/Kolkata')
+def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
+def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
+scan_log, trade_log, exit_orders = [], [], []
+daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
+error_message = ""
 
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def get_wallet_balance():
+def fetch_pair_precisions():
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
+        if r.ok:
+            for item in r.json():
+                if item["pair"] in PAIRS:
+                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
+    except: pass
+
+def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sig,
-        "Content-Type": "application/json"
-    }
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    balances = {}
     try:
         r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
         if r.ok:
             for b in r.json():
-                if b['currency'] == "USDT":
-                    return float(b['balance'])
-    except Exception:
-        pass
-    return 0.0
+                balances[b['currency']] = float(b['balance'])
+    except: pass
+    return balances
 
 def fetch_all_prices():
     try:
         r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
         if r.ok:
-            data = r.json()
-            price_map = {}
             now = int(time.time())
-            for item in data:
-                m = item["market"]
-                if m in PAIRS:
-                    price_map[m] = {"price": float(item["last_price"]), "ts": now}
-            return price_map
-    except Exception:
-        pass
+            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
+                    for item in r.json() if item["market"] in PAIRS}
+    except: pass
     return {}
 
 def aggregate_candles(pair, interval=60):
     ticks = tick_logs[pair]
-    if not ticks:
-        return
-    window = interval  # 1 minute = 60 seconds
-    candles = []
-    ticks_sorted = sorted(ticks, key=lambda x: x[0])
-    candle = None
-    last_window = None
-    for ts, price in ticks_sorted:
-        wstart = ts - (ts % window)
+    if not ticks: return
+    candles, candle, last_window = [], None, None
+    for ts, price in sorted(ticks, key=lambda x: x[0]):
+        wstart = ts - (ts % interval)
         if last_window != wstart:
-            if candle:
-                candles.append(candle)
-            candle = {
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 1,
-                "start": wstart
-            }
+            if candle: candles.append(candle)
+            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
             last_window = wstart
         else:
             candle["high"] = max(candle["high"], price)
             candle["low"] = min(candle["low"], price)
             candle["close"] = price
             candle["volume"] += 1
-    if candle:
-        candles.append(candle)
+    if candle: candles.append(candle)
     candle_logs[pair] = candles[-50:]
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3:
-        return None
-
-    prev1 = candles[-3]  # candle before previous
-    prev2 = candles[-2]  # previous candle
-    curr = candles[-1]   # current/latest candle
-
-    # BUY condition: current high > previous two highs and price crosses above current close
+    if len(candles) < 3: return None
+    prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
     if curr["high"] > prev1["high"] and curr["high"] > prev2["high"] and curr["close"] > curr["open"]:
-        return {
-            "side": "BUY",
-            "entry": curr["close"],
-            "msg": "PA BUY: high > last 2 highs and close breakout"
-        }
-
-    # SELL condition: current low < previous two lows and price crosses below current close
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: high > last 2 highs and close breakout"}
     if curr["low"] < prev1["low"] and curr["low"] < prev2["low"] and curr["close"] < curr["open"]:
-        return {
-            "side": "SELL",
-            "entry": curr["close"],
-            "msg": "PA SELL: low < last 2 lows and close breakdown"
-        }
-
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: low < last 2 lows and close breakdown"}
     return None
 
 def place_order(pair, side, qty):
-    payload = {
-        "market": pair,
-        "side": "buy" if side == "BUY" else "sell",
-        "order_type": "market_order",
-        "total_quantity": str(qty),
-        "timestamp": int(time.time() * 1000)
-    }
+    payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
+               "timestamp": int(time.time() * 1000)}
     body = json.dumps(payload)
     sig = hmac_signature(body)
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sig,
-        "Content-Type": "application/json"
-    }
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
     try:
         r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
         return r.json()
@@ -144,88 +108,71 @@ def place_order(pair, side, qty):
         return {"error": str(e)}
 
 def monitor_exits(prices):
+    global error_message
     to_remove = []
     for ex in exit_orders:
-        pair, side, qty, tp, sl, entry = ex["pair"], ex["side"], ex["qty"], ex["tp"], ex["sl"], ex["entry"]
+        pair, side, qty, tp, sl, entry = ex.values()
         price = prices.get(pair, {}).get("price")
-        if price:
-            # For spot, to exit a buy, you "sell"; to exit a sell, you "buy"
-            if side == "BUY" and (price >= tp or price <= sl):
-                result = place_order(pair, "SELL", qty)
-                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT SELL {qty} at {price} (TP/SL) | Result: {result}")
-                to_remove.append(ex)
-            elif side == "SELL" and (price <= tp or price >= sl):
-                result = place_order(pair, "BUY", qty)
-                scan_log.append(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | {pair} | EXIT BUY {qty} at {price} (TP/SL) | Result: {result}")
-                to_remove.append(ex)
-    for ex in to_remove:
-        exit_orders.remove(ex)
+        if not price: continue
+        if side == "BUY" and (price >= tp or price <= sl):
+            res = place_order(pair, "SELL", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
+            pl = (price - entry) * qty
+            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+        elif side == "SELL" and (price <= tp or price >= sl):
+            res = place_order(pair, "BUY", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
+            pl = (entry - price) * qty
+            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+    for ex in to_remove: exit_orders.remove(ex)
 
 def scan_loop():
-    global running, scan_log, status
+    global running, error_message
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
-    interval = 60  # 1 min candles
+    interval = 60
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
-        log_lines = []
         monitor_exits(prices)
+        balances = get_wallet_balances()
         for pair in PAIRS:
-            if pair in prices:
-                price = prices[pair]["price"]
-                tick_logs[pair].append((now, price))
-                if len(tick_logs[pair]) > 1000:
-                    tick_logs[pair] = tick_logs[pair][-1000:]
-                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: {price}")
-                aggregate_candles(pair, interval)
-                last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
-                if last_candle and last_candle["start"] != last_candle_ts[pair]:
-                    last_candle_ts[pair] = last_candle["start"]
-                    signal = pa_buy_sell_signal(pair)
-                    if signal:
-                        usdt = get_wallet_balance()
-                        qty = round((0.3 * usdt) / signal['entry'], 6)
-                        tp = round(signal['entry'] * 1.0005, 6)  # +0.05%
-                        sl = round(signal['entry'] * 0.999, 6)   # -0.1%
-                        result = place_order(pair, signal['side'], qty)
-                        scan_log.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | SIGNAL: {signal['side']} @ {signal['entry']} ({signal['msg']}) | ORDER: {result}")
-                        trade = {
-                            "time": datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
-                            "pair": pair,
-                            "side": signal['side'],
-                            "entry": signal['entry'],
-                            "msg": signal['msg'],
-                            "tp": tp,
-                            "sl": sl,
-                            "qty": qty,
-                            "order_result": result
-                        }
-                        trade_log.append(trade)
-                        exit_orders.append({
-                            "pair": pair,
-                            "side": signal['side'],
-                            "qty": qty,
-                            "tp": tp,
-                            "sl": sl,
-                            "entry": signal['entry']
-                        })
-                        if len(trade_log) > 20:
-                            trade_log[:] = trade_log[-20:]
-            else:
-                log_lines.append(f"{datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} | {pair} | price: -")
-        scan_log.extend(log_lines)
-        if len(scan_log) > 100:
-            scan_log[:] = scan_log[-100:]
-        status["msg"] = "Running"
-        status["last"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            if pair not in prices: continue
+            price = prices[pair]["price"]
+            tick_logs[pair].append((now, price))
+            if len(tick_logs[pair]) > 1000: tick_logs[pair] = tick_logs[pair][-1000:]
+            aggregate_candles(pair, interval)
+            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
+            if last_candle and last_candle["start"] != last_candle_ts[pair]:
+                last_candle_ts[pair] = last_candle["start"]
+                signal = pa_buy_sell_signal(pair)
+                if signal:
+                    error_message = ""
+                    coin = pair[:-4]
+                    qty = (0.3 * balances.get("USDT", 0)) / signal["entry"] if signal["side"] == "BUY" else balances.get(coin, 0)
+                    qty = round(qty, pair_precision.get(pair, 6))
+                    tp = round(signal['entry'] * 1.0005, 6)
+                    sl = round(signal['entry'] * 0.999, 6)
+                    res = place_order(pair, signal["side"], qty)
+                    if "error" in res: error_message = res["error"]
+                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
+                    trade_log.append({
+                        "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
+                        "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
+                    })
+                    exit_orders.append({ "pair": pair, "side": signal["side"], "qty": qty,
+                                         "tp": tp, "sl": sl, "entry": signal["entry"] })
+        status["msg"], status["last"] = "Running", ist_now()
         time.sleep(5)
     status["msg"] = "Idle"
 
 @app.route("/")
 def index():
-    usdt = get_wallet_balance()
-    return render_template("index.html", usdt=usdt)
+    return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
 def start():
@@ -245,22 +192,20 @@ def stop():
 
 @app.route("/status")
 def get_status():
-    usdt = get_wallet_balance()
-    trades = trade_log[-10:]
-    scans = scan_log[-30:]
-    candles_out = {p: candle_logs[p][-5:] for p in PAIRS}
+    balances = get_wallet_balances()
+    coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
     return jsonify({
-        "status": status["msg"],
-        "last": status["last"],
-        "usdt": usdt,
-        "trades": trades[::-1],
-        "scans": scans[::-1],
-        "candles": candles_out
+        "status": status["msg"], "last": status["last"],
+        "usdt": balances.get("USDT", 0.0),
+        "profit_today": round(daily_profit.get(ist_date(), 0), 4),
+        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
+        "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
+        "error": error_message
     })
 
 @app.route("/ping")
-def ping():
-    return "pong"
+def ping(): return "pong"
 
 if __name__ == "__main__":
+    fetch_pair_precisions()
     app.run(host="0.0.0.0", port=10000)
