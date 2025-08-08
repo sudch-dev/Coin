@@ -16,8 +16,11 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
 PAIRS = [
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
+    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
+]
 
-PAIR_RULES == {
+PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
@@ -29,10 +32,6 @@ PAIR_RULES == {
     "LTCUSDT": {"precision": 2, "min_qty": 0.01},
     "BNBUSDT": {"precision": 4, "min_qty": 0.001}
 }
-
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
-]
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
