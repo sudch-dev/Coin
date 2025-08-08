@@ -174,7 +174,8 @@ def scan_loop():
             rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
             qty = max(qty, rule["min_qty"])
             qty = round(qty, rule["precision"])
-                    if "error" in res: error_message = res["error"]
+            if "error" in res:
+                error_message = res["error"]
                     scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
