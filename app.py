@@ -176,7 +176,7 @@ def scan_loop():
             qty = round(qty, rule["precision"])
             if "error" in res:
                 error_message = res["error"]
-                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
+            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
                         "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
