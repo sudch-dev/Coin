@@ -35,14 +35,17 @@ error_message = ""
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
+
 def fetch_pair_precisions():
     try:
-        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
+        r = requests.get(f"{BASE_URL}/exchange/v1/market_details", timeout=10)
         if r.ok:
             for item in r.json():
-                if item["pair"] in PAIRS:
-                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
-    except: pass
+                pair = item.get("pair")
+                if pair in PAIRS:
+                    pair_precision[pair] = int(item.get("base_currency_precision", 6))
+    except Exception as e:
+        print(f"Error fetching pair precision: {e}")
 
 def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
@@ -87,27 +90,12 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3:
-        return None
-
+    if len(candles) < 3: return None
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-
-    # Relaxed BUY: current high > max(prev1, prev2 high)
-    if curr["high"] > max(prev1["high"], prev2["high"]):
-        return {
-            "side": "BUY",
-            "entry": curr["close"],
-            "msg": "PA BUY: high > last 2 highs"
-        }
-
-    # Relaxed SELL: current low < min(prev1, prev2 low)
-    if curr["low"] < min(prev1["low"], prev2["low"]):
-        return {
-            "side": "SELL",
-            "entry": curr["close"],
-            "msg": "PA SELL: low < last 2 lows"
-        }
-
+    if curr["high"] > prev1["high"] and curr["high"] > prev2["high"] and curr["close"] > curr["open"]:
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: high > last 2 highs and close breakout"}
+    if curr["low"] < prev1["low"] and curr["low"] < prev2["low"] and curr["close"] < curr["open"]:
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: low < last 2 lows and close breakdown"}
     return None
 
 def place_order(pair, side, qty):
