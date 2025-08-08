@@ -166,6 +166,7 @@ def scan_loop():
                     tp = round(signal['entry'] * 1.0005, 6)
                     sl = round(signal['entry'] * 0.999, 6)
                     res = place_order(pair, signal["side"], qty)
+                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
                     if "error" in res: error_message = res["error"]
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
