@@ -58,7 +58,7 @@ def fetch_pair_precisions():
     except: pass
 
 def get_wallet_balances():
-    payload = json.dumps({"timestamp": int(time.time() * 1000)})
+            payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
     headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
     balances = {}
@@ -125,7 +125,7 @@ def monitor_exits(prices):
     to_remove = []
     for ex in exit_orders:
         pair, side, qty, tp, sl, entry = ex.values()
-        price = prices.get(pair, {}).get("price")
+            price = prices.get(pair, {}).get("price")
         if not price: continue
         if side == "BUY" and (price >= tp or price <= sl):
             res = place_order(pair, "SELL", qty)
@@ -177,12 +177,12 @@ def scan_loop():
             if "error" in res:
                 error_message = res["error"]
             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
-                    trade_log.append({
-                        "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
-                        "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
-                    })
-                    exit_orders.append({ "pair": pair, "side": signal["side"], "qty": qty,
-                                         "tp": tp, "sl": sl, "entry": signal["entry"] })
+            trade_log.append({
+                "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
+                "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
+            })
+                exit_orders.append({ "pair": pair, "side": signal["side"], "qty": qty,
+                "tp": tp, "sl": sl, "entry": signal["entry"] })
         status["msg"], status["last"] = "Running", ist_now()
         time.sleep(5)
     status["msg"] = "Idle"
@@ -199,13 +199,13 @@ def start():
         t = threading.Thread(target=scan_loop)
         t.daemon = True
         t.start()
-    return jsonify({"status": "started"})
+            return jsonify({"status": "started"})
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global running
     running = False
-    return jsonify({"status": "stopped"})
+            return jsonify({"status": "stopped"})
 
 @app.route("/status")
 def get_status():
@@ -218,7 +218,7 @@ def get_status():
         "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
         "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
         "error": error_message
-    })
+            })
 
 @app.route("/ping")
 def ping(): return "pong"
