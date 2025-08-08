@@ -147,43 +147,65 @@ def scan_loop():
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
     interval = 60
+
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
         monitor_exits(prices)
         balances = get_wallet_balances()
+
         for pair in PAIRS:
-            if pair not in prices: continue
+            if pair not in prices:
+                continue
+
             price = prices[pair]["price"]
             tick_logs[pair].append((now, price))
-            if len(tick_logs[pair]) > 1000: tick_logs[pair] = tick_logs[pair][-1000:]
+            if len(tick_logs[pair]) > 1000:
+                tick_logs[pair] = tick_logs[pair][-1000:]
+
             aggregate_candles(pair, interval)
             last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
+
             if last_candle and last_candle["start"] != last_candle_ts[pair]:
                 last_candle_ts[pair] = last_candle["start"]
                 signal = pa_buy_sell_signal(pair)
+
                 if signal:
                     error_message = ""
                     coin = pair[:-4]
                     qty = (0.3 * balances.get("USDT", 0)) / signal["entry"] if signal["side"] == "BUY" else balances.get(coin, 0)
                     qty = round(qty, pair_precision.get(pair, 6))
+
                     tp = round(signal['entry'] * 1.0005, 6)
                     sl = round(signal['entry'] * 0.999, 6)
+
                     res = place_order(pair, signal["side"], qty)
+
+                    # Apply precision and min_qty logic
                     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
                     qty = max(qty, rule["min_qty"])
                     qty = round(qty, rule["precision"])
-                    if "error" in res:
-                        error_message = res["error"]
+
+                    # Log result
                     scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
                         "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
                     })
-                    exit_orders.append({ "pair": pair, "side": signal["side"], "qty": qty,
-                        "tp": tp, "sl": sl, "entry": signal["entry"] })
+                    exit_orders.append({
+                        "pair": pair, "side": signal["side"], "qty": qty,
+                        "tp": tp, "sl": sl, "entry": signal["entry"]
+                    })
+
+                    if "error" in res:
+                        error_message = res["error"]
+                else:
+                    # ✅ Even if no signal, log the scan
+                    scan_log.append(f"{ist_now()} | {pair} | No Signal")
+
         status["msg"], status["last"] = "Running", ist_now()
         time.sleep(5)
+
     status["msg"] = "Idle"
 
 @app.route("/")
