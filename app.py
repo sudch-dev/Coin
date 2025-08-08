@@ -90,12 +90,27 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3: return None
+    if len(candles) < 3:
+        return None
+
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-    if curr["high"] > prev1["high"] and curr["high"] > prev2["high"] and curr["close"] > curr["open"]:
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: high > last 2 highs and close breakout"}
-    if curr["low"] < prev1["low"] and curr["low"] < prev2["low"] and curr["close"] < curr["open"]:
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: low < last 2 lows and close breakdown"}
+
+    # Relaxed BUY: current high > max(prev1, prev2 high)
+    if curr["high"] > max(prev1["high"], prev2["high"]):
+        return {
+            "side": "BUY",
+            "entry": curr["close"],
+            "msg": "PA BUY: high > last 2 highs"
+        }
+
+    # Relaxed SELL: current low < min(prev1, prev2 low)
+    if curr["low"] < min(prev1["low"], prev2["low"]):
+        return {
+            "side": "SELL",
+            "entry": curr["close"],
+            "msg": "PA SELL: low < last 2 lows"
+        }
+
     return None
 
 def place_order(pair, side, qty):
