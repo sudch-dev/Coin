@@ -1,95 +1,94 @@
+
 <!DOCTYPE html>
 <html>
 <head>
-  <title>CoinDCX Spot Bot</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      background: #f9f9f9;
-      padding: 20px;
-    }
-    h1 {
-      color: #2c3e50;
-    }
-    .button {
-      padding: 10px 20px;
-      font-size: 16px;
-      margin: 5px;
-      cursor: pointer;
-      border: none;
-      border-radius: 4px;
-      background-color: #3498db;
-      color: white;
-    }
-    .button:disabled {
-      background-color: #ccc;
-    }
-    .section {
-      margin-top: 20px;
-      padding: 15px;
-      background: white;
-      border: 1px solid #ddd;
-      border-radius: 5px;
-    }
-    pre {
-      background: #f0f0f0;
-      padding: 10px;
-      max-height: 300px;
-      overflow-y: auto;
-    }
-  </style>
+    <title>CoinDCX Auto Trader</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
+    <style>
+        body { padding: 20px; }
+        .blink { animation: blinker 0.6s linear infinite; color: red; font-weight: bold; }
+        @keyframes blinker { 50% { opacity: 0; } }
+        table { font-size: 0.9rem; }
+    </style>
 </head>
 <body>
-  <h1>🪙 CoinDCX Spot Bot</h1>
+    <div class="container">
+        <h2>CoinDCX Auto Trading Dashboard</h2>
+        <div class="mb-3">
+            <button class="btn btn-success" onclick="startScan()">Start</button>
+            <button class="btn btn-danger" onclick="stopScan()">Stop</button>
+            <span class="ms-3">Status: <strong id="status">-</strong></span>
+            <span class="ms-3">Last Updated: <strong id="last">-</strong></span>
+        </div>
+        <div class="row mb-3">
+            <div class="col-md-4"><strong>USDT Balance:</strong> <span id="usdt">0</span></div>
+            <div class="col-md-4"><strong>Profit Today:</strong> <span id="profitToday">0</span></div>
+            <div class="col-md-4"><strong>Profit Yesterday:</strong> <span id="profitYesterday">0</span></div>
+        </div>
+        <div class="mb-3">
+            <strong>Coin Balances:</strong>
+            <ul id="coinList"></ul>
+        </div>
+        <div id="errorBox" class="blink" style="display:none;">Order Failed: <span id="errorMsg"></span></div>
+        <hr/>
+        <h5>Recent Trades</h5>
+        <table class="table table-bordered table-striped">
+            <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th><th>Message</th></tr></thead>
+            <tbody id="tradeTable"></tbody>
+        </table>
+        <hr/>
+        <h5>Scan Logs</h5>
+        <pre id="scanLogs" style="height:300px; overflow-y:scroll; background:#f8f9fa; padding:10px;"></pre>
+    </div>
 
-  <div>
-    <p><strong>USDT Balance:</strong> <span id="usdt">{{ usdt }}</span></p>
-    <button class="button" onclick="startBot()">▶️ Start</button>
-    <button class="button" onclick="stopBot()">⏹ Stop</button>
-  </div>
+<script>
+function startScan() {
+    fetch('/start', { method: 'POST' }).then(r => r.json()).then(updateStatus);
+}
+function stopScan() {
+    fetch('/stop', { method: 'POST' }).then(r => r.json()).then(updateStatus);
+}
+function updateStatus(data) {
+    document.getElementById("status").innerText = data.status || "-";
+}
+function refreshData() {
+    fetch('/status').then(r => r.json()).then(data => {
+        document.getElementById("status").innerText = data.status;
+        document.getElementById("last").innerText = data.last;
+        document.getElementById("usdt").innerText = data.usdt;
+        document.getElementById("profitToday").innerText = data.profit_today;
+        document.getElementById("profitYesterday").innerText = data.profit_yesterday;
 
-  <div class="section">
-    <p><strong>Status:</strong> <span id="status">Loading...</span></p>
-    <p><strong>Last Updated:</strong> <span id="last">--</span></p>
-  </div>
+        let coinList = document.getElementById("coinList");
+        coinList.innerHTML = "";
+        for (let coin in data.coins) {
+            let li = document.createElement("li");
+            li.innerText = coin + ": " + data.coins[coin];
+            coinList.appendChild(li);
+        }
 
-  <div class="section">
-    <h3>📊 Recent Trades</h3>
-    <pre id="trades">Loading...</pre>
-  </div>
+        let trades = data.trades || [];
+        let table = document.getElementById("tradeTable");
+        table.innerHTML = "";
+        trades.forEach(t => {
+            let row = `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side}</td><td>${t.qty}</td><td>${t.entry}</td><td>${t.tp}</td><td>${t.sl}</td><td>${t.msg}</td></tr>`;
+            table.innerHTML += row;
+        });
 
-  <div class="section">
-    <h3>🔍 Scan Logs</h3>
-    <pre id="scans">Loading...</pre>
-  </div>
+        let logs = data.scans || [];
+        document.getElementById("scanLogs").innerText = logs.join("\n");
 
-  <script>
-    async function startBot() {
-      await fetch("/start", { method: "POST" });
-    }
-    async function stopBot() {
-      await fetch("/stop", { method: "POST" });
-    }
+        if (data.error && data.error.length > 0) {
+            document.getElementById("errorBox").style.display = "block";
+            document.getElementById("errorMsg").innerText = data.error;
+        } else {
+            document.getElementById("errorBox").style.display = "none";
+        }
+    });
+}
 
-    async function refresh() {
-      const res = await fetch("/status");
-      const data = await res.json();
-
-      document.getElementById("status").textContent = data.status;
-      document.getElementById("last").textContent = data.last;
-      document.getElementById("usdt").textContent = data.usdt.toFixed(2);
-
-      let trades = data.trades.map(t => {
-        return `${t.time} | ${t.pair} | ${t.side} @ ${t.entry} | Qty: ${t.qty}\nMsg: ${t.msg}`;
-      }).join("\n");
-      document.getElementById("trades").textContent = trades || "No trades yet.";
-
-      let scans = data.scans.join("\n");
-      document.getElementById("scans").textContent = scans || "No scan data yet.";
-    }
-
-    setInterval(refresh, 3000);
-    refresh();
-  </script>
+setInterval(refreshData, 5000);
+refreshData();
+</script>
 </body>
 </html>
