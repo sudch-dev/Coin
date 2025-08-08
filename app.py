@@ -16,7 +16,7 @@ API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
+    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
 PAIR_RULES = {
@@ -26,7 +26,7 @@ PAIR_RULES = {
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
     "DOGEUSDT": {"precision": 4, "min_qty": 1},
     "SOLUSDT": {"precision": 3, "min_qty": 0.01},
-    "MATICUSDT": {"precision": 2, "min_qty": 1},
+    "AEROUSDT": {"precision": 4, "min_qty": 1},
     "ADAUSDT": {"precision": 2, "min_qty": 1},
     "LTCUSDT": {"precision": 2, "min_qty": 0.01},
     "BNBUSDT": {"precision": 4, "min_qty": 0.001}
