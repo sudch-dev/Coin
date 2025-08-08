@@ -23,7 +23,7 @@ PAIR_RULES = {
     "BTCUSDT": {"precision": 2, "min_qty": 0.001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
-    "SHIBUSDT": {"precision": 4, "min_qty": 10000},
+    "SHIBUSDT": {"precision": 8, "min_qty": 100000000},
     "DOGEUSDT": {"precision": 4, "min_qty": 1},
     "SOLUSDT": {"precision": 3, "min_qty": 0.01},
     "AEROUSDT": {"precision": 4, "min_qty": 1},
