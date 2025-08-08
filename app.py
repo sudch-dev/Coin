@@ -99,14 +99,28 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3: return None
-    prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-    if curr["high"] > prev1["high"] and curr["high"] > prev2["high"] and curr["close"] > curr["open"]:
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: high > last 2 highs and close breakout"}
-    if curr["low"] < prev1["low"] and curr["low"] < prev2["low"] and curr["close"] < curr["open"]:
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: low < last 2 lows and close breakdown"}
-    return None
+    if len(candles) < 3:
+        return None
 
+    prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
+
+    # Relaxed BUY: current close > prev close and current high > max of last 2 highs
+    if curr["close"] > prev2["close"] and curr["high"] > max(prev1["high"], prev2["high"]):
+        return {
+            "side": "BUY",
+            "entry": curr["close"],
+            "msg": "PA BUY: close > prev close and high > last 2 highs"
+        }
+
+    # Relaxed SELL: current close < prev close and current low < min of last 2 lows
+    if curr["close"] < prev2["close"] and curr["low"] < min(prev1["low"], prev2["low"]):
+        return {
+            "side": "SELL",
+            "entry": curr["close"],
+            "msg": "PA SELL: close < prev close and low < last 2 lows"
+        }
+
+    return None
 def place_order(pair, side, qty):
     payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
                "timestamp": int(time.time() * 1000)}
