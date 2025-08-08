@@ -16,6 +16,20 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 BASE_URL = "https://api.coindcx.com"
 PAIRS = [
+
+PAIR_RULES = {
+    "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
+    "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
+    "XRPUSDT": {"precision": 4, "min_qty": 0.1},
+    "SHIBUSDT": {"precision": 0, "min_qty": 10000},
+    "DOGEUSDT": {"precision": 2, "min_qty": 1},
+    "SOLUSDT": {"precision": 3, "min_qty": 0.01},
+    "MATICUSDT": {"precision": 2, "min_qty": 1},
+    "ADAUSDT": {"precision": 2, "min_qty": 1},
+    "LTCUSDT": {"precision": 2, "min_qty": 0.01},
+    "BNBUSDT": {"precision": 4, "min_qty": 0.001}
+}
+
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "MATICUSDT", "BNBUSDT", "LTCUSDT"
 ]
@@ -27,7 +41,7 @@ def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y
 
 tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
 scan_log, trade_log, exit_orders = [], [], []
-daily_profit, coin_precision = {}, {}
+daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
 error_message = ""
@@ -35,16 +49,14 @@ error_message = ""
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def fetch_coin_precisions():
+def fetch_pair_precisions():
     try:
-        r = requests.get("https://api.coindcx.com/exchange/v1/market_details", timeout=10)
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
         if r.ok:
             for item in r.json():
-                base = item["base_currency"]
-                if base not in coin_precision:
-                    coin_precision[base] = int(item.get("base_currency_precision", 6))
-    except Exception as e:
-        print("Precision fetch error:", e)
+                if item["pair"] in PAIRS:
+                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
+    except: pass
 
 def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
@@ -89,25 +101,17 @@ def aggregate_candles(pair, interval=60):
 
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3:
-        return None
+    if len(candles) < 3: return None
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-
-    # Relaxed BUY: current high > max(prev1, prev2 high)
-    if curr["high"] > max(prev1["high"], prev2["high"]):
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: relaxed high breakout"}
-    if curr["low"] < min(prev1["low"], prev2["low"]):
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: relaxed low breakdown"}
+    if curr["high"] > prev1["high"] and curr["high"] > prev2["high"] and curr["close"] > curr["open"]:
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: high > last 2 highs and close breakout"}
+    if curr["low"] < prev1["low"] and curr["low"] < prev2["low"] and curr["close"] < curr["open"]:
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: low < last 2 lows and close breakdown"}
     return None
 
 def place_order(pair, side, qty):
-    payload = {
-        "market": pair,
-        "side": side.lower(),
-        "order_type": "market_order",
-        "total_quantity": str(qty),
-        "timestamp": int(time.time() * 1000)
-    }
+    payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
+               "timestamp": int(time.time() * 1000)}
     body = json.dumps(payload)
     sig = hmac_signature(body)
     headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
@@ -126,12 +130,14 @@ def monitor_exits(prices):
         if not price: continue
         if side == "BUY" and (price >= tp or price <= sl):
             res = place_order(pair, "SELL", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
             pl = (price - entry) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
         elif side == "SELL" and (price <= tp or price >= sl):
             res = place_order(pair, "BUY", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
             pl = (entry - price) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if "error" in res: error_message = res["error"]
@@ -162,12 +168,15 @@ def scan_loop():
                     error_message = ""
                     coin = pair[:-4]
                     qty = (0.3 * balances.get("USDT", 0)) / signal["entry"] if signal["side"] == "BUY" else balances.get(coin, 0)
-                    qty = round(qty, coin_precision.get(coin, 6))
+                    qty = round(qty, pair_precision.get(pair, 6))
                     tp = round(signal['entry'] * 1.0005, 6)
                     sl = round(signal['entry'] * 0.999, 6)
                     res = place_order(pair, signal["side"], qty)
-                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
+            rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
+            qty = max(qty, rule["min_qty"])
+            qty = round(qty, rule["precision"])
                     if "error" in res: error_message = res["error"]
+                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
                         "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
@@ -215,5 +224,5 @@ def get_status():
 def ping(): return "pong"
 
 if __name__ == "__main__":
-    fetch_coin_precisions()
+    fetch_pair_precisions()
     app.run(host="0.0.0.0", port=10000)
