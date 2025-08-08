@@ -190,8 +190,8 @@ def scan_loop():
                     qty = (0.3 * balances.get("USDT", 0)) / signal["entry"] if signal["side"] == "BUY" else balances.get(coin, 0)
                     qty = round(qty, pair_precision.get(pair, 6))
 
-                    tp = round(signal['entry'] * 1.0005, 6)
-                    sl = round(signal['entry'] * 0.999, 6)
+                    tp = round(signal['entry'] * 1.003, 6)
+                    sl = round(signal['entry'] * 0.997, 6)
 
                     res = place_order(pair, signal["side"], qty)
 
