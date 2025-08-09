@@ -8,7 +8,7 @@ import json
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
-from collections import deque, defaultdict  # NEW
+from collections import deque, defaultdict  # needed for FIFO P&L
 
 app = Flask(__name__)
 
@@ -53,7 +53,7 @@ def fetch_pair_precisions():
         r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
         if r.ok:
             for item in r.json():
-                if item["pair"] in PAIRS:
+                if item.get("pair") in PAIRS:
                     pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
     except:
         pass
@@ -78,7 +78,7 @@ def fetch_all_prices():
         if r.ok:
             now = int(time.time())
             return {item["market"]: {"price": float(item["last_price"]), "ts": now}
-                    for item in r.json() if item["market"] in PAIRS}
+                    for item in r.json() if item.get("market") in PAIRS}
     except:
         pass
     return {}
@@ -108,21 +108,13 @@ def pa_buy_sell_signal(pair):
 
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
 
-    # Relaxed BUY: current close > prev close and current high > max of last 2 highs
+    # Relaxed BUY
     if curr["close"] > prev2["close"] and curr["high"] > max(prev1["high"], prev2["high"]):
-        return {
-            "side": "BUY",
-            "entry": curr["close"],
-            "msg": "PA BUY: close > prev close and high > last 2 highs"
-        }
+        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: close > prev close and high > last 2 highs"}
 
-    # Relaxed SELL: current close < prev close and current low < min of last 2 lows
+    # Relaxed SELL
     if curr["close"] < prev2["close"] and curr["low"] < min(prev1["low"], prev2["low"]):
-        return {
-            "side": "SELL",
-            "entry": curr["close"],
-            "msg": "PA SELL: close < prev close and low < last 2 lows"
-        }
+        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: close < prev close and low < last 2 lows"}
 
     return None
 
@@ -227,88 +219,149 @@ def scan_loop():
 
     status["msg"] = "Idle"
 
-# ---------- NEW: Executed-trade P&L helpers (no other changes to app) ----------
+# ---------- Executed-trade P&L (fetch + robust parse) ----------
 
-def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=1000):
+def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
     """
-    Pull executed trades from CoinDCX between from_ts_ms and to_ts_ms.
+    Try the documented trade-history endpoints. Use time-windowed one first,
+    then fall back to the 'users/me/orders/trades' style and filter locally.
     """
-    body = {
-        "from_timestamp": from_ts_ms,
-        "to_timestamp": to_ts_ms,
-        "limit": limit,
-        "timestamp": int(time.time() * 1000)
+    def signed_post(url, body):
+        payload = json.dumps(body, separators=(',', ':'))
+        sig = hmac_signature(payload)
+        headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+        try:
+            r = requests.post(url, headers=headers, data=payload, timeout=12)
+            if r.ok:
+                return r.json()
+        except:
+            pass
+        return []
+
+    # 1) Primary: time-windowed trade history (fields may be 'market', 'timestamp', 'price', 'quantity', 'side', 'fee_amount')
+    body1 = {
+        "timestamp": int(time.time() * 1000),
+        "from_timestamp": int(from_ts_ms),
+        "to_timestamp": int(to_ts_ms),
+        "limit": limit
     }
     if symbol:
-        body["symbol"] = symbol
-    payload = json.dumps(body, separators=(',', ':'))
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+        body1["market"] = symbol
+    trades = signed_post(f"{BASE_URL}/exchange/v1/orders/trade_history", body1)
+    if isinstance(trades, list) and trades:
+        return trades
+
+    # 2) Fallback: broader account trades; filter window locally
+    body2 = {
+        "timestamp": int(time.time() * 1000),
+        "limit": limit
+    }
+    if symbol:
+        body2["market"] = symbol
+    trades2 = signed_post(f"{BASE_URL}/exchange/v1/users/me/orders/trades", body2)
+    return trades2 if isinstance(trades2, list) else []
+
+def _norm_trade(t):
+    """
+    Normalize trade dict -> {market, side, price, qty, ts_ms, fee_base}
+    Handles variations like market/symbol, price/price_per_unit/p, quantity/q, timestamp/T/created_at.
+    """
+    market = t.get("market") or t.get("symbol") or t.get("pair") or t.get("s")
+    side   = (t.get("side") or "").lower()
+
+    # price
+    price = t.get("price", None)
+    if price is None: price = t.get("price_per_unit", None)
+    if price is None: price = t.get("p", 0)
     try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/orders/trade_history", headers=headers, data=payload, timeout=10)
-        return r.json() if r.ok else []
+        price = float(price)
     except:
-        return []
+        price = 0.0
+
+    # quantity
+    qty = t.get("quantity", None)
+    if qty is None: qty = t.get("q", None)
+    if qty is None: qty = t.get("total_quantity", 0)
+    try:
+        qty = float(qty)
+    except:
+        qty = 0.0
+
+    # timestamp -> ms
+    ts = t.get("timestamp", None)
+    if ts is None: ts = t.get("T", None)
+    if ts is None: ts = t.get("created_at", None)
+    ts_ms = 0
+    try:
+        ts_ms = int(ts)
+        if ts_ms < 10**12:  # seconds -> ms
+            ts_ms = ts_ms * 1000
+    except:
+        ts_ms = 0  # if not numeric, ignore in-window filter later
+
+    # fee amount (CoinDCX docs: fee_amount = absolute amount in BASE)
+    fee_base = t.get("fee_amount", 0)  # may be missing
+    try:
+        fee_base = float(fee_base)
+    except:
+        fee_base = 0.0
+
+    return {
+        "market": market, "side": side, "price": price, "qty": qty, "ts_ms": ts_ms, "fee_base": fee_base
+    }
 
 def compute_realized_pnl_today():
     """
-    Compute realized P&L for 'today' (IST midnight -> now) from executed fills only.
-    FIFO, quote currency (e.g., USDT). Fees (in base) converted to quote using trade price.
+    Realized P&L for today (IST midnight -> now) from executed fills ONLY.
+    FIFO in quote (USDT) terms. Fees assumed in BASE per CoinDCX docs; converted via trade price.
     """
     start_dt = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
     from_ts = int(start_dt.timestamp() * 1000)
-    to_ts = int(datetime.now(IST).timestamp() * 1000)
+    to_ts   = int(datetime.now(IST).timestamp() * 1000)
 
-    trades = get_account_trades(from_ts, to_ts, symbol=None, limit=5000)
-    if not isinstance(trades, list):
+    raw = get_account_trades(from_ts, to_ts, symbol=None, limit=5000)
+    if not isinstance(raw, list):
         return 0.0
 
-    pair_set = set(PAIRS)
-    by_symbol = defaultdict(list)
+    trades = [_norm_trade(t) for t in raw if isinstance(t, dict)]
+
+    # Filter to the window if fallback returned a broader range
+    trades = [t for t in trades if t["ts_ms"] == 0 or (from_ts <= t["ts_ms"] <= to_ts)]
+
+    # Group by market, FIFO lots in BASE with cost in QUOTE
+    by_market = defaultdict(list)
     for t in trades:
-        sym = t.get("symbol")
-        # If the API returns symbols already in "<BASE>USDT" format, this will match.
-        # Otherwise we still group by whatever symbol is returned.
-        if sym:
-            by_symbol[sym].append(t)
+        if t["market"] and t["price"] > 0 and t["qty"] > 0 and t["side"] in ("buy", "sell"):
+            by_market[t["market"]].append(t)
 
     realized_quote_pnl = 0.0
-    inventory = defaultdict(deque)  # per-symbol FIFO of [qty_base, cost_quote_per_base]
+    inventory = defaultdict(deque)  # {market: deque([ [qty_base, cost_quote_per_base], ... ])}
 
-    for sym, lst in by_symbol.items():
-        lst.sort(key=lambda x: x.get("timestamp", 0))
+    for market, lst in by_market.items():
+        lst.sort(key=lambda x: x["ts_ms"])
         for tr in lst:
-            side = tr.get("side")    # "buy" or "sell"
-            try:
-                qty  = float(tr.get("quantity", 0.0))   # in BASE
-                px   = float(tr.get("price", 0.0))      # QUOTE per BASE
-                fee_base = float(tr.get("fee_amount", 0.0))  # fee in BASE
-            except:
-                continue
-
-            fee_quote = fee_base * px
-
-            if side == "buy":
-                inventory[sym].append([qty, px])
+            px, q, fee_b = tr["price"], tr["qty"], tr["fee_base"]
+            fee_quote = fee_b * px  # fee in BASE -> convert to QUOTE via trade price
+            if tr["side"] == "buy":
+                inventory[market].append([q, px])
                 realized_quote_pnl -= fee_quote
-            elif side == "sell":
-                sell_qty = qty
-                # Realize P&L against FIFO inventory
-                while sell_qty > 1e-18 and inventory[sym]:
-                    lot_qty, lot_px = inventory[sym][0]
+            else:  # sell
+                sell_qty = q
+                while sell_qty > 1e-18 and inventory[market]:
+                    lot_qty, lot_px = inventory[market][0]
                     used = min(sell_qty, lot_qty)
                     realized_quote_pnl += (px - lot_px) * used
                     lot_qty -= used
                     sell_qty -= used
                     if lot_qty <= 1e-18:
-                        inventory[sym].popleft()
+                        inventory[market].popleft()
                     else:
-                        inventory[sym][0][0] = lot_qty
+                        inventory[market][0][0] = lot_qty
                 realized_quote_pnl -= fee_quote
 
     return round(realized_quote_pnl, 6)
 
-# ------------------------------------------------------------------------------
+# -------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -335,14 +388,14 @@ def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
 
-    # NEW: profit_today from executed fills only
+    # Executed-only P&L (USDT terms for XXXUSDT pairs)
     profit_today = compute_realized_pnl_today()
 
     return jsonify({
         "status": status["msg"], "last": status["last"],
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
-        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
+        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),  # keep as-is unless you want executed-only window calc too
         "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
         "error": error_message
     })
