@@ -8,7 +8,7 @@ import json
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
-from collections import deque, defaultdict  # needed for FIFO P&L
+from collections import deque, defaultdict  # for FIFO P&L
 
 app = Flask(__name__)
 
@@ -44,6 +44,10 @@ daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
 error_message = ""
+
+# NEW: local executed fills store (survives while app is running)
+# each item: {"market": str, "side": "buy"/"sell", "price": float, "qty": float, "ts_ms": int}
+executed_fills = []
 
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
@@ -118,6 +122,18 @@ def pa_buy_sell_signal(pair):
 
     return None
 
+def _signed_post(url, body):
+    payload = json.dumps(body, separators=(',', ':'))
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=headers, data=payload, timeout=12)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return {}
+
 def place_order(pair, side, qty):
     payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
                "timestamp": int(time.time() * 1000)}
@@ -130,6 +146,44 @@ def place_order(pair, side, qty):
     except Exception as e:
         return {"error": str(e)}
 
+# NEW: poll order status and capture executed fills locally
+def get_order_status(order_id=None, client_order_id=None):
+    body = {"timestamp": int(time.time() * 1000)}
+    if order_id: body["id"] = order_id
+    if client_order_id: body["client_order_id"] = client_order_id
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
+    return res if isinstance(res, dict) else {}
+
+def _record_fill_from_status(market, side, st):
+    """
+    When an order is filled (or partially), record avg_price * filled_qty as a single fill snapshot.
+    If exchange returns executions list, you could iterate them; avg is enough for P&L.
+    """
+    try:
+        total_q = float(st.get("total_quantity", 0))
+        remain_q = float(st.get("remaining_quantity", 0))
+        filled = max(0.0, total_q - remain_q)
+        avg_px = float(st.get("avg_price", 0))
+    except:
+        filled, avg_px = 0.0, 0.0
+
+    if filled > 0 and avg_px > 0:
+        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time()*1000)
+        try:
+            ts_ms = int(ts_field)
+            if ts_ms < 10**12:
+                ts_ms *= 1000
+        except:
+            ts_ms = int(time.time() * 1000)
+
+        executed_fills.append({
+            "market": market,
+            "side": side.lower(),
+            "price": avg_px,
+            "qty": filled,
+            "ts_ms": ts_ms
+        })
+
 def monitor_exits(prices):
     global error_message
     to_remove = []
@@ -140,6 +194,15 @@ def monitor_exits(prices):
         if side == "BUY" and (price >= tp or price <= sl):
             res = place_order(pair, "SELL", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
+            # NEW: capture fill
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "SELL", st)
+
             pl = (price - entry) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if "error" in res: error_message = res["error"]
@@ -147,6 +210,15 @@ def monitor_exits(prices):
         elif side == "SELL" and (price <= tp or price >= sl):
             res = place_order(pair, "BUY", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
+            # NEW: capture fill
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "BUY", st)
+
             pl = (entry - price) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if "error" in res: error_message = res["error"]
@@ -208,6 +280,15 @@ def scan_loop():
                         "tp": tp, "sl": sl, "entry": signal["entry"]
                     })
 
+                    # NEW: capture fill for entry order
+                    try:
+                        order_id = (res.get("orders") or [{}])[0].get("id")
+                    except:
+                        order_id = None
+                    if order_id:
+                        st = get_order_status(order_id=order_id)
+                        _record_fill_from_status(pair, signal["side"], st)
+
                     if "error" in res:
                         error_message = res["error"]
                 else:
@@ -219,13 +300,10 @@ def scan_loop():
 
     status["msg"] = "Idle"
 
-# ---------- Executed-trade P&L (fetch + robust parse) ----------
+# ---------- Executed-trade P&L (local-first; API fallback) ----------
 
 def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
-    """
-    Try the documented trade-history endpoints. Use time-windowed one first,
-    then fall back to the 'users/me/orders/trades' style and filter locally.
-    """
+    # same as previous robust version (kept for fallback)
     def signed_post(url, body):
         payload = json.dumps(body, separators=(',', ':'))
         sig = hmac_signature(payload)
@@ -238,7 +316,6 @@ def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
             pass
         return []
 
-    # 1) Primary: time-windowed trade history (fields may be 'market', 'timestamp', 'price', 'quantity', 'side', 'fee_amount')
     body1 = {
         "timestamp": int(time.time() * 1000),
         "from_timestamp": int(from_ts_ms),
@@ -251,7 +328,6 @@ def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
     if isinstance(trades, list) and trades:
         return trades
 
-    # 2) Fallback: broader account trades; filter window locally
     body2 = {
         "timestamp": int(time.time() * 1000),
         "limit": limit
@@ -262,104 +338,82 @@ def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
     return trades2 if isinstance(trades2, list) else []
 
 def _norm_trade(t):
-    """
-    Normalize trade dict -> {market, side, price, qty, ts_ms, fee_base}
-    Handles variations like market/symbol, price/price_per_unit/p, quantity/q, timestamp/T/created_at.
-    """
     market = t.get("market") or t.get("symbol") or t.get("pair") or t.get("s")
     side   = (t.get("side") or "").lower()
-
-    # price
-    price = t.get("price", None)
-    if price is None: price = t.get("price_per_unit", None)
-    if price is None: price = t.get("p", 0)
-    try:
-        price = float(price)
-    except:
-        price = 0.0
-
-    # quantity
-    qty = t.get("quantity", None)
-    if qty is None: qty = t.get("q", None)
-    if qty is None: qty = t.get("total_quantity", 0)
-    try:
-        qty = float(qty)
-    except:
-        qty = 0.0
-
-    # timestamp -> ms
-    ts = t.get("timestamp", None)
-    if ts is None: ts = t.get("T", None)
-    if ts is None: ts = t.get("created_at", None)
-    ts_ms = 0
+    price = t.get("price", t.get("price_per_unit", t.get("p", 0)))
+    qty   = t.get("quantity", t.get("q", t.get("total_quantity", 0)))
+    try: price = float(price)
+    except: price = 0.0
+    try: qty = float(qty)
+    except: qty = 0.0
+    ts = t.get("timestamp", t.get("T", t.get("created_at", int(time.time()*1000))))
     try:
         ts_ms = int(ts)
-        if ts_ms < 10**12:  # seconds -> ms
-            ts_ms = ts_ms * 1000
+        if ts_ms < 10**12: ts_ms *= 1000
     except:
-        ts_ms = 0  # if not numeric, ignore in-window filter later
+        ts_ms = int(time.time()*1000)
+    fee_base = t.get("fee_amount", 0)
+    try: fee_base = float(fee_base)
+    except: fee_base = 0.0
+    return {"market": market, "side": side, "price": price, "qty": qty, "ts_ms": ts_ms, "fee_base": fee_base}
 
-    # fee amount (CoinDCX docs: fee_amount = absolute amount in BASE)
-    fee_base = t.get("fee_amount", 0)  # may be missing
-    try:
-        fee_base = float(fee_base)
-    except:
-        fee_base = 0.0
+def _compute_realized_pnl_from(trades_iterable):
+    by_market = defaultdict(list)
+    for t in trades_iterable:
+        if t["market"] and t["price"] > 0 and t["qty"] > 0 and t["side"] in ("buy", "sell"):
+            by_market[t["market"]].append(t)
 
-    return {
-        "market": market, "side": side, "price": price, "qty": qty, "ts_ms": ts_ms, "fee_base": fee_base
-    }
+    realized = 0.0
+    inventory = defaultdict(deque)
+    for market, lst in by_market.items():
+        lst.sort(key=lambda x: x["ts_ms"])
+        for tr in lst:
+            px, q = tr["price"], tr["qty"]
+            fee_b = tr.get("fee_base", 0.0)
+            fee_q = fee_b * px
+            if tr["side"] == "buy":
+                inventory[market].append([q, px])
+                realized -= fee_q
+            else:
+                sell_q = q
+                while sell_q > 1e-18 and inventory[market]:
+                    lot_q, lot_px = inventory[market][0]
+                    used = min(sell_q, lot_q)
+                    realized += (px - lot_px) * used
+                    lot_q -= used
+                    sell_q -= used
+                    if lot_q <= 1e-18:
+                        inventory[market].popleft()
+                    else:
+                        inventory[market][0][0] = lot_q
+                realized -= fee_q
+    return round(realized, 6)
 
 def compute_realized_pnl_today():
     """
-    Realized P&L for today (IST midnight -> now) from executed fills ONLY.
-    FIFO in quote (USDT) terms. Fees assumed in BASE per CoinDCX docs; converted via trade price.
+    Prefer local executed_fills (from this app run). If empty, fallback to API trades.
+    Returns P&L in USDT (quote) for XXXUSDT pairs.
     """
+    # 1) Local fills for 'today'
     start_dt = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
     from_ts = int(start_dt.timestamp() * 1000)
     to_ts   = int(datetime.now(IST).timestamp() * 1000)
 
+    local = [t for t in executed_fills if from_ts <= t["ts_ms"] <= to_ts]
+    if local:
+        # local fills don’t include fee; assume 0-fee OR add fee if you log it later.
+        # Still accurate for direction/price P&L.
+        norm_local = [{"market": t["market"], "side": t["side"], "price": t["price"], "qty": t["qty"], "ts_ms": t["ts_ms"], "fee_base": 0.0} for t in local]
+        return _compute_realized_pnl_from(norm_local)
+
+    # 2) Fallback to API
     raw = get_account_trades(from_ts, to_ts, symbol=None, limit=5000)
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not raw:
         return 0.0
-
     trades = [_norm_trade(t) for t in raw if isinstance(t, dict)]
-
-    # Filter to the window if fallback returned a broader range
-    trades = [t for t in trades if t["ts_ms"] == 0 or (from_ts <= t["ts_ms"] <= to_ts)]
-
-    # Group by market, FIFO lots in BASE with cost in QUOTE
-    by_market = defaultdict(list)
-    for t in trades:
-        if t["market"] and t["price"] > 0 and t["qty"] > 0 and t["side"] in ("buy", "sell"):
-            by_market[t["market"]].append(t)
-
-    realized_quote_pnl = 0.0
-    inventory = defaultdict(deque)  # {market: deque([ [qty_base, cost_quote_per_base], ... ])}
-
-    for market, lst in by_market.items():
-        lst.sort(key=lambda x: x["ts_ms"])
-        for tr in lst:
-            px, q, fee_b = tr["price"], tr["qty"], tr["fee_base"]
-            fee_quote = fee_b * px  # fee in BASE -> convert to QUOTE via trade price
-            if tr["side"] == "buy":
-                inventory[market].append([q, px])
-                realized_quote_pnl -= fee_quote
-            else:  # sell
-                sell_qty = q
-                while sell_qty > 1e-18 and inventory[market]:
-                    lot_qty, lot_px = inventory[market][0]
-                    used = min(sell_qty, lot_qty)
-                    realized_quote_pnl += (px - lot_px) * used
-                    lot_qty -= used
-                    sell_qty -= used
-                    if lot_qty <= 1e-18:
-                        inventory[market].popleft()
-                    else:
-                        inventory[market][0][0] = lot_qty
-                realized_quote_pnl -= fee_quote
-
-    return round(realized_quote_pnl, 6)
+    # filter to window again if needed
+    trades = [t for t in trades if from_ts <= t["ts_ms"] <= to_ts]
+    return _compute_realized_pnl_from(trades)
 
 # -------------------------------------------------------------
 
@@ -388,14 +442,14 @@ def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
 
-    # Executed-only P&L (USDT terms for XXXUSDT pairs)
+    # Executed-only P&L (USDT terms). Local fills preferred.
     profit_today = compute_realized_pnl_today()
 
     return jsonify({
         "status": status["msg"], "last": status["last"],
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
-        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),  # keep as-is unless you want executed-only window calc too
+        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
         "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
         "error": error_message
     })
