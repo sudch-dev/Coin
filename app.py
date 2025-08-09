@@ -8,6 +8,7 @@ import json
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
+from collections import deque, defaultdict  # NEW
 
 app = Flask(__name__)
 
@@ -54,7 +55,8 @@ def fetch_pair_precisions():
             for item in r.json():
                 if item["pair"] in PAIRS:
                     pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
-    except: pass
+    except:
+        pass
 
 def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
@@ -66,7 +68,8 @@ def get_wallet_balances():
         if r.ok:
             for b in r.json():
                 balances[b['currency']] = float(b['balance'])
-    except: pass
+    except:
+        pass
     return balances
 
 def fetch_all_prices():
@@ -76,7 +79,8 @@ def fetch_all_prices():
             now = int(time.time())
             return {item["market"]: {"price": float(item["last_price"]), "ts": now}
                     for item in r.json() if item["market"] in PAIRS}
-    except: pass
+    except:
+        pass
     return {}
 
 def aggregate_candles(pair, interval=60):
@@ -121,6 +125,7 @@ def pa_buy_sell_signal(pair):
         }
 
     return None
+
 def place_order(pair, side, qty):
     payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
                "timestamp": int(time.time() * 1000)}
@@ -222,6 +227,89 @@ def scan_loop():
 
     status["msg"] = "Idle"
 
+# ---------- NEW: Executed-trade P&L helpers (no other changes to app) ----------
+
+def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=1000):
+    """
+    Pull executed trades from CoinDCX between from_ts_ms and to_ts_ms.
+    """
+    body = {
+        "from_timestamp": from_ts_ms,
+        "to_timestamp": to_ts_ms,
+        "limit": limit,
+        "timestamp": int(time.time() * 1000)
+    }
+    if symbol:
+        body["symbol"] = symbol
+    payload = json.dumps(body, separators=(',', ':'))
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/orders/trade_history", headers=headers, data=payload, timeout=10)
+        return r.json() if r.ok else []
+    except:
+        return []
+
+def compute_realized_pnl_today():
+    """
+    Compute realized P&L for 'today' (IST midnight -> now) from executed fills only.
+    FIFO, quote currency (e.g., USDT). Fees (in base) converted to quote using trade price.
+    """
+    start_dt = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
+    from_ts = int(start_dt.timestamp() * 1000)
+    to_ts = int(datetime.now(IST).timestamp() * 1000)
+
+    trades = get_account_trades(from_ts, to_ts, symbol=None, limit=5000)
+    if not isinstance(trades, list):
+        return 0.0
+
+    pair_set = set(PAIRS)
+    by_symbol = defaultdict(list)
+    for t in trades:
+        sym = t.get("symbol")
+        # If the API returns symbols already in "<BASE>USDT" format, this will match.
+        # Otherwise we still group by whatever symbol is returned.
+        if sym:
+            by_symbol[sym].append(t)
+
+    realized_quote_pnl = 0.0
+    inventory = defaultdict(deque)  # per-symbol FIFO of [qty_base, cost_quote_per_base]
+
+    for sym, lst in by_symbol.items():
+        lst.sort(key=lambda x: x.get("timestamp", 0))
+        for tr in lst:
+            side = tr.get("side")    # "buy" or "sell"
+            try:
+                qty  = float(tr.get("quantity", 0.0))   # in BASE
+                px   = float(tr.get("price", 0.0))      # QUOTE per BASE
+                fee_base = float(tr.get("fee_amount", 0.0))  # fee in BASE
+            except:
+                continue
+
+            fee_quote = fee_base * px
+
+            if side == "buy":
+                inventory[sym].append([qty, px])
+                realized_quote_pnl -= fee_quote
+            elif side == "sell":
+                sell_qty = qty
+                # Realize P&L against FIFO inventory
+                while sell_qty > 1e-18 and inventory[sym]:
+                    lot_qty, lot_px = inventory[sym][0]
+                    used = min(sell_qty, lot_qty)
+                    realized_quote_pnl += (px - lot_px) * used
+                    lot_qty -= used
+                    sell_qty -= used
+                    if lot_qty <= 1e-18:
+                        inventory[sym].popleft()
+                    else:
+                        inventory[sym][0][0] = lot_qty
+                realized_quote_pnl -= fee_quote
+
+    return round(realized_quote_pnl, 6)
+
+# ------------------------------------------------------------------------------
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -246,10 +334,14 @@ def stop():
 def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
+
+    # NEW: profit_today from executed fills only
+    profit_today = compute_realized_pnl_today()
+
     return jsonify({
         "status": status["msg"], "last": status["last"],
         "usdt": balances.get("USDT", 0.0),
-        "profit_today": round(daily_profit.get(ist_date(), 0), 4),
+        "profit_today": profit_today,
         "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
         "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
         "error": error_message
