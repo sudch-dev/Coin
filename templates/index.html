@@ -1,106 +1,141 @@
-
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-    <title>CoinDCX Auto Trader</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-    <style>
-        body { padding: 20px; }
-        .blink { animation: blinker 0.6s linear infinite; color: red; font-weight: bold; }
-        @keyframes blinker { 50% { opacity: 0; } }
-        table { font-size: 0.9rem; }
-    </style>
+  <meta charset="utf-8">
+  <title>CoinDCX Auto Trader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px;}
+    .row {display:flex; gap:16px; flex-wrap:wrap; align-items:center}
+    .card {border:1px solid #ddd; padding:12px 16px; border-radius:8px; min-width:240px}
+    pre {background:#f7f7f7; padding:12px; border-radius:8px; max-height:300px; overflow:auto;}
+    button {padding:8px 14px; border-radius:6px; border:1px solid #ccc; cursor:pointer}
+    .ok{color:#0a0}
+    .warn{color:#a60}
+    .bad{color:#c00}
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h2>CoinDCX Auto Trading Dashboard</h2>
-        <div class="mb-3">
-            <button class="btn btn-success" onclick="startScan()">Start</button>
-            <button class="btn btn-danger" onclick="stopScan()">Stop</button>
-            <span class="ms-3">Status: <strong id="status">-</strong></span>
-            <span class="ms-3">Last Updated: <strong id="last">-</strong></span>
-        </div>
-        <div class="row mb-3">
-            <div class="col-md-4"><strong>USDT Balance:</strong> <span id="usdt">0</span></div>
-            <div class="col-md-4"><strong>Profit Today:</strong> <span id="profitToday">0</span></div>
-            <div class="col-md-4"><strong>Profit Yesterday:</strong> <span id="profitYesterday">0</span></div>
-        </div>
-        <div class="mb-3">
-            <strong>Coin Balances:</strong>
-            <ul id="coinList"></ul>
-        </div>
-        <div id="errorBox" class="blink" style="display:none;">Order Failed: <span id="errorMsg"></span></div>
-        <hr/>
-        <h5>Recent Trades</h5>
-        <table class="table table-bordered table-striped">
-            <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th><th>Message</th></tr></thead>
-            <tbody id="tradeTable"></tbody>
-        </table>
-        <hr/>
-        <h5>Scan Logs</h5>
-        <pre id="scanLogs" style="height:300px; overflow-y:scroll; background:#f8f9fa; padding:10px;"></pre>
+  <h2>CoinDCX Auto Trader</h2>
+
+  <div class="row">
+    <button id="btnStart">Start</button>
+    <button id="btnStop">Stop</button>
+    <span>Status: <b id="lblStatus">Idle</b></span>
+    <span>Last: <span id="lblLast">-</span></span>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <div class="card">
+      <div>USDT: <b id="lblUSDT">0</b></div>
+      <div>Today P&L (USDT): <b id="lblPNLT">0</b></div>
+      <div>Yesterday P&L (USDT): <b id="lblPNLY">0</b></div>
+      <div>Total P&L (USDT): <b id="lblPNLAll">0</b></div>
     </div>
+  </div>
 
-<script>
-function startScan() {
-    fetch('/start', { method: 'POST' }).then(r => r.json()).then(updateStatus);
-}
-function stopScan() {
-    fetch('/stop', { method: 'POST' }).then(r => r.json()).then(updateStatus);
-}
-function updateStatus(data) {
-    document.getElementById("status").innerText = data.status || "-";
-}
-function refreshData() {
-    fetch('/status').then(r => r.json()).then(data => {
-        document.getElementById("status").innerText = data.status;
-        document.getElementById("last").innerText = data.last;
-        document.getElementById("usdt").innerText = data.usdt;
-        document.getElementById("profitToday").innerText = data.profit_today;
-        document.getElementById("profitYesterday").innerText = data.profit_yesterday;
+  <h3>Scans (latest 30)</h3>
+  <pre id="scanLog"></pre>
 
-        let coinList = document.getElementById("coinList");
-        coinList.innerHTML = "";
-        for (let coin in data.coins) {
-            let li = document.createElement("li");
-            li.innerText = coin + ": " + data.coins[coin];
-            coinList.appendChild(li);
+  <h3>Trades (latest 10)</h3>
+  <pre id="tradeLog"></pre>
+
+  <script>
+  // --- simple UI handlers for start/stop ---
+  document.getElementById('btnStart').onclick = async () => {
+    try { const r = await fetch('/start', {method:'POST'}); console.log('start', await r.json()); } catch(e){}
+  };
+  document.getElementById('btnStop').onclick = async () => {
+    try { const r = await fetch('/stop', {method:'POST'}); console.log('stop', await r.json()); } catch(e){}
+  };
+
+  // --- Watchdog + Keepalive ---
+  (() => {
+    const PING_MS = 60 * 1000;
+    const CHECK_MS = 60 * 1000;
+    const STALE_SEC = 120;
+    const START_RETRY_MS = 10 * 1000;
+
+    let lastStatusEpoch = 0;
+
+    async function safeFetch(url, opts = {}, timeoutMs = 8000) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
+        clearTimeout(t);
+        return res;
+      } catch (e) {
+        clearTimeout(t);
+        throw e;
+      }
+    }
+
+    async function keepAlive() {
+      try { await safeFetch('/ping', {}, 4000); } catch (_) {}
+    }
+
+    async function startScanner() {
+      try {
+        const res = await safeFetch('/start', { method: 'POST' }, 6000);
+        console.log('[auto-start] result', await res.json());
+      } catch (e) {
+        console.warn('[auto-start] failed, retrying soon', e);
+        setTimeout(startScanner, START_RETRY_MS);
+      }
+    }
+
+    function renderStatus(data){
+      document.getElementById('lblStatus').textContent = data.status || '—';
+      document.getElementById('lblLast').textContent = data.last || '—';
+      document.getElementById('lblUSDT').textContent = (data.usdt ?? 0).toFixed(2);
+      document.getElementById('lblPNLT').textContent = (data.profit_today ?? 0).toFixed(2);
+      document.getElementById('lblPNLY').textContent = (data.profit_yesterday ?? 0).toFixed(2);
+      document.getElementById('lblPNLAll').textContent = (data.pnl_cumulative ?? 0).toFixed(2);
+
+      const scans = Array.isArray(data.scans) ? data.scans.join('\n') : '';
+      const trades = Array.isArray(data.trades) ? data.trades.map(t => JSON.stringify(t)).join('\n') : '';
+      document.getElementById('scanLog').textContent = scans;
+      document.getElementById('tradeLog').textContent = trades;
+    }
+
+    async function checkStatusAndAutostart() {
+      try {
+        const res = await safeFetch('/status', {}, 8000);
+        if (!res.ok) throw new Error('status not ok');
+        const data = await res.json();
+        renderStatus(data);
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const epoch = Number(data.status_epoch || 0);
+        const isIdle = (data.status || '').toLowerCase() !== 'running';
+        const isStale = epoch && (nowSec - epoch > STALE_SEC);
+
+        if (isIdle || isStale) {
+          console.log('[watchdog] idle/stale detected -> auto-start', { isIdle, isStale, epoch });
+          startScanner();
         }
+        lastStatusEpoch = epoch || lastStatusEpoch;
+      } catch (e) {
+        console.warn('[watchdog] status failed; will retry', e);
+        setTimeout(startScanner, START_RETRY_MS);
+      }
+    }
 
-        let trades = data.trades || [];
-        let table = document.getElementById("tradeTable");
-        table.innerHTML = "";
-        trades.forEach(t => {
-            let row = `<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.side}</td><td>${t.qty}</td><td>${t.entry}</td><td>${t.tp}</td><td>${t.sl}</td><td>${t.msg}</td></tr>`;
-            table.innerHTML += row;
-        });
+    // initial kicks
+    keepAlive();
+    checkStatusAndAutostart();
+    startScanner();
 
-        let logs = data.scans || [];
-        document.getElementById("scanLogs").innerText = logs.join("\n");
+    // repeaters
+    setInterval(keepAlive, PING_MS);
+    setInterval(checkStatusAndAutostart, CHECK_MS);
 
-        if (data.error && data.error.length > 0) {
-            document.getElementById("errorBox").style.display = "block";
-            document.getElementById("errorMsg").innerText = data.error;
-        } else {
-            document.getElementById("errorBox").style.display = "none";
-        }
+    window.addEventListener('focus', () => {
+      keepAlive();
+      checkStatusAndAutostart();
     });
-}
-
-setInterval(refreshData, 5000);
-refreshData();
-</script>
+  })();
+  </script>
 </body>
 </html>
-
-<!-- Auto-start every 5 minutes to prevent Render server from sleeping -->
-<script>
-setInterval(() => {
-    fetch('/start', { method: 'POST' })
-        .then(res => res.json())
-        .then(data => {
-            console.log("✅ Auto-start ping every 5 min:", data.status);
-        })
-        .catch(err => console.error("Auto-start error:", err));
-}, 300000); // 300000 ms = 5 minutes
-</script>
