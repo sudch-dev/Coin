@@ -28,7 +28,7 @@ PAIR_RULES = {
     "SOLUSDT": {"precision": 3, "min_qty": 0.01},
     "AEROUSDT": {"precision": 2, "min_qty": .01},
     "ADAUSDT": {"precision": 2, "min_qty": 1},
-    "LTCUSDT": {"precision": 2, "min_qty": 0.01},
+    "LTCUSDT": {"precision": 4, "min_qty": 0.001},
     "BNBUSDT": {"precision": 4, "min_qty": 0.001}
 }
 
