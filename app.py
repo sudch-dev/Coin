@@ -36,7 +36,7 @@ PAIR_RULES = {
 }
 
 # --- Tunables ---
-CANDLE_INTERVAL = 30                # seconds (was 60). 20–30 is snappier.
+CANDLE_INTERVAL = 300               # seconds (was 60). 20–30 is snappier.
 TRADE_COOLDOWN_SEC = 300            # cooldown after an exit; can lower to 120 if you want.
 
 IST = timezone('Asia/Kolkata')
