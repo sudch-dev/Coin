@@ -9,6 +9,7 @@ from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
 from collections import deque, defaultdict  # for FIFO P&L
+from statistics import median
 
 app = Flask(__name__)
 
@@ -21,7 +22,7 @@ PAIRS = [
 ]
 
 PAIR_RULES = {
-    "BTCUSDT": {"precision": 4, "min_qty": 0.001},
+    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
@@ -47,13 +48,6 @@ error_message = ""
 
 # ===== Persistent P&L state (confirmed fills only) =====
 PROFIT_STATE_FILE = "profit_state.json"
-# state schema:
-# {
-#   "cumulative_pnl": float (USDT),
-#   "daily": {"YYYY-MM-DD": float (USDT), ...},
-#   "inventory": { "BTCUSDT": [[qty, cost_per_base_quote], ...], ... },
-#   "processed_orders": [ "order_id1", "order_id2", ... ]
-# }
 profit_state = {
     "cumulative_pnl": 0.0,
     "daily": {},
@@ -61,12 +55,15 @@ profit_state = {
     "processed_orders": []
 }
 
+# NEW: basic trade cooldown per pair (sec)
+TRADE_COOLDOWN_SEC = 300
+pair_cooldown_until = {p: 0 for p in PAIRS}
+
 def load_profit_state():
     global profit_state
     try:
         with open(PROFIT_STATE_FILE, "r") as f:
             data = json.load(f)
-        # sanity defaults
         profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
         profit_state["daily"] = dict(data.get("daily", {}))
         profit_state["inventory"] = data.get("inventory", {})
@@ -88,7 +85,6 @@ def save_profit_state():
         pass
 
 def _get_inventory_deque(market):
-    # inventory as list in state; adapt to deque of [qty, cost]
     inv = profit_state["inventory"].get(market, [])
     dq = deque()
     for lot in inv:
@@ -104,30 +100,20 @@ def _set_inventory_from_deque(market, dq):
     profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
 
 def apply_fill_update(market, side, price, qty, ts_ms, order_id):
-    """
-    Update FIFO inventory and realized P&L using a confirmed fill.
-    Persist to disk. Ignore if order_id already processed.
-    P&L is in USDT (quote), since all pairs are XXXUSDT.
-    """
-    if not order_id:
-        return
-    if order_id in profit_state["processed_orders"]:
-        return
-
+    if not order_id: return
+    if order_id in profit_state["processed_orders"]: return
     try:
-        price = float(price)
-        qty = float(qty)
+        price = float(price); qty = float(qty)
     except:
         return
-    if price <= 0 or qty <= 0:
-        return
+    if price <= 0 or qty <= 0: return
 
     inv = _get_inventory_deque(market)
     realized = 0.0
 
     if side.lower() == "buy":
         inv.append([qty, price])
-    else:  # sell -> consume FIFO
+    else:
         sell_q = qty
         while sell_q > 1e-18 and inv:
             lot_q, lot_px = inv[0]
@@ -139,9 +125,7 @@ def apply_fill_update(market, side, price, qty, ts_ms, order_id):
                 inv.popleft()
             else:
                 inv[0][0] = lot_q
-        # if sell_q > 0 and no inventory, treat as short-close? For spot, we ignore leftover.
 
-    # update state
     _set_inventory_from_deque(market, inv)
     profit_state["processed_orders"].append(order_id)
     profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
@@ -207,22 +191,83 @@ def aggregate_candles(pair, interval=60):
     if candle: candles.append(candle)
     candle_logs[pair] = candles[-50:]
 
+# ========== NEW: indicators & enhanced signal logic ==========
+def _ema(values, n):
+    if len(values) < n: return None
+    k = 2 / (n + 1)
+    ema = values[0]
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def _compute_ema(values, n):
+    # compute EMA seed via SMA then roll
+    if len(values) < n: return None
+    sma = sum(values[:n]) / n
+    k = 2 / (n + 1)
+    ema = sma
+    for v in values[n:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def _atr_14(candles):
+    if len(candles) < 15: return None
+    trs = []
+    prev_close = candles[-15]["close"]
+    for c in candles[-14:]:
+        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
+        trs.append(tr)
+        prev_close = c["close"]
+    return sum(trs) / len(trs) if trs else None
+
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
-    if len(candles) < 3:
+    if len(candles) < 20:
+        return None
+
+    # Extract OHLC arrays
+    highs = [c["high"] for c in candles]
+    lows  = [c["low"]  for c in candles]
+    closes= [c["close"] for c in candles]
+
+    ema5  = _compute_ema(closes, 5)
+    ema10 = _compute_ema(closes, 10)
+    atr14 = _atr_14(candles)
+
+    if ema5 is None or ema10 is None or atr14 is None:
         return None
 
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
 
-    # Relaxed BUY
-    if curr["close"] > prev2["close"] and curr["high"] > max(prev1["high"], prev2["high"]):
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: close > prev close and high > last 2 highs"}
+    # Breakout filters (last 3 bars)
+    last3_high = max(prev1["high"], prev2["high"], curr["high"])
+    last3_low  = min(prev1["low"],  prev2["low"],  curr["low"])
 
-    # Relaxed SELL
-    if curr["close"] < prev2["close"] and curr["low"] < min(prev1["low"], prev2["low"]):
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: close < prev close and low < last 2 lows"}
+    # Body strength filter to avoid tiny breaks
+    body_sizes = [abs(c["close"] - c["open"]) for c in candles[-10:]]
+    body_med = median(body_sizes) if body_sizes else 0
+    curr_body = abs(curr["close"] - curr["open"])
+
+    # BUY: trend (ema5>ema10), breakout of last 3 highs, decent body
+    if closes[-1] > last3_high and ema5 > ema10 and curr_body >= 0.5 * body_med:
+        return {
+            "side": "BUY",
+            "entry": closes[-1],
+            "ema5": ema5, "ema10": ema10, "atr": atr14,
+            "msg": "BUY: EMA5>EMA10 + breakout last 3 highs + strong body"
+        }
+
+    # SELL: trend (ema5<ema10), breakdown of last 3 lows, decent body
+    if closes[-1] < last3_low and ema5 < ema10 and curr_body >= 0.5 * body_med:
+        return {
+            "side": "SELL",
+            "entry": closes[-1],
+            "ema5": ema5, "ema10": ema10, "atr": atr14,
+            "msg": "SELL: EMA5<EMA10 + breakdown last 3 lows + strong body"
+        }
 
     return None
+# ============================================================
 
 def _signed_post(url, body):
     payload = json.dumps(body, separators=(',', ':'))
@@ -256,10 +301,6 @@ def get_order_status(order_id=None, client_order_id=None):
     return res if isinstance(res, dict) else {}
 
 def _record_fill_from_status(market, side, st, order_id):
-    """
-    Confirm fill from order status and update persistent P&L.
-    Works on avg fill; good enough for market orders.
-    """
     try:
         total_q = float(st.get("total_quantity", 0))
         remain_q = float(st.get("remaining_quantity", 0))
@@ -276,7 +317,6 @@ def _record_fill_from_status(market, side, st, order_id):
                 ts_ms *= 1000
         except:
             ts_ms = int(time.time() * 1000)
-        # >>> P&L update from confirmed fill (BUY/SELL)
         apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
 
 def monitor_exits(prices):
@@ -289,7 +329,6 @@ def monitor_exits(prices):
         if side == "BUY" and (price >= tp or price <= sl):
             res = place_order(pair, "SELL", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
-            # Confirm from order success -> update P&L
             try:
                 order_id = (res.get("orders") or [{}])[0].get("id")
             except:
@@ -299,10 +338,10 @@ def monitor_exits(prices):
                 _record_fill_from_status(pair, "SELL", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
         elif side == "SELL" and (price <= tp or price >= sl):
             res = place_order(pair, "BUY", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
-            # Confirm from order success -> update P&L
             try:
                 order_id = (res.get("orders") or [{}])[0].get("id")
             except:
@@ -312,7 +351,14 @@ def monitor_exits(prices):
                 _record_fill_from_status(pair, "BUY", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
     for ex in to_remove: exit_orders.remove(ex)
+
+def _has_open_exit_for(pair):
+    for ex in exit_orders:
+        if ex.get("pair") == pair:
+            return True
+    return False
 
 def scan_loop():
     global running, error_message
@@ -340,33 +386,62 @@ def scan_loop():
 
             if last_candle and last_candle["start"] != last_candle_ts[pair]:
                 last_candle_ts[pair] = last_candle["start"]
+
+                # Respect cooldown and existing exits to avoid overtrading
+                if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
+                    scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
+                    continue
+
                 signal = pa_buy_sell_signal(pair)
 
                 if signal:
                     error_message = ""
-                    coin = pair[:-4]
-                    qty = (0.3 * balances.get("USDT", 0)) / signal["entry"] if signal["side"] == "BUY" else balances.get(coin, 0)
+                    entry = signal["entry"]
+                    atr = signal.get("atr", None)
+
+                    # === Profit-oriented risk management ===
+                    # risk per trade = 0.5% of USDT balance
+                    usdt_bal = balances.get("USDT", 0.0)
+                    risk_amt = 0.005 * usdt_bal  # 0.5%
+                    # risk unit = max(0.75*ATR, 0.25% of price) as a minimum move
+                    min_tick_risk = entry * 0.0025
+                    risk_unit = max((0.75 * atr) if atr else 0, min_tick_risk)
+
+                    if signal["side"] == "BUY":
+                        sl = round(entry - risk_unit, 6)
+                        tp = round(entry + 1.8 * risk_unit, 6)  # ~1:1.8 RR
+                        risk_per_unit = max(entry - sl, 1e-9)
+                        qty_risk = risk_amt / risk_per_unit
+                        qty_cap = (0.3 * usdt_bal) / entry  # your 30% cap
+                        qty = min(qty_risk, qty_cap)
+                    else:
+                        sl = round(entry + risk_unit, 6)
+                        tp = round(entry - 1.8 * risk_unit, 6)
+                        # For SELL in spot, use available coin balance (no fresh short)
+                        coin = pair[:-4]
+                        qty = balances.get(coin, 0.0)
+
+                    # Precision & min qty
                     qty = round(qty, pair_precision.get(pair, 6))
-
-                    tp = round(signal['entry'] * 1.003, 6)
-                    sl = round(signal['entry'] * 0.997, 6)
-
-                    res = place_order(pair, signal["side"], qty)
-
-                    # Apply precision and min_qty logic
                     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
                     qty = max(qty, rule["min_qty"])
                     qty = round(qty, rule["precision"])
 
-                    # Log result
-                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {signal['entry']} | {res}")
+                    # Sanity: skip if qty still too small
+                    if qty <= 0:
+                        scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
+                        continue
+
+                    res = place_order(pair, signal["side"], qty)
+
+                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SL {sl} | TP {tp} | {res}")
                     trade_log.append({
-                        "time": ist_now(), "pair": pair, "side": signal["side"], "entry": signal["entry"],
+                        "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
                         "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
                     })
                     exit_orders.append({
                         "pair": pair, "side": signal["side"], "qty": qty,
-                        "tp": tp, "sl": sl, "entry": signal["entry"]
+                        "tp": tp, "sl": sl, "entry": entry
                     })
 
                     # Confirm from order success -> update P&L
@@ -380,8 +455,8 @@ def scan_loop():
 
                     if "error" in res:
                         error_message = res["error"]
+
                 else:
-                    # ✅ Even if no signal, log the scan
                     scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
         status["msg"], status["last"] = "Running", ist_now()
@@ -389,10 +464,8 @@ def scan_loop():
 
     status["msg"] = "Idle"
 
-# --------- Keep function name, but now it reads from persistent state ---------
 def compute_realized_pnl_today():
     return round(profit_state["daily"].get(ist_date(), 0.0), 6)
-# ------------------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -418,8 +491,6 @@ def stop():
 def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
-
-    # Executed-only P&L (USDT) from persistent state
     profit_today = compute_realized_pnl_today()
     profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
     cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
