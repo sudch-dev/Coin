@@ -20,7 +20,7 @@ PAIRS = [
 ]
 
 PAIR_RULES = {
-    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "BTCUSDT": {"precision": 4, "min_qty": 0.001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
