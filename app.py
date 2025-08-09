@@ -393,7 +393,7 @@ def scan_loop():
                         usdt_bal = balances.get("USDT", 0.0)
                         risk_amt = 0.005 * usdt_bal        # 0.5% risk per trade
                         min_tick_risk = entry * 0.0015     # tighter for responsiveness
-                        risk_unit = max((0.6 * atr) if atr else 0, min_tick_risk)
+                        risk_unit = max((0.1 * atr) if atr else 0, min_tick_risk)
 
                         if signal["side"] == "BUY":
                             sl = round(entry - risk_unit, 6)
