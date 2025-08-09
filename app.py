@@ -187,7 +187,7 @@ def aggregate_candles(pair, interval=60):
         else:
             candle["high"] = max(candle["high"], price)
             candle["low"] = min(candle["low"], price)
-            candle["close"] = price)
+            candle["close"] = price
             candle["volume"] += 1
     if candle: candles.append(candle)
     candle_logs[pair] = candles[-50:]
