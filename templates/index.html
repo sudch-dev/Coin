@@ -10,10 +10,11 @@
     h2 { margin: 0 0 12px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
     .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
-    button { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    button, select { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
     button:hover { background:#fafafa; }
     pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:300px; overflow:auto; }
     .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
+    .muted { color: var(--muted); font-size: 12px; }
   </style>
 </head>
 <body>
@@ -22,6 +23,12 @@
   <div class="row" style="margin-bottom:10px">
     <button id="btnStart">Start</button>
     <button id="btnStop">Stop</button>
+    <label class="muted">Interval:
+      <select id="selInterval">
+        <option value="1m">1 min</option>
+        <option value="5m">5 min</option>
+      </select>
+    </label>
     <span>Status: <b id="lblStatus">Idle</b></span>
     <span>Last: <span id="lblLast">—</span></span>
   </div>
@@ -42,22 +49,101 @@
   <pre id="tradeLog">—</pre>
 
   <script>
-    // --- basic Start/Stop buttons ---
-    document.getElementById('btnStart').onclick = async () => {
-      try { const r = await fetch('/start', { method:'POST' }); console.log('start', await r.json()); } catch(e){ console.warn(e); }
-    };
+    // ——— Interval UI state ———
+    const sel = document.getElementById('selInterval');
+    sel.value = localStorage.getItem('interval') || '1m';
+    sel.addEventListener('change', () => {
+      localStorage.setItem('interval', sel.value);
+    });
+
+    // ——— Start/Stop ———
+    document.getElementById('btnStart').onclick = () => startScanner(true);
     document.getElementById('btnStop').onclick = async () => {
       try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
     };
 
-    // --- watchdog + keepalive ---
+    // ——— Helpers ———
+    const MAX_SCANS = 30;
+    const MAX_TRADES = 10;
+    const IST = 'Asia/Kolkata';
+
+    function fmtIST(d) {
+      const date = d instanceof Date ? d
+        : (String(d).length <= 10 ? new Date(Number(d) * 1000) : new Date(Number(d)));
+      try {
+        const pad = n => String(n).padStart(2, '0');
+        const z = new Intl.DateTimeFormat('en-GB', {
+          timeZone: IST, year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+        }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+        return `${z.year}-${z.month}-${z.day} ${z.hour}:${z.minute}:${z.second}`;
+      } catch { return '—'; }
+    }
+    function safeJson(v){ try { return JSON.stringify(v); } catch { return String(v); } }
+    function setEpochPill(epochSec){
+      const s = Number(epochSec || 0);
+      document.getElementById('lblEpoch').textContent = s ? `hb:${s} | ${fmtIST(s)}` : '—';
+    }
+
+    // ——— P&L from scan log (success-only, no "error") ———
+    // Accepts lines like:
+    //  - "... pnl=+1.23 ..." or "... PNL: -0.45 ..." or "... profit=0.7 ..."
+    //  - If the line has "error" (any case) it is ignored.
+    //  - If the line has an epoch ("epoch=1723200000") we date-bucket to Today/Yesterday (IST).
+    function computePnlFromScans(scanLines) {
+      const TODAY = new Intl.DateTimeFormat('en-CA', { timeZone: IST, year:'numeric', month:'2-digit', day:'2-digit' })
+        .formatToParts(new Date()).reduce((a,p)=>(a[p.type]=p.value,a),{});
+      const todayKey = `${TODAY.year}-${TODAY.month}-${TODAY.day}`;
+
+      function istKeyFromEpoch(sec){
+        try {
+          const d = new Date(sec * 1000);
+          const p = new Intl.DateTimeFormat('en-CA', { timeZone: IST, year:'numeric', month:'2-digit', day:'2-digit' })
+            .formatToParts(d).reduce((a,t)=>(a[t.type]=t.value,a),{});
+          return `${p.year}-${p.month}-${p.day}`;
+        } catch { return todayKey; }
+      }
+
+      let t = 0, y = 0, all = 0;
+      // Look back more lines for P&L accuracy (don’t render all)
+      const pool = Array.isArray(scanLines) ? scanLines.slice(-500) : [];
+
+      for (const lineRaw of pool) {
+        const line = String(lineRaw);
+        if (line.toLowerCase().includes('error')) continue;         // ignore errored orders
+        if (!/(order|trade|buy|sell|filled|executed)/i.test(line)) continue; // only trade-ish lines
+
+        // Try to extract explicit PnL
+        const m = line.match(/(?:pnl|profit)\s*[:=]\s*([+-]?\d+(?:\.\d+)?)/i);
+        if (!m) continue;
+        const val = Number(m[1]);
+        if (!isFinite(val)) continue;
+
+        // Bucket by date if we have an epoch; else assume today
+        const em = line.match(/epoch[=:]\s*(\d{9,10})/);
+        const key = em ? istKeyFromEpoch(Number(em[1])) : todayKey;
+
+        all += val;
+        if (key === todayKey) t += val;
+        else {
+          // compute yesterday's key once lazily
+          // (We treat anything not-today as "yesterday" bucket for the display)
+          y += val;
+        }
+      }
+      return { today: t, yesterday: y, total: all };
+    }
+
+    // ——— Watchdog + keepalive ———
     (() => {
-      const PING_MS = 60 * 1000;     // ping /ping to keep the dyno warm
-      const CHECK_MS = 60 * 1000;    // poll /status cadence
-      const STALE_SEC = 120;         // if heartbeat older than this -> auto-start
-      const START_RETRY_MS = 10 * 1000;
+      const PING_MS = 60 * 1000;
+      const CHECK_MS = 60 * 1000;
+      const STALE_SEC = 120;
 
       let lastEpoch = 0;
+      let starting = false;
+      let backoff = 5000;
+      const MAX_BACKOFF = 30000;
 
       async function safeFetch(url, opts = {}, timeoutMs = 8000) {
         const ctrl = new AbortController();
@@ -72,35 +158,63 @@
         }
       }
 
-      async function keepAlive() {
-        try { await safeFetch('/ping', {}, 4000); } catch (_) {}
-      }
+      async function keepAlive(){ try { await safeFetch('/ping', {}, 4000); } catch(_){} }
 
-      async function startScanner() {
+      async function startScanner(manual=false) {
+        if (starting) return;
+        starting = true;
+        const interval = document.getElementById('selInterval').value || '1m';
         try {
-          const res = await safeFetch('/start', { method:'POST' }, 6000);
-          console.log('[auto-start]', await res.json());
+          const res = await safeFetch(`/start?interval=${encodeURIComponent(interval)}`, { method:'POST' }, 6000);
+          const j = await res.json().catch(() => ({}));
+          console.log(manual ? '[manual-start]' : '[auto-start]', j);
+          backoff = 5000;
         } catch (e) {
-          console.warn('[auto-start] failed, retrying', e);
-          setTimeout(startScanner, START_RETRY_MS);
+          console.warn('[start] failed; retrying', e);
+          setTimeout(() => startScanner(false), backoff);
+          backoff = Math.min(MAX_BACKOFF, Math.floor(backoff * 1.6));
+        } finally {
+          setTimeout(() => { starting = false; }, 1500);
         }
       }
 
       function renderStatus(d) {
         document.getElementById('lblStatus').textContent = d.status || '—';
-        document.getElementById('lblLast').textContent = d.last || '—';
-        document.getElementById('lblUSDT').textContent = Number(d.usdt ?? 0).toFixed(2);
-        document.getElementById('lblPNLT').textContent = Number(d.profit_today ?? 0).toFixed(2);
-        document.getElementById('lblPNLY').textContent = Number(d.profit_yesterday ?? 0).toFixed(2);
-        document.getElementById('lblPNLAll').textContent = Number(d.pnl_cumulative ?? 0).toFixed(2);
-        document.getElementById('lblEpoch').textContent = d.status_epoch ? `hb:${d.status_epoch}` : '—';
+        document.getElementById('lblLast').textContent = d.last
+          ? (/\d{10,}/.test(String(d.last)) ? fmtIST(d.last) : String(d.last))
+          : '—';
 
-        const scans = Array.isArray(d.scans) ? d.scans.join('\n') : '';
-        const trades = Array.isArray(d.trades) ? d.trades.map(t => {
-          try { return JSON.stringify(t); } catch { return String(t); }
-        }).join('\n') : '';
-        document.getElementById('scanLog').textContent = scans || '—';
-        document.getElementById('tradeLog').textContent = trades || '—';
+        // balances as-is from backend
+        document.getElementById('lblUSDT').textContent   = Number(d.usdt ?? 0).toFixed(2);
+        setEpochPill(d.status_epoch);
+
+        // scans & trades to screen (trimmed)
+        const scans = Array.isArray(d.scans) ? d.scans.slice(-MAX_SCANS) : [];
+        document.getElementById('scanLog').textContent =
+          scans.map(line => {
+            const m = String(line).match(/epoch[=:]\s*(\d{9,10})/);
+            return m ? String(line).replace(m[1], `${m[1]} (${fmtIST(Number(m[1]))})`) : String(line);
+          }).join('\n') || '—';
+
+        const trades = Array.isArray(d.trades) ? d.trades.slice(-MAX_TRADES) : [];
+        const prettyTrades = trades.map(t => {
+          try {
+            const x = typeof t === 'string' ? JSON.parse(t) : t;
+            if (x && (x.time || x.ts || x.epoch)) {
+              const ts = x.time ?? x.ts ?? x.epoch;
+              x.time_ist = fmtIST(ts);
+            }
+            return JSON.stringify(x);
+          } catch { return safeJson(t); }
+        }).join('\n');
+        document.getElementById('tradeLog').textContent = prettyTrades || '—';
+
+        // ——— P&L from scans (success-only) ———
+        // Use the untrimmed list if backend provides it; else our trimmed "scans"
+        const pnl = computePnlFromScans(Array.isArray(d.scans) ? d.scans : scans);
+        document.getElementById('lblPNLT').textContent   = Number(pnl.today).toFixed(2);
+        document.getElementById('lblPNLY').textContent   = Number(pnl.yesterday).toFixed(2);
+        document.getElementById('lblPNLAll').textContent = Number(pnl.total).toFixed(2);
       }
 
       async function checkStatusAndAutostart() {
@@ -117,25 +231,22 @@
 
           if (isIdle || isStale) {
             console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
-            startScanner();
+            startScanner(false);
           }
           lastEpoch = epoch || lastEpoch;
         } catch (e) {
           console.warn('[watchdog] /status failed; nudging /start', e);
-          setTimeout(startScanner, START_RETRY_MS);
+          startScanner(false);
         }
       }
 
-      // initial kicks
+      // kick
       keepAlive();
       checkStatusAndAutostart();
-      startScanner();
-
-      // repeaters
+      // repeats
       setInterval(keepAlive, PING_MS);
       setInterval(checkStatusAndAutostart, CHECK_MS);
-
-      // on tab focus (when mobile wakes)
+      // focus resume
       window.addEventListener('focus', () => {
         keepAlive();
         checkStatusAndAutostart();
