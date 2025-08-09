@@ -22,7 +22,7 @@ PAIRS = [
 ]
 
 PAIR_RULES = {
-    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "BTCUSDT": {"precision": 4, "min_qty": 0.001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
@@ -44,6 +44,7 @@ scan_log, trade_log, exit_orders = [], [], []
 daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
+status_epoch = 0  # NEW: heartbeat seconds since epoch
 error_message = ""
 
 # ===== Persistent P&L state (confirmed fills only) =====
@@ -186,22 +187,13 @@ def aggregate_candles(pair, interval=60):
         else:
             candle["high"] = max(candle["high"], price)
             candle["low"] = min(candle["low"], price)
-            candle["close"] = price
+            candle["close"] = price)
             candle["volume"] += 1
     if candle: candles.append(candle)
     candle_logs[pair] = candles[-50:]
 
-# ========== NEW: indicators & enhanced signal logic ==========
-def _ema(values, n):
-    if len(values) < n: return None
-    k = 2 / (n + 1)
-    ema = values[0]
-    for v in values[1:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
+# ========== indicators & enhanced signal logic ==========
 def _compute_ema(values, n):
-    # compute EMA seed via SMA then roll
     if len(values) < n: return None
     sma = sum(values[:n]) / n
     k = 2 / (n + 1)
@@ -225,7 +217,6 @@ def pa_buy_sell_signal(pair):
     if len(candles) < 20:
         return None
 
-    # Extract OHLC arrays
     highs = [c["high"] for c in candles]
     lows  = [c["low"]  for c in candles]
     closes= [c["close"] for c in candles]
@@ -238,17 +229,13 @@ def pa_buy_sell_signal(pair):
         return None
 
     prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-
-    # Breakout filters (last 3 bars)
     last3_high = max(prev1["high"], prev2["high"], curr["high"])
     last3_low  = min(prev1["low"],  prev2["low"],  curr["low"])
 
-    # Body strength filter to avoid tiny breaks
     body_sizes = [abs(c["close"] - c["open"]) for c in candles[-10:]]
     body_med = median(body_sizes) if body_sizes else 0
     curr_body = abs(curr["close"] - curr["open"])
 
-    # BUY: trend (ema5>ema10), breakout of last 3 highs, decent body
     if closes[-1] > last3_high and ema5 > ema10 and curr_body >= 0.5 * body_med:
         return {
             "side": "BUY",
@@ -257,7 +244,6 @@ def pa_buy_sell_signal(pair):
             "msg": "BUY: EMA5>EMA10 + breakout last 3 highs + strong body"
         }
 
-    # SELL: trend (ema5<ema10), breakdown of last 3 lows, decent body
     if closes[-1] < last3_low and ema5 < ema10 and curr_body >= 0.5 * body_med:
         return {
             "side": "SELL",
@@ -361,7 +347,7 @@ def _has_open_exit_for(pair):
     return False
 
 def scan_loop():
-    global running, error_message
+    global running, error_message, status_epoch  # NEW: add status_epoch
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
     interval = 60
@@ -387,7 +373,6 @@ def scan_loop():
             if last_candle and last_candle["start"] != last_candle_ts[pair]:
                 last_candle_ts[pair] = last_candle["start"]
 
-                # Respect cooldown and existing exits to avoid overtrading
                 if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
                     scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
                     continue
@@ -399,35 +384,29 @@ def scan_loop():
                     entry = signal["entry"]
                     atr = signal.get("atr", None)
 
-                    # === Profit-oriented risk management ===
-                    # risk per trade = 0.5% of USDT balance
                     usdt_bal = balances.get("USDT", 0.0)
-                    risk_amt = 0.005 * usdt_bal  # 0.5%
-                    # risk unit = max(0.75*ATR, 0.25% of price) as a minimum move
+                    risk_amt = 0.005 * usdt_bal
                     min_tick_risk = entry * 0.0025
                     risk_unit = max((0.75 * atr) if atr else 0, min_tick_risk)
 
                     if signal["side"] == "BUY":
                         sl = round(entry - risk_unit, 6)
-                        tp = round(entry + 1.8 * risk_unit, 6)  # ~1:1.8 RR
+                        tp = round(entry + 1.8 * risk_unit, 6)
                         risk_per_unit = max(entry - sl, 1e-9)
                         qty_risk = risk_amt / risk_per_unit
-                        qty_cap = (0.3 * usdt_bal) / entry  # your 30% cap
+                        qty_cap = (0.3 * usdt_bal) / entry
                         qty = min(qty_risk, qty_cap)
                     else:
                         sl = round(entry + risk_unit, 6)
                         tp = round(entry - 1.8 * risk_unit, 6)
-                        # For SELL in spot, use available coin balance (no fresh short)
                         coin = pair[:-4]
                         qty = balances.get(coin, 0.0)
 
-                    # Precision & min qty
                     qty = round(qty, pair_precision.get(pair, 6))
                     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
                     qty = max(qty, rule["min_qty"])
                     qty = round(qty, rule["precision"])
 
-                    # Sanity: skip if qty still too small
                     if qty <= 0:
                         scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
                         continue
@@ -444,7 +423,6 @@ def scan_loop():
                         "tp": tp, "sl": sl, "entry": entry
                     })
 
-                    # Confirm from order success -> update P&L
                     try:
                         order_id = (res.get("orders") or [{}])[0].get("id")
                     except:
@@ -455,11 +433,11 @@ def scan_loop():
 
                     if "error" in res:
                         error_message = res["error"]
-
                 else:
                     scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
         status["msg"], status["last"] = "Running", ist_now()
+        status_epoch = int(time.time())  # NEW: heartbeat for the UI watchdog
         time.sleep(5)
 
     status["msg"] = "Idle"
@@ -496,12 +474,16 @@ def get_status():
     cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
 
     return jsonify({
-        "status": status["msg"], "last": status["last"],
+        "status": status["msg"],
+        "last": status["last"],
+        "status_epoch": status_epoch,  # NEW
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
         "pnl_cumulative": cumulative_pnl,
-        "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
+        "coins": coins,
+        "trades": trade_log[-10:][::-1],
+        "scans": scan_log[-30:][::-1],
         "error": error_message
     })
 
