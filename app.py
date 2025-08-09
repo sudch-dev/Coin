@@ -36,8 +36,8 @@ PAIR_RULES = {
 }
 
 # --- Tunables ---
-CANDLE_INTERVAL = 90            # seconds (was 60). 20–30 is snappier.
-TRADE_COOLDOWN_SEC = 30           # cooldown after an exit; can lower to 120 if you want.
+CANDLE_INTERVAL = 5           # seconds (was 60). 20–30 is snappier.
+TRADE_COOLDOWN_SEC = 10           # cooldown after an exit; can lower to 120 if you want.
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -218,7 +218,7 @@ def _atr_14(candles):
 def pa_buy_sell_signal(pair, live_price=None):
     """
     Responsive signal:
-    - Trend: EMAfast > EMAslow (5/13) built on completed closes + live price
+    - Trend: EMAfast > EMAslow (3/5) built on completed closes + live price
     - Breakout: price crosses Donchian channel of last N completed candles
     - ATR(14) from completed candles for sizing
     """
@@ -240,8 +240,8 @@ def pa_buy_sell_signal(pair, live_price=None):
     don_low  = min(c["low"]  for c in recent)
 
     closes_plus_live = closes[-30:] + [curr_price]
-    ema_fast = _compute_ema(closes_plus_live, 5)
-    ema_slow = _compute_ema(closes_plus_live, 13)
+    ema_fast = _compute_ema(closes_plus_live, 3)
+    ema_slow = _compute_ema(closes_plus_live, 7)
 
     atr14 = _atr_14(completed)
     if ema_fast is None or ema_slow is None or atr14 is None:
@@ -393,18 +393,18 @@ def scan_loop():
                         usdt_bal = balances.get("USDT", 0.0)
                         risk_amt = 0.005 * usdt_bal        # 0.5% risk per trade
                         min_tick_risk = entry * 0.0015     # tighter for responsiveness
-                        risk_unit = max((0.9 * atr) if atr else 0, min_tick_risk)
+                        risk_unit = max((0.5 * atr) if atr else 0, min_tick_risk)
 
                         if signal["side"] == "BUY":
                             sl = round(entry - risk_unit, 6)
-                            tp = round(entry + 1.8 * risk_unit, 6)
+                            tp = round(entry + 1.5 * risk_unit, 6)
                             risk_per_unit = max(entry - sl, 1e-9)
                             qty_risk = risk_amt / risk_per_unit
                             qty_cap = (0.3 * usdt_bal) / entry
                             qty = min(qty_risk, qty_cap)
                         else:
                             sl = round(entry + risk_unit, 6)
-                            tp = round(entry - 1.8 * risk_unit, 6)
+                            tp = round(entry - 1.2 * risk_unit, 6)
                             coin = pair[:-4]
                             qty = balances.get(coin, 0.0)
 
