@@ -25,7 +25,7 @@ PAIR_RULES = {
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
     "DOGEUSDT": {"precision": 4, "min_qty": .1},
-    "SOLUSDT": {"precision": 3, "min_qty": 0.01},
+    "SOLUSDT": {"precision": 4, "min_qty": 0.01},
     "AEROUSDT": {"precision": 2, "min_qty": .01},
     "ADAUSDT": {"precision": 2, "min_qty": 1},
     "LTCUSDT": {"precision": 4, "min_qty": 0.001},
