@@ -25,9 +25,9 @@ PAIR_RULES = {
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "XRPUSDT": {"precision": 4, "min_qty": 0.1},
     "SHIBUSDT": {"precision": 4, "min_qty": 10000},
-    "DOGEUSDT": {"precision": 4, "min_qty": .01},
+    "DOGEUSDT": {"precision": 4, "min_qty": 0.01},
     "SOLUSDT": {"precision": 4, "min_qty": 0.01},
-    "AEROUSDT": {"precision": 2, "min_qty": .01},
+    "AEROUSDT": {"precision": 2, "min_qty": 0.01},
     "ADAUSDT": {"precision": 2, "min_qty": 0.1},
     "LTCUSDT": {"precision": 4, "min_qty": 0.001},
     "BNBUSDT": {"precision": 4, "min_qty": 0.001}
@@ -45,9 +45,111 @@ running = False
 status = {"msg": "Idle", "last": ""}
 error_message = ""
 
-# NEW: local executed fills store (survives while app is running)
-# each item: {"market": str, "side": "buy"/"sell", "price": float, "qty": float, "ts_ms": int}
-executed_fills = []
+# ===== Persistent P&L state (confirmed fills only) =====
+PROFIT_STATE_FILE = "profit_state.json"
+# state schema:
+# {
+#   "cumulative_pnl": float (USDT),
+#   "daily": {"YYYY-MM-DD": float (USDT), ...},
+#   "inventory": { "BTCUSDT": [[qty, cost_per_base_quote], ...], ... },
+#   "processed_orders": [ "order_id1", "order_id2", ... ]
+# }
+profit_state = {
+    "cumulative_pnl": 0.0,
+    "daily": {},
+    "inventory": {},
+    "processed_orders": []
+}
+
+def load_profit_state():
+    global profit_state
+    try:
+        with open(PROFIT_STATE_FILE, "r") as f:
+            data = json.load(f)
+        # sanity defaults
+        profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
+        profit_state["daily"] = dict(data.get("daily", {}))
+        profit_state["inventory"] = data.get("inventory", {})
+        profit_state["processed_orders"] = list(data.get("processed_orders", []))
+    except:
+        pass
+
+def save_profit_state():
+    tmp = {
+        "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
+        "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
+        "inventory": profit_state.get("inventory", {}),
+        "processed_orders": profit_state.get("processed_orders", [])
+    }
+    try:
+        with open(PROFIT_STATE_FILE, "w") as f:
+            json.dump(tmp, f)
+    except:
+        pass
+
+def _get_inventory_deque(market):
+    # inventory as list in state; adapt to deque of [qty, cost]
+    inv = profit_state["inventory"].get(market, [])
+    dq = deque()
+    for lot in inv:
+        try:
+            q, c = float(lot[0]), float(lot[1])
+            if q > 0 and c > 0:
+                dq.append([q, c])
+        except:
+            continue
+    return dq
+
+def _set_inventory_from_deque(market, dq):
+    profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
+
+def apply_fill_update(market, side, price, qty, ts_ms, order_id):
+    """
+    Update FIFO inventory and realized P&L using a confirmed fill.
+    Persist to disk. Ignore if order_id already processed.
+    P&L is in USDT (quote), since all pairs are XXXUSDT.
+    """
+    if not order_id:
+        return
+    if order_id in profit_state["processed_orders"]:
+        return
+
+    try:
+        price = float(price)
+        qty = float(qty)
+    except:
+        return
+    if price <= 0 or qty <= 0:
+        return
+
+    inv = _get_inventory_deque(market)
+    realized = 0.0
+
+    if side.lower() == "buy":
+        inv.append([qty, price])
+    else:  # sell -> consume FIFO
+        sell_q = qty
+        while sell_q > 1e-18 and inv:
+            lot_q, lot_px = inv[0]
+            used = min(sell_q, lot_q)
+            realized += (price - lot_px) * used
+            lot_q -= used
+            sell_q -= used
+            if lot_q <= 1e-18:
+                inv.popleft()
+            else:
+                inv[0][0] = lot_q
+        # if sell_q > 0 and no inventory, treat as short-close? For spot, we ignore leftover.
+
+    # update state
+    _set_inventory_from_deque(market, inv)
+    profit_state["processed_orders"].append(order_id)
+    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
+    dkey = ist_date()
+    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
+    save_profit_state()
+
+# ===== end persistent P&L helpers =====
 
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
@@ -146,7 +248,6 @@ def place_order(pair, side, qty):
     except Exception as e:
         return {"error": str(e)}
 
-# NEW: poll order status and capture executed fills locally
 def get_order_status(order_id=None, client_order_id=None):
     body = {"timestamp": int(time.time() * 1000)}
     if order_id: body["id"] = order_id
@@ -154,10 +255,10 @@ def get_order_status(order_id=None, client_order_id=None):
     res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
     return res if isinstance(res, dict) else {}
 
-def _record_fill_from_status(market, side, st):
+def _record_fill_from_status(market, side, st, order_id):
     """
-    When an order is filled (or partially), record avg_price * filled_qty as a single fill snapshot.
-    If exchange returns executions list, you could iterate them; avg is enough for P&L.
+    Confirm fill from order status and update persistent P&L.
+    Works on avg fill; good enough for market orders.
     """
     try:
         total_q = float(st.get("total_quantity", 0))
@@ -175,14 +276,8 @@ def _record_fill_from_status(market, side, st):
                 ts_ms *= 1000
         except:
             ts_ms = int(time.time() * 1000)
-
-        executed_fills.append({
-            "market": market,
-            "side": side.lower(),
-            "price": avg_px,
-            "qty": filled,
-            "ts_ms": ts_ms
-        })
+        # >>> P&L update from confirmed fill (BUY/SELL)
+        apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
 
 def monitor_exits(prices):
     global error_message
@@ -194,33 +289,27 @@ def monitor_exits(prices):
         if side == "BUY" and (price >= tp or price <= sl):
             res = place_order(pair, "SELL", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
-            # NEW: capture fill
+            # Confirm from order success -> update P&L
             try:
                 order_id = (res.get("orders") or [{}])[0].get("id")
             except:
                 order_id = None
             if order_id:
                 st = get_order_status(order_id=order_id)
-                _record_fill_from_status(pair, "SELL", st)
-
-            pl = (price - entry) * qty
-            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
+                _record_fill_from_status(pair, "SELL", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
         elif side == "SELL" and (price <= tp or price >= sl):
             res = place_order(pair, "BUY", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
-            # NEW: capture fill
+            # Confirm from order success -> update P&L
             try:
                 order_id = (res.get("orders") or [{}])[0].get("id")
             except:
                 order_id = None
             if order_id:
                 st = get_order_status(order_id=order_id)
-                _record_fill_from_status(pair, "BUY", st)
-
-            pl = (entry - price) * qty
-            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
+                _record_fill_from_status(pair, "BUY", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
     for ex in to_remove: exit_orders.remove(ex)
@@ -280,14 +369,14 @@ def scan_loop():
                         "tp": tp, "sl": sl, "entry": signal["entry"]
                     })
 
-                    # NEW: capture fill for entry order
+                    # Confirm from order success -> update P&L
                     try:
                         order_id = (res.get("orders") or [{}])[0].get("id")
                     except:
                         order_id = None
                     if order_id:
                         st = get_order_status(order_id=order_id)
-                        _record_fill_from_status(pair, signal["side"], st)
+                        _record_fill_from_status(pair, signal["side"], st, order_id)
 
                     if "error" in res:
                         error_message = res["error"]
@@ -300,122 +389,10 @@ def scan_loop():
 
     status["msg"] = "Idle"
 
-# ---------- Executed-trade P&L (local-first; API fallback) ----------
-
-def get_account_trades(from_ts_ms: int, to_ts_ms: int, symbol=None, limit=5000):
-    # same as previous robust version (kept for fallback)
-    def signed_post(url, body):
-        payload = json.dumps(body, separators=(',', ':'))
-        sig = hmac_signature(payload)
-        headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-        try:
-            r = requests.post(url, headers=headers, data=payload, timeout=12)
-            if r.ok:
-                return r.json()
-        except:
-            pass
-        return []
-
-    body1 = {
-        "timestamp": int(time.time() * 1000),
-        "from_timestamp": int(from_ts_ms),
-        "to_timestamp": int(to_ts_ms),
-        "limit": limit
-    }
-    if symbol:
-        body1["market"] = symbol
-    trades = signed_post(f"{BASE_URL}/exchange/v1/orders/trade_history", body1)
-    if isinstance(trades, list) and trades:
-        return trades
-
-    body2 = {
-        "timestamp": int(time.time() * 1000),
-        "limit": limit
-    }
-    if symbol:
-        body2["market"] = symbol
-    trades2 = signed_post(f"{BASE_URL}/exchange/v1/users/me/orders/trades", body2)
-    return trades2 if isinstance(trades2, list) else []
-
-def _norm_trade(t):
-    market = t.get("market") or t.get("symbol") or t.get("pair") or t.get("s")
-    side   = (t.get("side") or "").lower()
-    price = t.get("price", t.get("price_per_unit", t.get("p", 0)))
-    qty   = t.get("quantity", t.get("q", t.get("total_quantity", 0)))
-    try: price = float(price)
-    except: price = 0.0
-    try: qty = float(qty)
-    except: qty = 0.0
-    ts = t.get("timestamp", t.get("T", t.get("created_at", int(time.time()*1000))))
-    try:
-        ts_ms = int(ts)
-        if ts_ms < 10**12: ts_ms *= 1000
-    except:
-        ts_ms = int(time.time()*1000)
-    fee_base = t.get("fee_amount", 0)
-    try: fee_base = float(fee_base)
-    except: fee_base = 0.0
-    return {"market": market, "side": side, "price": price, "qty": qty, "ts_ms": ts_ms, "fee_base": fee_base}
-
-def _compute_realized_pnl_from(trades_iterable):
-    by_market = defaultdict(list)
-    for t in trades_iterable:
-        if t["market"] and t["price"] > 0 and t["qty"] > 0 and t["side"] in ("buy", "sell"):
-            by_market[t["market"]].append(t)
-
-    realized = 0.0
-    inventory = defaultdict(deque)
-    for market, lst in by_market.items():
-        lst.sort(key=lambda x: x["ts_ms"])
-        for tr in lst:
-            px, q = tr["price"], tr["qty"]
-            fee_b = tr.get("fee_base", 0.0)
-            fee_q = fee_b * px
-            if tr["side"] == "buy":
-                inventory[market].append([q, px])
-                realized -= fee_q
-            else:
-                sell_q = q
-                while sell_q > 1e-18 and inventory[market]:
-                    lot_q, lot_px = inventory[market][0]
-                    used = min(sell_q, lot_q)
-                    realized += (px - lot_px) * used
-                    lot_q -= used
-                    sell_q -= used
-                    if lot_q <= 1e-18:
-                        inventory[market].popleft()
-                    else:
-                        inventory[market][0][0] = lot_q
-                realized -= fee_q
-    return round(realized, 6)
-
+# --------- Keep function name, but now it reads from persistent state ---------
 def compute_realized_pnl_today():
-    """
-    Prefer local executed_fills (from this app run). If empty, fallback to API trades.
-    Returns P&L in USDT (quote) for XXXUSDT pairs.
-    """
-    # 1) Local fills for 'today'
-    start_dt = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
-    from_ts = int(start_dt.timestamp() * 1000)
-    to_ts   = int(datetime.now(IST).timestamp() * 1000)
-
-    local = [t for t in executed_fills if from_ts <= t["ts_ms"] <= to_ts]
-    if local:
-        # local fills don’t include fee; assume 0-fee OR add fee if you log it later.
-        # Still accurate for direction/price P&L.
-        norm_local = [{"market": t["market"], "side": t["side"], "price": t["price"], "qty": t["qty"], "ts_ms": t["ts_ms"], "fee_base": 0.0} for t in local]
-        return _compute_realized_pnl_from(norm_local)
-
-    # 2) Fallback to API
-    raw = get_account_trades(from_ts, to_ts, symbol=None, limit=5000)
-    if not isinstance(raw, list) or not raw:
-        return 0.0
-    trades = [_norm_trade(t) for t in raw if isinstance(t, dict)]
-    # filter to window again if needed
-    trades = [t for t in trades if from_ts <= t["ts_ms"] <= to_ts]
-    return _compute_realized_pnl_from(trades)
-
-# -------------------------------------------------------------
+    return round(profit_state["daily"].get(ist_date(), 0.0), 6)
+# ------------------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -442,14 +419,17 @@ def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
 
-    # Executed-only P&L (USDT terms). Local fills preferred.
+    # Executed-only P&L (USDT) from persistent state
     profit_today = compute_realized_pnl_today()
+    profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
+    cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
 
     return jsonify({
         "status": status["msg"], "last": status["last"],
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
-        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
+        "profit_yesterday": profit_yesterday,
+        "pnl_cumulative": cumulative_pnl,
         "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
         "error": error_message
     })
@@ -458,5 +438,6 @@ def get_status():
 def ping(): return "pong"
 
 if __name__ == "__main__":
+    load_profit_state()
     fetch_pair_precisions()
     app.run(host="0.0.0.0", port=10000)
