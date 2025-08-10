@@ -8,7 +8,7 @@ import json
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
-from collections import deque, defaultdict
+from collections import deque
 from statistics import median
 
 app = Flask(__name__)
@@ -36,8 +36,8 @@ PAIR_RULES = {
 }
 
 # --- Tunables ---
-CANDLE_INTERVAL = 30        # seconds (was 60). 20–30 is snappier.
-TRADE_COOLDOWN_SEC = 30         # cooldown after an exit; can lower to 120 if you want.
+CANDLE_INTERVAL = 15            # seconds (changed from 30 -> 15 as requested)
+TRADE_COOLDOWN_SEC = 30
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -49,8 +49,11 @@ scan_log, trade_log, exit_orders = [], [], []
 daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
-status_epoch = 0         # heartbeat for the UI watchdog
+status_epoch = 0
 error_message = ""
+
+# Prevent multiple entries on the same flip-candle
+_last_signal_candle_start = {p: None for p in PAIRS}
 
 # ===== Persistent P&L state (confirmed fills only) =====
 PROFIT_STATE_FILE = "profit_state.json"
@@ -189,21 +192,12 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
         else:
             candle["high"] = max(candle["high"], price)
             candle["low"] = min(candle["low"], price)
-            candle["close"] = price   # <-- fixed (no stray ')')
+            candle["close"] = price
             candle["volume"] += 1
     if candle: candles.append(candle)
-    candle_logs[pair] = candles[-50:]
+    candle_logs[pair] = candles[-100:]  # keep more, 15s candles are small
 
-# ========= indicators =========
-def _compute_ema(values, n):
-    if len(values) < n: return None
-    sma = sum(values[:n]) / n
-    k = 2 / (n + 1)
-    ema = sma
-    for v in values[n:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
+# ========= Indicators =========
 def _atr_14(candles):
     if len(candles) < 15: return None
     trs = []
@@ -214,52 +208,126 @@ def _atr_14(candles):
         prev_close = c["close"]
     return sum(trs) / len(trs) if trs else None
 
-# ========= responsive signal (uses live price) =========
-def pa_buy_sell_signal(pair, live_price=None):
+# -------- Parabolic SAR (classic) --------
+def _psar_series(candles, step=0.02, max_step=0.2):
     """
-    Responsive signal:
-    - Trend: EMAfast > EMAslow (3/5) built on completed closes + live price
-    - Breakout: price crosses Donchian channel of last N completed candles
-    - ATR(14) from completed candles for sizing
+    Returns list of dicts: [{'sar': float, 'bull': bool}], length == len(candles)
+    Uses classic Wilder PSAR on completed candles.
+    """
+    n = len(candles)
+    if n < 2:
+        return []
+
+    psar = [None] * n
+    bull = True  # initial trend guess
+    af = step
+    ep = candles[0]["high"]
+    sar = candles[0]["low"]
+
+    # Decide initial trend from first 2 candles
+    if candles[1]["close"] < candles[0]["close"]:
+        bull = False
+        ep = candles[0]["low"]
+        sar = candles[0]["high"]
+
+    psar[0] = sar
+
+    for i in range(1, n):
+        c_prev = candles[i - 1]
+        c = candles[i]
+
+        sar = sar + af * (ep - sar)
+
+        if bull:
+            # SAR cannot be above last two lows
+            sar = min(sar, c_prev["low"], c["low"])
+        else:
+            # SAR cannot be below last two highs
+            sar = max(sar, c_prev["high"], c["high"])
+
+        reverse = False
+        if bull:
+            if c["low"] < sar:
+                reverse = True
+        else:
+            if c["high"] > sar:
+                reverse = True
+
+        if reverse:
+            bull = not bull
+            sar = ep  # on reversal, SAR = prior EP
+            af = step
+            if bull:
+                ep = c["high"]
+                # adjust SAR to min of last two lows
+                sar = min(sar, c_prev["low"], c["low"])
+            else:
+                ep = c["low"]
+                # adjust SAR to max of last two highs
+                sar = max(sar, c_prev["high"], c["high"])
+        else:
+            if bull:
+                if c["high"] > ep:
+                    ep = c["high"]
+                    af = min(af + step, max_step)
+            else:
+                if c["low"] < ep:
+                    ep = c["low"]
+                    af = min(af + step, max_step)
+
+        psar[i] = sar
+
+    out = []
+    # Determine bull/bear for each candle: price above SAR => bull
+    for i in range(n):
+        c = candles[i]
+        is_bull = c["close"] > psar[i]
+        out.append({"sar": psar[i], "bull": is_bull})
+    return out
+
+# ========= Signal (PSAR-only) =========
+def pa_buy_sell_signal_psar(pair):
+    """
+    PSAR-only entry:
+    - Use COMPLETED 15s candles.
+    - Generate a signal ONLY on a flip (bull <-> bear) between the last two completed candles.
     """
     candles = candle_logs[pair]
-    if len(candles) < 25:
+    if len(candles) < 6:
         return None
 
-    # completed candles (exclude the currently forming one)
     completed = candles[:-1] if len(candles) >= 2 else candles
-    if len(completed) < 20:
+    if len(completed) < 5:
         return None
 
-    closes = [c["close"] for c in completed]
-    curr_price = float(live_price) if live_price else candles[-1]["close"]
-
-    N = 5
-    recent = completed[-N:]
-    don_high = max(c["high"] for c in recent)
-    don_low  = min(c["low"]  for c in recent)
-
-    closes_plus_live = closes[-30:] + [curr_price]
-    ema_fast = _compute_ema(closes_plus_live, 7)
-    ema_slow = _compute_ema(closes_plus_live, 21)
-
-    atr14 = _atr_14(completed)
-    if ema_fast is None or ema_slow is None or atr14 is None:
+    states = _psar_series(completed)
+    if len(states) < 3:
         return None
 
-    if curr_price > don_high and ema_fast > ema_slow:
+    prev_state = states[-2]
+    last_state = states[-1]
+    last_candle = completed[-1]
+
+    # Flip detected only once per last completed candle
+    if _last_signal_candle_start.get(pair) == last_candle["start"]:
+        return None
+
+    # BUY if flipped to bull; SELL if flipped to bear
+    if (not prev_state["bull"]) and last_state["bull"]:
+        _last_signal_candle_start[pair] = last_candle["start"]
         return {
             "side": "BUY",
-            "entry": curr_price,
-            "atr": atr14,
-            "msg": f"BUY: live breakout > Donchian({N}) & EMA5>EMA13"
+            "entry": last_candle["close"],    # use close of flip candle
+            "atr": _atr_14(completed),
+            "msg": "BUY: PSAR flip to bullish"
         }
-    if curr_price < don_low and ema_fast < ema_slow:
+    if prev_state["bull"] and (not last_state["bull"]):
+        _last_signal_candle_start[pair] = last_candle["start"]
         return {
             "side": "SELL",
-            "entry": curr_price,
-            "atr": atr14,
-            "msg": f"SELL: live breakdown < Donchian({N}) & EMA5<EMA13"
+            "entry": last_candle["close"],
+            "atr": _atr_14(completed),
+            "msg": "SELL: PSAR flip to bearish"
         }
     return None
 
@@ -356,7 +424,6 @@ def _has_open_exit_for(pair):
 def scan_loop():
     global running, error_message, status_epoch
     scan_log.clear()
-    last_candle_ts = {p: 0 for p in PAIRS}
     interval = CANDLE_INTERVAL
 
     while running:
@@ -371,28 +438,27 @@ def scan_loop():
 
             price = prices[pair]["price"]
             tick_logs[pair].append((now, price))
-            if len(tick_logs[pair]) > 1000:
-                tick_logs[pair] = tick_logs[pair][-1000:]
+            if len(tick_logs[pair]) > 2000:
+                tick_logs[pair] = tick_logs[pair][-2000:]
 
-            # build/refresh candles
+            # build/refresh 15s candles
             aggregate_candles(pair, interval)
-            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
+            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
             if last_candle:
-                # Evaluate signal EVERY LOOP using live price
-                # Respect cooldown & pending exits first
                 if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
                     scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
                 else:
-                    signal = pa_buy_sell_signal(pair, price)
+                    # --- PSAR-only entry ---
+                    signal = pa_buy_sell_signal_psar(pair)
                     if signal:
                         error_message = ""
                         entry = signal["entry"]
                         atr = signal.get("atr", None)
 
                         usdt_bal = balances.get("USDT", 0.0)
-                        risk_amt = 0.005 * usdt_bal        # 0.5% risk per trade
-                        min_tick_risk = entry * 0.0015     # tighter for responsiveness
+                        risk_amt = 0.005 * usdt_bal
+                        min_tick_risk = entry * 0.0015
                         risk_unit = max((0.5 * atr) if atr else 0, min_tick_risk)
 
                         if signal["side"] == "BUY":
@@ -441,10 +507,10 @@ def scan_loop():
                             if "error" in res:
                                 error_message = res["error"]
                     else:
-                        scan_log.append(f"{ist_now()} | {pair} | No Signal")
+                        scan_log.append(f"{ist_now()} | {pair} | No Signal (PSAR)")
 
         status["msg"], status["last"] = "Running", ist_now()
-        status_epoch = int(time.time())  # heartbeat for watchdog
+        status_epoch = int(time.time())
         time.sleep(5)
 
     status["msg"] = "Idle"
@@ -483,7 +549,7 @@ def get_status():
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
-        "status_epoch": status_epoch,  # for frontend watchdog
+        "status_epoch": status_epoch,
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
