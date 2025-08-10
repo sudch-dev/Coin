@@ -36,8 +36,8 @@ PAIR_RULES = {
 }
 
 # --- Tunables ---
-CANDLE_INTERVAL = 5           # seconds (was 60). 20–30 is snappier.
-TRADE_COOLDOWN_SEC = 10           # cooldown after an exit; can lower to 120 if you want.
+CANDLE_INTERVAL = 30        # seconds (was 60). 20–30 is snappier.
+TRADE_COOLDOWN_SEC = 30         # cooldown after an exit; can lower to 120 if you want.
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -397,7 +397,7 @@ def scan_loop():
 
                         if signal["side"] == "BUY":
                             sl = round(entry - risk_unit, 6)
-                            tp = round(entry + 1.5 * risk_unit, 6)
+                            tp = round(entry + 1.2 * risk_unit, 6)
                             risk_per_unit = max(entry - sl, 1e-9)
                             qty_risk = risk_amt / risk_per_unit
                             qty_cap = (0.3 * usdt_bal) / entry
