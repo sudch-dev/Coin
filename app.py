@@ -240,8 +240,8 @@ def pa_buy_sell_signal(pair, live_price=None):
     don_low  = min(c["low"]  for c in recent)
 
     closes_plus_live = closes[-30:] + [curr_price]
-    ema_fast = _compute_ema(closes_plus_live, 3)
-    ema_slow = _compute_ema(closes_plus_live, 7)
+    ema_fast = _compute_ema(closes_plus_live, 7)
+    ema_slow = _compute_ema(closes_plus_live, 21)
 
     atr14 = _atr_14(completed)
     if ema_fast is None or ema_slow is None or atr14 is None:
