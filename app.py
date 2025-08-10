@@ -463,14 +463,14 @@ def scan_loop():
 
                         if signal["side"] == "BUY":
                             sl = round(entry - 2 * risk_unit, 6)
-                            tp = round(entry + 1.5 * risk_unit, 6)
+                            tp = round(entry + 4 * risk_unit, 6)
                             risk_per_unit = max(entry - sl, 1e-9)
                             qty_risk = risk_amt / risk_per_unit
                             qty_cap = (0.3 * usdt_bal) / entry
                             qty = min(qty_risk, qty_cap)
                         else:
                             sl = round(entry + 2 * risk_unit, 6)
-                            tp = round(entry - 1.5 * risk_unit, 6)
+                            tp = round(entry - 6 * risk_unit, 6)
                             coin = pair[:-4]
                             qty = balances.get(coin, 0.0)
 
