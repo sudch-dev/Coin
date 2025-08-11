@@ -1,569 +1,416 @@
 import os
+import json
 import time
-import threading
 import hmac
 import hashlib
+from typing import Dict, List, Any
+
 import requests
-import json
-from flask import Flask, render_template, jsonify
-from datetime import datetime, timedelta
-from pytz import timezone
-from collections import deque
-from statistics import median
+from flask import Flask, redirect, request, render_template, jsonify
+from dotenv import load_dotenv
 
-app = Flask(__name__)
+load_dotenv()
 
-API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET").encode()
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+API_KEY = os.getenv("API_KEY", "").strip()
+API_SECRET = os.getenv("API_SECRET", "").strip().encode()
 BASE_URL = "https://api.coindcx.com"
 
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
-]
+# Universe: 5 major USDT pairs
+PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
 
-PAIR_RULES = {
-    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
-    "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
-    "XRPUSDT": {"precision": 4, "min_qty": 0.1},
-    "SHIBUSDT": {"precision": 4, "min_qty": 10000},
-    "DOGEUSDT": {"precision": 4, "min_qty": 0.01},
-    "SOLUSDT": {"precision": 4, "min_qty": 0.01},
-    "AEROUSDT": {"precision": 2, "min_qty": 0.01},
-    "ADAUSDT": {"precision": 2, "min_qty": 2},
-    "LTCUSDT": {"precision": 2, "min_qty": 0.001},
-    "BNBUSDT": {"precision": 4, "min_qty": 0.001}
-}
+app = Flask(__name__, template_folder="templates")
+smc_status_cache = {}
 
-# --- Tunables ---
-CANDLE_INTERVAL = 15            # seconds (changed from 30 -> 15 as requested)
-TRADE_COOLDOWN_SEC = 30
+# ──────────────────────────────────────────────────────────────────────────────
+# Minimal CoinDCX client
+# ──────────────────────────────────────────────────────────────────────────────
+class CoinDCXClient:
+    def __init__(self, api_key: str, api_secret: bytes, base_url: str):
+        if not api_key or not api_secret:
+            raise RuntimeError("API_KEY and API_SECRET must be set in environment/.env")
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url
 
-IST = timezone('Asia/Kolkata')
-def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
-def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
-def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+    def _sign(self, payload: dict) -> tuple[dict, str]:
+        body = json.dumps(payload, separators=(",", ":"))
+        signature = hmac.new(self.api_secret, body.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-AUTH-APIKEY": self.api_key,
+            "X-AUTH-SIGNATURE": signature,
+            "Content-Type": "application/json",
+        }
+        return headers, body
 
-tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
-scan_log, trade_log, exit_orders = [], [], []
-daily_profit, pair_precision = {}, {}
-running = False
-status = {"msg": "Idle", "last": ""}
-status_epoch = 0
-error_message = ""
+    def balances(self):
+        url = f"{self.base_url}/exchange/v1/users/balances"
+        payload = {"timestamp": int(time.time() * 1000)}
+        headers, body = self._sign(payload)
+        r = requests.post(url, headers=headers, data=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
 
-# Prevent multiple entries on the same flip-candle
-_last_signal_candle_start = {p: None for p in PAIRS}
+    def ticker(self):
+        r = requests.get(f"{self.base_url}/exchange/ticker", timeout=10)
+        r.raise_for_status()
+        return r.json()
 
-# ===== Persistent P&L state (confirmed fills only) =====
-PROFIT_STATE_FILE = "profit_state.json"
-profit_state = {
-    "cumulative_pnl": 0.0,
-    "daily": {},
-    "inventory": {},
-    "processed_orders": []
-}
-pair_cooldown_until = {p: 0 for p in PAIRS}
+    def markets_details(self):
+        r = requests.get(f"{self.base_url}/exchange/v1/markets_details", timeout=12)
+        r.raise_for_status()
+        return r.json()
 
-def load_profit_state():
-    global profit_state
+client = CoinDCXClient(API_KEY, API_SECRET, BASE_URL)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Precision helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _pair_precisions(client: CoinDCXClient) -> Dict[str, int]:
+    precisions: Dict[str, int] = {}
     try:
-        with open(PROFIT_STATE_FILE, "r") as f:
-            data = json.load(f)
-        profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
-        profit_state["daily"] = dict(data.get("daily", {}))
-        profit_state["inventory"] = data.get("inventory", {})
-        profit_state["processed_orders"] = list(data.get("processed_orders", []))
-    except:
+        md = client.markets_details()
+        for row in md:
+            p = row.get("pair")
+            if p:
+                try:
+                    precisions[p] = int(row.get("target_currency_precision", 6))
+                except Exception:
+                    pass
+    except Exception:
         pass
+    return precisions
 
-def save_profit_state():
-    tmp = {
-        "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
-        "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
-        "inventory": profit_state.get("inventory", {}),
-        "processed_orders": profit_state.get("processed_orders", [])
-    }
+def _round_price(p, precision):
     try:
-        with open(PROFIT_STATE_FILE, "w") as f:
-            json.dump(tmp, f)
-    except:
-        pass
+        return float(f"{float(p):.{precision}f}")
+    except Exception:
+        return float(p)
 
-def _get_inventory_deque(market):
-    inv = profit_state["inventory"].get(market, [])
-    dq = deque()
-    for lot in inv:
-        try:
-            q, c = float(lot[0]), float(lot[1])
-            if q > 0 and c > 0:
-                dq.append([q, c])
-        except:
-            continue
-    return dq
+# ──────────────────────────────────────────────────────────────────────────────
+# Lightweight SMC logic (candles & live)
+# ──────────────────────────────────────────────────────────────────────────────
+def ema(values: List[float], period: int) -> List[float]:
+    """Simple EMA."""
+    if period <= 1 or len(values) == 0:
+        return values[:]
+    k = 2 / (period + 1)
+    out, ema_val = [], None
+    for v in values:
+        ema_val = v if ema_val is None else (v * k + ema_val * (1 - k))
+        out.append(ema_val)
+    return out
 
-def _set_inventory_from_deque(market, dq):
-    profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
-
-def apply_fill_update(market, side, price, qty, ts_ms, order_id):
-    if not order_id: return
-    if order_id in profit_state["processed_orders"]: return
-    try:
-        price = float(price); qty = float(qty)
-    except:
-        return
-    if price <= 0 or qty <= 0: return
-
-    inv = _get_inventory_deque(market)
-    realized = 0.0
-
-    if side.lower() == "buy":
-        inv.append([qty, price])
-    else:
-        sell_q = qty
-        while sell_q > 1e-18 and inv:
-            lot_q, lot_px = inv[0]
-            used = min(sell_q, lot_q)
-            realized += (price - lot_px) * used
-            lot_q -= used
-            sell_q -= used
-            if lot_q <= 1e-18:
-                inv.popleft()
-            else:
-                inv[0][0] = lot_q
-
-    _set_inventory_from_deque(market, inv)
-    profit_state["processed_orders"].append(order_id)
-    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
-    dkey = ist_date()
-    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
-    save_profit_state()
-
-# ===== end persistent P&L helpers =====
-
-def hmac_signature(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-
-def fetch_pair_precisions():
-    try:
-        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
-        if r.ok:
-            for item in r.json():
-                if item.get("pair") in PAIRS:
-                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
-    except:
-        pass
-
-def get_wallet_balances():
-    payload = json.dumps({"timestamp": int(time.time() * 1000)})
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    balances = {}
-    try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
-        if r.ok:
-            for b in r.json():
-                balances[b['currency']] = float(b['balance'])
-    except:
-        pass
-    return balances
-
-def fetch_all_prices():
-    try:
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        if r.ok:
-            now = int(time.time())
-            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
-                    for item in r.json() if item.get("market") in PAIRS}
-    except:
-        pass
-    return {}
-
-def aggregate_candles(pair, interval=CANDLE_INTERVAL):
-    ticks = tick_logs[pair]
-    if not ticks: return
-    candles, candle, last_window = [], None, None
-    for ts, price in sorted(ticks, key=lambda x: x[0]):
-        wstart = ts - (ts % interval)
-        if last_window != wstart:
-            if candle: candles.append(candle)
-            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
-            last_window = wstart
-        else:
-            candle["high"] = max(candle["high"], price)
-            candle["low"] = min(candle["low"], price)
-            candle["close"] = price
-            candle["volume"] += 1
-    if candle: candles.append(candle)
-    candle_logs[pair] = candles[-100:]  # keep more, 15s candles are small
-
-# ========= Indicators =========
-def _atr_14(candles):
-    if len(candles) < 15: return None
-    trs = []
-    prev_close = candles[-15]["close"]
-    for c in candles[-14:]:
-        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
-        trs.append(tr)
-        prev_close = c["close"]
-    return sum(trs) / len(trs) if trs else None
-
-# -------- Parabolic SAR (classic) --------
-def _psar_series(candles, step=0.02, max_step=0.2):
-    """
-    Returns list of dicts: [{'sar': float, 'bull': bool}], length == len(candles)
-    Uses classic Wilder PSAR on completed candles.
-    """
+def psar_series(candles: List[Dict[str, float]], step=0.02, max_step=0.2) -> List[Dict[str, Any]]:
+    """Classic Wilder PSAR computed on completed candles."""
     n = len(candles)
     if n < 2:
         return []
-
     psar = [None] * n
-    bull = True  # initial trend guess
+    bull = True
     af = step
     ep = candles[0]["high"]
     sar = candles[0]["low"]
-
-    # Decide initial trend from first 2 candles
     if candles[1]["close"] < candles[0]["close"]:
         bull = False
         ep = candles[0]["low"]
         sar = candles[0]["high"]
-
     psar[0] = sar
-
     for i in range(1, n):
         c_prev = candles[i - 1]
         c = candles[i]
-
         sar = sar + af * (ep - sar)
-
         if bull:
-            # SAR cannot be above last two lows
             sar = min(sar, c_prev["low"], c["low"])
         else:
-            # SAR cannot be below last two highs
             sar = max(sar, c_prev["high"], c["high"])
-
         reverse = False
-        if bull:
-            if c["low"] < sar:
-                reverse = True
-        else:
-            if c["high"] > sar:
-                reverse = True
-
+        if bull and c["low"] < sar:
+            reverse = True
+        elif (not bull) and c["high"] > sar:
+            reverse = True
         if reverse:
             bull = not bull
-            sar = ep  # on reversal, SAR = prior EP
+            sar = ep
             af = step
             if bull:
                 ep = c["high"]
-                # adjust SAR to min of last two lows
                 sar = min(sar, c_prev["low"], c["low"])
             else:
                 ep = c["low"]
-                # adjust SAR to max of last two highs
                 sar = max(sar, c_prev["high"], c["high"])
         else:
-            if bull:
-                if c["high"] > ep:
-                    ep = c["high"]
-                    af = min(af + step, max_step)
-            else:
-                if c["low"] < ep:
-                    ep = c["low"]
-                    af = min(af + step, max_step)
-
+            if bull and c["high"] > ep:
+                ep = c["high"]; af = min(af + step, max_step)
+            elif (not bull) and c["low"] < ep:
+                ep = c["low"];  af = min(af + step, max_step)
         psar[i] = sar
+    return [{"sar": psar[i], "bull": candles[i]["close"] > psar[i]} for i in range(n)]
 
-    out = []
-    # Determine bull/bear for each candle: price above SAR => bull
-    for i in range(n):
-        c = candles[i]
-        is_bull = c["close"] > psar[i]
-        out.append({"sar": psar[i], "bull": is_bull})
+def swing_highs_lows(candles: List[Dict[str, float]], w: int = 2):
+    sh, sl = [], []
+    for i in range(w, len(candles) - w):
+        hi, lo = candles[i]["high"], candles[i]["low"]
+        if all(hi >= candles[j]["high"] for j in range(i - w, i + w + 1) if j != i):
+            sh.append(i)
+        if all(lo <= candles[j]["low"]  for j in range(i - w, i + w + 1) if j != i):
+            sl.append(i)
+    return sh, sl
+
+def structure_bos_choch(candles: List[Dict[str, float]], sh: List[int], sl: List[int]):
+    """Compact BOS/CHOCH based on last two swing highs/lows."""
+    last_hi = sh[-2:] if len(sh) >= 2 else []
+    last_lo = sl[-2:] if len(sl) >= 2 else []
+    bos = None
+    choch = None
+    note = []
+
+    if last_hi and last_lo:
+        hh = candles[last_hi[-1]]["high"] > candles[last_hi[-2]]["high"] if len(last_hi) >= 2 else False
+        ll = candles[last_lo[-1]]["low"]  < candles[last_lo[-2]]["low"]  if len(last_lo) >= 2 else False
+
+        if hh and not ll:
+            bos = "bullish"; note.append("BOS: HH")
+        elif ll and not hh:
+            bos = "bearish"; note.append("BOS: LL")
+
+        if len(last_hi) >= 2 and len(last_lo) >= 2:
+            choch = "bullish" if (last_hi[-1] > last_lo[-1]) else "bearish"
+            note.append(f"CHOCH:{choch}")
+
+    return bos, choch, ", ".join(note) if note else ""
+
+def decide_signal(candles: List[Dict[str, float]], opts: Dict[str, Any]):
+    """Combine EMA/PSAR/Structure for a simple BUY/SELL/HOLD decision."""
+    closes = [c["close"] for c in candles]
+    ema_fast = ema(closes, int(opts.get("ema_fast", 5)))
+    ema_slow = ema(closes, int(opts.get("ema_slow", 10)))
+    ps = psar_series(
+        candles,
+        step=float(opts.get("psar_step", 0.02)),
+        max_step=float(opts.get("psar_max", 0.2)),
+    )
+    sh, sl = swing_highs_lows(candles, w=2)
+    bos, choch, s_note = structure_bos_choch(candles, sh, sl)
+
+    note = []
+    bullish_ma = None
+    if ema_fast and ema_slow and len(ema_fast) == len(closes) and len(ema_slow) == len(closes):
+        bullish_ma = ema_fast[-1] > ema_slow[-1]
+        note.append(f"EMA: {'bull' if bullish_ma else 'bear'}")
+
+    ps_bull = ps[-1]["bull"] if ps else None
+    if ps_bull is not None:
+        note.append(f"PSAR: {'bull' if ps_bull else 'bear'}")
+
+    if s_note:
+        note.append(s_note)
+
+    signal = "HOLD"
+    if bullish_ma is True and ps_bull is True and bos == "bullish":
+        signal = "BUY"
+    elif bullish_ma is False and ps_bull is False and bos == "bearish":
+        signal = "SELL"
+    elif choch == "bullish" and ps_bull is True:
+        signal = "BUY"
+    elif choch == "bearish" and ps_bull is False:
+        signal = "SELL"
+
+    return signal, "; ".join(note)
+
+def normalize_candle(c) -> Dict[str, float]:
+    t = c.get("time") or c.get("ts") or c.get("date")
+    return {
+        "time": int(t) if t is not None else None,
+        "open": float(c["open"]),
+        "high": float(c["high"]),
+        "low": float(c["low"]),
+        "close": float(c["close"]),
+        "volume": float(c.get("volume", 0.0)),
+    }
+
+def run_smc_scan_on_candles(
+    candles_by_pair: Dict[str, List[Dict[str, float]]],
+    pairs: List[str],
+    options: Dict[str, Any] = None,
+):
+    """Full SMC on uploaded candles."""
+    options = options or {}
+    out = {
+        "status": "ok",
+        "timestamp": int(time.time()),
+        "universe": list(pairs),
+        "results": []
+    }
+
+    for p in pairs:
+        arr = candles_by_pair.get(p, [])
+        if not isinstance(arr, list) or len(arr) < 10:
+            out["results"].append({
+                "pair": p,
+                "signal": "NA",
+                "notes": "Insufficient candles (min 10)"
+            })
+            continue
+
+        try:
+            candles = [normalize_candle(x) for x in arr]
+            candles.sort(key=lambda z: (z["time"] if z["time"] is not None else 0))
+            sig, notes = decide_signal(candles, options)
+            out["results"].append({
+                "pair": p,
+                "signal": sig,
+                "notes": notes,
+                "last_close": candles[-1]["close"],
+                "last_time": candles[-1]["time"],
+            })
+        except Exception as e:
+            out["results"].append({
+                "pair": p,
+                "signal": "ERR",
+                "notes": f"error: {e}"
+            })
+
     return out
 
-# ========= Signal (PSAR-only) =========
-def pa_buy_sell_signal_psar(pair):
-    """
-    PSAR-only entry:
-    - Use COMPLETED 15s candles.
-    - Generate a signal ONLY on a flip (bull <-> bear) between the last two completed candles.
-    """
-    candles = candle_logs[pair]
-    if len(candles) < 6:
-        return None
-
-    completed = candles[:-1] if len(candles) >= 2 else candles
-    if len(completed) < 5:
-        return None
-
-    states = _psar_series(completed)
-    if len(states) < 3:
-        return None
-
-    prev_state = states[-2]
-    last_state = states[-1]
-    last_candle = completed[-1]
-
-    # Flip detected only once per last completed candle
-    if _last_signal_candle_start.get(pair) == last_candle["start"]:
-        return None
-
-    # BUY if flipped to bull; SELL if flipped to bear
-    if (not prev_state["bull"]) and last_state["bull"]:
-        _last_signal_candle_start[pair] = last_candle["start"]
-        return {
-            "side": "BUY",
-            "entry": last_candle["close"],    # use close of flip candle
-            "atr": _atr_14(completed),
-            "msg": "BUY: PSAR flip to bullish"
-        }
-    if prev_state["bull"] and (not last_state["bull"]):
-        _last_signal_candle_start[pair] = last_candle["start"]
-        return {
-            "side": "SELL",
-            "entry": last_candle["close"],
-            "atr": _atr_14(completed),
-            "msg": "SELL: PSAR flip to bearish"
-        }
-    return None
-
-def _signed_post(url, body):
-    payload = json.dumps(body, separators=(',', ':'))
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+def run_smc_scan_coindcx(client: CoinDCXClient, pairs: List[str]):
+    """Live scan using /exchange/ticker (no candles)."""
+    out = {"timestamp": int(time.time()), "status": "ok", "universe": list(pairs), "results": []}
     try:
-        r = requests.post(url, headers=headers, data=payload, timeout=12)
-        if r.ok:
-            return r.json()
-    except:
-        pass
-    return {}
-
-def place_order(pair, side, qty):
-    payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
-               "timestamp": int(time.time() * 1000)}
-    body = json.dumps(payload)
-    sig = hmac_signature(body)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
-        return r.json()
+        tick = client.ticker()
     except Exception as e:
-        return {"error": str(e)}
+        return {"status": "error", "error": f"ticker_error: {e}", "universe": list(pairs), "results": []}
 
-def get_order_status(order_id=None, client_order_id=None):
-    body = {"timestamp": int(time.time() * 1000)}
-    if order_id: body["id"] = order_id
-    if client_order_id: body["client_order_id"] = client_order_id
-    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
-    return res if isinstance(res, dict) else {}
+    if not isinstance(tick, list) or not tick:
+        out["status"] = "error"
+        out["error"] = "ticker_unavailable"
+        return out
 
-def _record_fill_from_status(market, side, st, order_id):
-    try:
-        total_q = float(st.get("total_quantity", 0))
-        remain_q = float(st.get("remaining_quantity", 0))
-        filled = max(0.0, total_q - remain_q)
-        avg_px = float(st.get("avg_price", 0))
-    except:
-        filled, avg_px = 0.0, 0.0
-
-    if filled > 0 and avg_px > 0:
-        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time()*1000)
-        try:
-            ts_ms = int(ts_field)
-            if ts_ms < 10**12: ts_ms *= 1000
-        except:
-            ts_ms = int(time.time() * 1000)
-        apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
-
-def monitor_exits(prices):
-    global error_message
-    to_remove = []
-    for ex in exit_orders:
-        pair, side, qty, tp, sl, entry = ex.values()
-        price = prices.get(pair, {}).get("price")
-        if not price: continue
-        if side == "BUY" and (price >= tp or price <= sl):
-            res = place_order(pair, "SELL", qty)
-            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
+    last_by_pair: Dict[str, float] = {}
+    for row in tick:
+        mkt = row.get("market")
+        if mkt in pairs:
             try:
-                order_id = (res.get("orders") or [{}])[0].get("id")
-            except:
-                order_id = None
-            if order_id:
-                st = get_order_status(order_id=order_id)
-                _record_fill_from_status(pair, "SELL", st, order_id)
-            if "error" in res: error_message = res["error"]
-            to_remove.append(ex)
-            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
-        elif side == "SELL" and (price <= tp or price >= sl):
-            res = place_order(pair, "BUY", qty)
-            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
-            try:
-                order_id = (res.get("orders") or [{}])[0].get("id")
-            except:
-                order_id = None
-            if order_id:
-                st = get_order_status(order_id=order_id)
-                _record_fill_from_status(pair, "BUY", st, order_id)
-            if "error" in res: error_message = res["error"]
-            to_remove.append(ex)
-            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
-    for ex in to_remove: exit_orders.remove(ex)
-
-def _has_open_exit_for(pair):
-    for ex in exit_orders:
-        if ex.get("pair") == pair:
-            return True
-    return False
-
-def scan_loop():
-    global running, error_message, status_epoch
-    scan_log.clear()
-    interval = CANDLE_INTERVAL
-
-    while running:
-        prices = fetch_all_prices()
-        now = int(time.time())
-        monitor_exits(prices)
-        balances = get_wallet_balances()
-
-        for pair in PAIRS:
-            if pair not in prices:
+                price = float(row.get("last_price"))
+                last_by_pair[mkt] = price
+            except Exception:
                 continue
 
-            price = prices[pair]["price"]
-            tick_logs[pair].append((now, price))
-            if len(tick_logs[pair]) > 2000:
-                tick_logs[pair] = tick_logs[pair][-2000:]
+    precisions = _pair_precisions(client)
 
-            # build/refresh 15s candles
-            aggregate_candles(pair, interval)
+    for p in pairs:
+        px = last_by_pair.get(p)
+        if px is None:
+            out["results"].append({"pair": p, "price": None, "signal": "NA", "notes": "No price"})
+            continue
+        prec = precisions.get(p, 4)
+        out["results"].append({
+            "pair": p,
+            "price": _round_price(px, prec),
+            "signal": "HOLD",
+            "notes": "SMC stub — send candles via /api/smc-scan for full logic."
+        })
+    return out
 
-            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
-            if last_candle:
-                if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
-                    scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
-                else:
-                    # --- PSAR-only entry ---
-                    signal = pa_buy_sell_signal_psar(pair)
-                    if signal:
-                        error_message = ""
-                        entry = signal["entry"]
-                        atr = signal.get("atr", None)
-
-                        usdt_bal = balances.get("USDT", 0.0)
-                        risk_amt = 0.005 * usdt_bal
-                        min_tick_risk = entry * 0.0015
-                        risk_unit = max((0.5 * atr) if atr else 0, min_tick_risk)
-
-                        if signal["side"] == "BUY":
-                            sl = round(entry - 2 * risk_unit, 6)
-                            tp = round(entry + 4 * risk_unit, 6)
-                            risk_per_unit = max(entry - sl, 1e-9)
-                            qty_risk = risk_amt / risk_per_unit
-                            qty_cap = (0.3 * usdt_bal) / entry
-                            qty = min(qty_risk, qty_cap)
-                        else:
-                            sl = round(entry + 2 * risk_unit, 6)
-                            tp = round(entry - 6 * risk_unit, 6)
-                            coin = pair[:-4]
-                            qty = balances.get(coin, 0.0)
-
-                        # Precision & min qty
-                        qty = round(qty, pair_precision.get(pair, 6))
-                        rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
-                        qty = max(qty, rule["min_qty"])
-                        qty = round(qty, rule["precision"])
-
-                        if qty <= 0:
-                            scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
-                        else:
-                            res = place_order(pair, signal["side"], qty)
-
-                            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SL {sl} | TP {tp} | {res}")
-                            trade_log.append({
-                                "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
-                                "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
-                            })
-                            exit_orders.append({
-                                "pair": pair, "side": signal["side"], "qty": qty,
-                                "tp": tp, "sl": sl, "entry": entry
-                            })
-
-                            # Confirm from order success -> update P&L
-                            try:
-                                order_id = (res.get("orders") or [{}])[0].get("id")
-                            except:
-                                order_id = None
-                            if order_id:
-                                st = get_order_status(order_id=order_id)
-                                _record_fill_from_status(pair, signal["side"], st, order_id)
-
-                            if "error" in res:
-                                error_message = res["error"]
-                    else:
-                        scan_log.append(f"{ist_now()} | {pair} | No Signal (PSAR)")
-
-        status["msg"], status["last"] = "Running", ist_now()
-        status_epoch = int(time.time())
-        time.sleep(5)
-
-    status["msg"] = "Idle"
-
-def compute_realized_pnl_today():
-    return round(profit_state["daily"].get(ist_date(), 0.0), 6)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────────────────────────────────────
 @app.route("/")
-def index():
-    return render_template("index.html")
+def home():
+    # Similar UX flow as the Kite app
+    return redirect("/login")
 
-@app.route("/start", methods=["POST"])
-def start():
-    global running
-    if not running:
-        running = True
-        t = threading.Thread(target=scan_loop)
-        t.daemon = True
-        t.start()
-    return jsonify({"status": "started"})
+@app.route("/login")
+def login():
+    # No OAuth needed; try balances to validate (non-fatal)
+    try:
+        client.balances()
+    except Exception:
+        pass
+    return redirect("/dashboard")
 
-@app.route("/stop", methods=["POST"])
-def stop():
-    global running
-    running = False
-    return jsonify({"status": "stopped"})
+@app.route("/dashboard")
+def dashboard():
+    # If template exists use it; else simple inline page
+    try:
+        return render_template("index.html", pairs=PAIRS)
+    except Exception:
+        html = f"""
+        <html><head><title>CoinDCX SMC</title></head>
+        <body style="font-family: system-ui; margin:20px">
+          <h3>CoinDCX SMC Scanner</h3>
+          <p>Endpoints:</p>
+          <ul>
+            <li><code>GET /api/smc-status</code> — live prices for {', '.join(PAIRS)}</li>
+            <li><code>POST /api/smc-scan</code> — run SMC on uploaded candles</li>
+            <li><code>GET /api/precisions</code> — target precisions for pairs</li>
+            <li><code>GET /ping</code></li>
+          </ul>
+        </body></html>
+        """
+        return html
 
-@app.route("/status")
-def get_status():
-    balances = get_wallet_balances()
-    coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
-    profit_today = compute_realized_pnl_today()
-    profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
-    cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
+@app.route("/api/smc-status")
+def api_smc_status():
+    global smc_status_cache
+    try:
+        smc_status_cache = run_smc_scan_coindcx(client, PAIRS)
+        return jsonify(smc_status_cache)
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
-    return jsonify({
-        "status": status["msg"],
-        "last": status["last"],
-        "status_epoch": status_epoch,
-        "usdt": balances.get("USDT", 0.0),
-        "profit_today": profit_today,
-        "profit_yesterday": profit_yesterday,
-        "pnl_cumulative": cumulative_pnl,
-        "coins": coins,
-        "trades": trade_log[-10:][::-1],
-        "scans": scan_log[-30:][::-1],
-        "error": error_message
-    })
+@app.route("/api/smc-scan", methods=["POST"])
+def api_smc_scan():
+    """
+    JSON:
+    {
+      "pairs": ["BTCUSDT","ETHUSDT"],
+      "candles": {
+        "BTCUSDT": [{"time":..., "open":..., "high":..., "low":..., "close":..., "volume":...}, ...],
+        "ETHUSDT": [ ... ]
+      },
+      "options": { "ema_fast":5, "ema_slow":10, "psar_step":0.02, "psar_max":0.2 }
+    }
+    """
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return jsonify({"status": "error", "error": "invalid_json"}), 400
+
+    pairs = payload.get("pairs")
+    candles = payload.get("candles")
+    options = payload.get("options", {})
+
+    if not isinstance(pairs, list) or not pairs:
+        return jsonify({"status": "error", "error": "missing_pairs"}), 400
+    if not isinstance(candles, dict) or not all(isinstance(candles.get(p), list) for p in pairs):
+        return jsonify({"status": "error", "error": "missing_or_invalid_candles"}), 400
+
+    try:
+        res = run_smc_scan_on_candles(candles_by_pair=candles, pairs=pairs, options=options)
+        return jsonify(res)
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route("/api/precisions")
+def api_precisions():
+    """Return {pair: target_currency_precision} for precision-aware UI formatting."""
+    try:
+        mp = _pair_precisions(client)
+        filtered = {p: mp.get(p, 4) for p in PAIRS}
+        return jsonify({"status": "ok", "precisions": filtered})
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route("/ping")
-def ping(): return "pong"
+def ping():
+    return "pong"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    load_profit_state()
-    fetch_pair_precisions()
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
