@@ -2,300 +2,184 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title> Virus Scan </title>
+  <title>CoinDCX SMC Scanner</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f7f7f7; --border:#e5e5e5; }
     body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
     h2 { margin: 0 0 12px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
-    button, select, input[type="checkbox"] { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:360px; }
+    button, input[type="checkbox"] { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
     button:hover { background:#fafafa; }
-    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:300px; overflow:auto; }
+    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:320px; overflow:auto; }
     .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
     .muted { color: var(--muted); font-size: 12px; }
-    .spacer { flex:1 }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; font-size: 13px; }
+    th { background: var(--card); }
+    .spacer { flex:1; }
     label.chk { display:flex; align-items:center; gap:6px; user-select:none; }
   </style>
 </head>
 <body>
-  <h2>Virus Scan <span class="pill" id="lblEpoch">—</span></h2>
+  <h2>CoinDCX SMC Scanner <span class="pill" id="lblEpoch">—</span></h2>
 
   <div class="row" style="margin-bottom:10px">
-    <button id="btnStart">Start</button>
-    <button id="btnStop">Stop</button>
-    <label class="muted">Interval:
-      <select id="selInterval">
-        <option value="1m">1 min</option>
-        <option value="5m">5 min</option>
-      </select>
-    </label>
-    <span class="spacer"></span>
-    <label class="chk muted" title="Reduce network & CPU; auto-pauses when tab is hidden">
+    <button id="btnRefresh">Refresh Status</button>
+    <label class="chk muted" title="Reduce network & CPU; backs off when tab is hidden">
       <input type="checkbox" id="chkPowerSave" />
       Power Saving
     </label>
+    <span class="spacer"></span>
     <span>Status: <b id="lblStatus">Idle</b></span>
     <span>Last: <span id="lblLast">—</span></span>
   </div>
 
   <div class="row" style="margin-bottom:16px">
     <div class="card">
-      <div>USDT: <b id="lblUSDT">0.00</b></div>
-      <div>Today P&L (USDT): <b id="lblPNLT">0.00</b></div>
-      <div>Yesterday P&L (USDT): <b id="lblPNLY">0.00</b></div>
-      <div>Total P&L (USDT): <b id="lblPNLAll">0.00</b></div>
+      <div class="muted" style="margin-bottom:6px">Universe</div>
+      <table id="tbl">
+        <thead><tr><th>Pair</th><th>Price</th><th>Signal</th><th>Notes</th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Upload Candles → /api/smc-scan</div>
+      <input id="fileJson" type="file" accept="application/json" />
+      <div class="muted" style="margin-top:8px">Expected JSON:
+        <code>{ pairs:[...], candles:{PAIR:[...]}, options:{...} }</code>
+      </div>
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+        <button id="btnUpload">Run SMC on Candles</button>
+        <button id="btnDownload" title="Download last /api/smc-scan response">Download JSON</button>
+      </div>
+      <pre id="scanOut" style="margin-top:8px">—</pre>
     </div>
   </div>
 
-  <h3>Scans (latest 30)</h3>
-  <pre id="scanLog">—</pre>
-
-  <h3>Trades (latest 10)</h3>
-  <pre id="tradeLog">—</pre>
-
   <script>
-    // ——— Interval UI state ———
-    const sel = document.getElementById('selInterval');
-    sel.value = localStorage.getItem('interval') || '1m';
-    sel.addEventListener('change', () => {
-      localStorage.setItem('interval', sel.value);
-    });
-
-    // Power Saving toggle
     const chkPower = document.getElementById('chkPowerSave');
     chkPower.checked = localStorage.getItem('power_save') === '1';
     chkPower.addEventListener('change', () => {
       localStorage.setItem('power_save', chkPower.checked ? '1' : '0');
-      resetTimers(); // reconfigure polling cadence
+      resetTimers();
     });
 
-    document.getElementById('btnStart').onclick = () => startScanner(true);
-    document.getElementById('btnStop').onclick = async () => {
-      try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
-    };
+    document.getElementById('btnRefresh').onclick = () => fetchStatus();
 
-    // ——— Helpers ———
-    const MAX_SCANS = 30;
-    const MAX_TRADES = 10;
-    const IST = 'Asia/Kolkata';
+    const tbody = document.getElementById('tbody');
+    const scanOut = document.getElementById('scanOut');
 
-    function fmtIST(d) {
-      const date = d instanceof Date ? d
-        : (String(d).length <= 10 ? new Date(Number(d) * 1000) : new Date(Number(d)));
-      try {
-        const pad = n => String(n).padStart(2, '0');
-        const z = new Intl.DateTimeFormat('en-GB', {
-          timeZone: IST, year: 'numeric', month: '2-digit', day: '2-digit',
-          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
-        }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-        return `${z.year}-${z.month}-${z.day} ${z.hour}:${z.minute}:${z.second}`;
-      } catch { return '—'; }
-    }
-    function safeJson(v){ try { return JSON.stringify(v); } catch { return String(v); } }
+    // precision map {PAIR: precision}
+    let PREC = {};
+    // cache last smc-scan response for download
+    let lastScanJson = null;
+
     function setEpochPill(epochSec){
       const s = Number(epochSec || 0);
-      document.getElementById('lblEpoch').textContent = s ? `hb:${s} | ${fmtIST(s)}` : '—';
+      document.getElementById('lblEpoch').textContent = s ? `t:${s}` : '—';
     }
 
-    // Fallback parser (kept only as backup if backend P&L not present)
-    function computePnlFromScans(scanLines) {
-      const TODAY = new Intl.DateTimeFormat('en-CA', { timeZone: IST, year:'numeric', month:'2-digit', day:'2-digit' })
-        .formatToParts(new Date()).reduce((a,p)=>(a[p.type]=p.value,a),{});
-      const todayKey = `${TODAY.year}-${TODAY.month}-${TODAY.day}`;
-      function istKeyFromEpoch(sec){
-        try {
-          const d = new Date(sec * 1000);
-          const p = new Intl.DateTimeFormat('en-CA', { timeZone: IST, year:'numeric', month:'2-digit', day:'2-digit' })
-            .formatToParts(d).reduce((a,t)=>(a[t.type]=t.value,a),{});
-          return `${p.year}-${p.month}-${p.day}`;
-        } catch { return todayKey; }
-      }
-      let t = 0, y = 0, all = 0;
-      const pool = Array.isArray(scanLines) ? scanLines.slice(-500) : [];
-      for (const lineRaw of pool) {
-        const line = String(lineRaw);
-        if (line.toLowerCase().includes('error')) continue;
-        if (!/(order|trade|buy|sell|filled|executed)/i.test(line)) continue;
-        const m = line.match(/(?:pnl|profit)\s*[:=]\s*([+-]?\d+(?:\.\d+)?)/i);
-        if (!m) continue;
-        const val = Number(m[1]); if (!isFinite(val)) continue;
-        const em = line.match(/epoch[=:]\s*(\d{9,10})/);
-        const key = em ? istKeyFromEpoch(Number(em[1])) : todayKey;
-        all += val; if (key === todayKey) t += val; else y += val;
-      }
-      return { today: t, yesterday: y, total: all };
-    }
-
-    // ——— Power-save aware timers ———
-    let pingTimer = null;
-    let statusTimer = null;
-
-    function currentCadence() {
-      const ps = chkPower.checked;
-      const hidden = document.hidden;
-
-      // Base intervals
-      let PING_MS  = ps ? 120_000 : 60_000;
-      let CHECK_MS = ps ? 120_000 : 60_000;
-
-      // If tab is hidden, back way off (super power-save)
-      if (hidden) {
-        PING_MS  = ps ? 300_000 : 180_000;  // 5 min / 3 min
-        CHECK_MS = ps ? 300_000 : 180_000;
-      }
-      return { PING_MS, CHECK_MS, STALE_SEC: ps ? 240 : 120 };
-    }
-
-    function clearTimers() {
-      if (pingTimer)   { clearInterval(pingTimer); pingTimer = null; }
-      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-    }
-    function resetTimers() {
-      clearTimers();
-      const { PING_MS, CHECK_MS } = currentCadence();
-      pingTimer   = setInterval(keepAlive, PING_MS);
-      statusTimer = setInterval(checkStatusAndAutostart, CHECK_MS);
-    }
-
-    document.addEventListener('visibilitychange', () => {
-      resetTimers(); // re-arm with new cadence
-      if (!document.hidden) {
-        // When user returns, do an immediate refresh (power-save friendly)
-        keepAlive(); checkStatusAndAutostart();
-      }
-    });
-
-    // ——— Start/Status logic ———
-    let starting = false;
-    let backoff = 5000;
-    const MAX_BACKOFF = 30000;
-
-    async function safeFetch(url, opts = {}, timeoutMs = 8000) {
-      // Skip most network when hidden + power-save (still one periodic check via timers)
-      if (document.hidden && chkPower.checked && !/^(\/ping|\/status)/.test(url)) {
-        return { ok: true, json: async () => ({}) };
-      }
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
-      try {
-        const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
-        clearTimeout(t);
-        return res;
-      } catch (e) {
-        clearTimeout(t);
-        throw e;
+    async function fetchPrecisions(){
+      try{
+        const r = await fetch('/api/precisions', { cache:'no-store' });
+        const j = await r.json();
+        if (j && j.status === 'ok' && j.precisions) {
+          PREC = j.precisions;
+        }
+      }catch(e){
+        console.warn('precisions error', e);
       }
     }
 
-    async function keepAlive(){ try { await safeFetch('/ping', {}, 4000); } catch(_){} }
-
-    async function startScanner(manual=false) {
-      if (starting) return;
-      starting = true;
-      const interval = document.getElementById('selInterval').value || '1m';
-      try {
-        const res = await safeFetch(`/start?interval=${encodeURIComponent(interval)}`, { method:'POST' }, 6000);
-        const j = await res.json().catch(() => ({}));
-        console.log(manual ? '[manual-start]' : '[auto-start]', j);
-        backoff = 5000;
-      } catch (e) {
-        console.warn('[start] failed; retrying', e);
-        setTimeout(() => startScanner(false), backoff);
-        backoff = Math.min(MAX_BACKOFF, Math.floor(backoff * 1.6));
-      } finally {
-        setTimeout(() => { starting = false; }, 1500);
-      }
-    }
-
-    function renderStatus(d) {
-      document.getElementById('lblStatus').textContent = d.status || '—';
-      document.getElementById('lblLast').textContent = d.last
-        ? (/\d{10,}/.test(String(d.last)) ? fmtIST(d.last) : String(d.last))
-        : '—';
-
-      // balances as-is from backend
-      document.getElementById('lblUSDT').textContent = Number(d.usdt ?? 0).toFixed(2);
-      setEpochPill(d.status_epoch);
-
-      // scans & trades (trimmed for screen)
-      const scans = Array.isArray(d.scans) ? d.scans.slice(-MAX_SCANS) : [];
-      document.getElementById('scanLog').textContent =
-        scans.map(line => {
-          const m = String(line).match(/epoch[=:]\s*(\d{9,10})/);
-          return m ? String(line).replace(m[1], `${m[1]} (${fmtIST(Number(m[1]))})`) : String(line);
-        }).join('\n') || '—';
-
-      const trades = Array.isArray(d.trades) ? d.trades.slice(-MAX_TRADES) : [];
-      const prettyTrades = trades.map(t => {
-        try {
-          const x = typeof t === 'string' ? JSON.parse(t) : t;
-          if (x && (x.time || x.ts || x.epoch)) {
-            const ts = x.time ?? x.ts ?? x.epoch;
-            x.time_ist = fmtIST(ts);
-          }
-          return JSON.stringify(x);
-        } catch { return safeJson(t); }
-      }).join('\n');
-      document.getElementById('tradeLog').textContent = prettyTrades || '—';
-
-      // -------- P&L from EXECUTED ORDERS (backend provided) --------
-      // Prefer backend's realized P&L fields (computed from confirmed fills):
-      const hasBackendPnL = (typeof d.profit_today !== 'undefined')
-                         || (typeof d.profit_yesterday !== 'undefined')
-                         || (typeof d.pnl_cumulative !== 'undefined');
-
-      if (hasBackendPnL) {
-        document.getElementById('lblPNLT').textContent   = Number(d.profit_today ?? 0).toFixed(6);
-        document.getElementById('lblPNLY').textContent   = Number(d.profit_yesterday ?? 0).toFixed(6);
-        document.getElementById('lblPNLAll').textContent = Number(d.pnl_cumulative ?? 0).toFixed(6);
-      } else {
-        // Fallback (legacy): parse from scan lines if backend not sending P&L
-        const pnl = computePnlFromScans(Array.isArray(d.scans) ? d.scans : scans);
-        document.getElementById('lblPNLT').textContent   = Number(pnl.today).toFixed(6);
-        document.getElementById('lblPNLY').textContent   = Number(pnl.yesterday).toFixed(6);
-        document.getElementById('lblPNLAll').textContent = Number(pnl.total).toFixed(6);
-      }
-    }
-
-    async function checkStatusAndAutostart() {
-      // If hidden and power-save, skip this tick (super conservative)
-      if (document.hidden && chkPower.checked) return;
-
-      try {
-        const res = await safeFetch('/status', {}, 8000);
-        if (!res.ok) throw new Error('status not ok');
+    async function fetchStatus(){
+      try{
+        const res = await fetch('/api/smc-status', { cache:'no-store' });
         const data = await res.json();
         renderStatus(data);
-
-        const nowSec = Math.floor(Date.now() / 1000);
-        const epoch = Number(data.status_epoch || 0);
-        const { STALE_SEC } = currentCadence();
-        const isIdle = (data.status || '').toLowerCase() !== 'running';
-        const isStale = epoch && (nowSec - epoch > STALE_SEC);
-
-        if (isIdle || isStale) {
-          console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
-          startScanner(false);
-        }
-      } catch (e) {
-        console.warn('[watchdog] /status failed; nudging /start', e);
-        // In power-save, avoid aggressive retries when hidden
-        if (!(document.hidden && chkPower.checked)) startScanner(false);
+      }catch(e){
+        console.warn('status error', e);
       }
     }
 
-    // Kick + timers
-    keepAlive();
-    checkStatusAndAutostart();
-    resetTimers();
+    function fmtPrice(pair, val){
+      if (typeof val !== 'number' || !isFinite(val)) return '-';
+      const p = PREC[pair] ?? 4;
+      return Number(val).toFixed(p);
+    }
 
-    // Also refresh once on focus (useful after long background)
-    window.addEventListener('focus', () => {
-      keepAlive();
-      checkStatusAndAutostart();
-    });
+    function renderStatus(d){
+      document.getElementById('lblStatus').textContent = (d.status || 'ok').toUpperCase();
+      document.getElementById('lblLast').textContent = new Date().toLocaleString();
+      setEpochPill(d.timestamp);
+
+      const rows = (d.results || []).map(r => {
+        return `<tr>
+          <td>${r.pair ?? ''}</td>
+          <td>${fmtPrice(r.pair, r.price)}</td>
+          <td><b>${r.signal ?? '-'}</b></td>
+          <td class="muted">${r.notes ?? ''}</td>
+        </tr>`;
+      }).join('');
+      tbody.innerHTML = rows || '<tr><td colspan="4" class="muted">No data</td></tr>';
+    }
+
+    document.getElementById('btnUpload').onclick = async () => {
+      const f = document.getElementById('fileJson').files[0];
+      if(!f){ alert('Choose a JSON file first'); return; }
+      try{
+        const text = await f.text();
+        const payload = JSON.parse(text);
+        const res = await fetch('/api/smc-scan', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        lastScanJson = data;
+        scanOut.textContent = JSON.stringify(data, null, 2);
+      }catch(e){
+        scanOut.textContent = 'Error: ' + e;
+      }
+    };
+
+    document.getElementById('btnDownload').onclick = () => {
+      if (!lastScanJson) { alert('No scan output yet. Run SMC first.'); return; }
+      const blob = new Blob([JSON.stringify(lastScanJson, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `smc-scan-${Date.now()}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    };
+
+    // power-saving timers
+    let statusTimer = null;
+    function cadence(){
+      const ps = chkPower.checked;
+      const hidden = document.hidden;
+      let ms = ps ? 60_000 : 30_000;       // normal cadence
+      if (hidden) ms = ps ? 180_000 : 90_000; // when hidden
+      return ms;
+    }
+    function resetTimers(){
+      if(statusTimer) clearInterval(statusTimer);
+      statusTimer = setInterval(() => {
+        if (document.hidden && chkPower.checked) return; // skip tick
+        fetchStatus();
+      }, cadence());
+    }
+    document.addEventListener('visibilitychange', resetTimers);
+
+    // kick
+    (async () => {
+      await fetchPrecisions();
+      await fetchStatus();
+      resetTimers();
+    })();
   </script>
 </body>
 </html>
