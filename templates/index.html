@@ -10,11 +10,13 @@
     h2 { margin: 0 0 12px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
     .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
-    button, select { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    button, select, input[type="checkbox"] { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
     button:hover { background:#fafafa; }
     pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:300px; overflow:auto; }
     .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
     .muted { color: var(--muted); font-size: 12px; }
+    .spacer { flex:1 }
+    label.chk { display:flex; align-items:center; gap:6px; user-select:none; }
   </style>
 </head>
 <body>
@@ -28,6 +30,11 @@
         <option value="1m">1 min</option>
         <option value="5m">5 min</option>
       </select>
+    </label>
+    <span class="spacer"></span>
+    <label class="chk muted" title="Reduce network & CPU; auto-pauses when tab is hidden">
+      <input type="checkbox" id="chkPowerSave" />
+      Power Saving
     </label>
     <span>Status: <b id="lblStatus">Idle</b></span>
     <span>Last: <span id="lblLast">—</span></span>
@@ -56,7 +63,14 @@
       localStorage.setItem('interval', sel.value);
     });
 
-    // ——— Start/Stop ———
+    // Power Saving toggle
+    const chkPower = document.getElementById('chkPowerSave');
+    chkPower.checked = localStorage.getItem('power_save') === '1';
+    chkPower.addEventListener('change', () => {
+      localStorage.setItem('power_save', chkPower.checked ? '1' : '0');
+      resetTimers(); // reconfigure polling cadence
+    });
+
     document.getElementById('btnStart').onclick = () => startScanner(true);
     document.getElementById('btnStop').onclick = async () => {
       try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
@@ -85,16 +99,11 @@
       document.getElementById('lblEpoch').textContent = s ? `hb:${s} | ${fmtIST(s)}` : '—';
     }
 
-    // ——— P&L from scan log (success-only, no "error") ———
-    // Accepts lines like:
-    //  - "... pnl=+1.23 ..." or "... PNL: -0.45 ..." or "... profit=0.7 ..."
-    //  - If the line has "error" (any case) it is ignored.
-    //  - If the line has an epoch ("epoch=1723200000") we date-bucket to Today/Yesterday (IST).
+    // Fallback parser (kept only as backup if backend P&L not present)
     function computePnlFromScans(scanLines) {
       const TODAY = new Intl.DateTimeFormat('en-CA', { timeZone: IST, year:'numeric', month:'2-digit', day:'2-digit' })
         .formatToParts(new Date()).reduce((a,p)=>(a[p.type]=p.value,a),{});
       const todayKey = `${TODAY.year}-${TODAY.month}-${TODAY.day}`;
-
       function istKeyFromEpoch(sec){
         try {
           const d = new Date(sec * 1000);
@@ -103,155 +112,190 @@
           return `${p.year}-${p.month}-${p.day}`;
         } catch { return todayKey; }
       }
-
       let t = 0, y = 0, all = 0;
-      // Look back more lines for P&L accuracy (don’t render all)
       const pool = Array.isArray(scanLines) ? scanLines.slice(-500) : [];
-
       for (const lineRaw of pool) {
         const line = String(lineRaw);
-        if (line.toLowerCase().includes('error')) continue;         // ignore errored orders
-        if (!/(order|trade|buy|sell|filled|executed)/i.test(line)) continue; // only trade-ish lines
-
-        // Try to extract explicit PnL
+        if (line.toLowerCase().includes('error')) continue;
+        if (!/(order|trade|buy|sell|filled|executed)/i.test(line)) continue;
         const m = line.match(/(?:pnl|profit)\s*[:=]\s*([+-]?\d+(?:\.\d+)?)/i);
         if (!m) continue;
-        const val = Number(m[1]);
-        if (!isFinite(val)) continue;
-
-        // Bucket by date if we have an epoch; else assume today
+        const val = Number(m[1]); if (!isFinite(val)) continue;
         const em = line.match(/epoch[=:]\s*(\d{9,10})/);
         const key = em ? istKeyFromEpoch(Number(em[1])) : todayKey;
-
-        all += val;
-        if (key === todayKey) t += val;
-        else {
-          // compute yesterday's key once lazily
-          // (We treat anything not-today as "yesterday" bucket for the display)
-          y += val;
-        }
+        all += val; if (key === todayKey) t += val; else y += val;
       }
       return { today: t, yesterday: y, total: all };
     }
 
-    // ——— Watchdog + keepalive ———
-    (() => {
-      const PING_MS = 60 * 1000;
-      const CHECK_MS = 60 * 1000;
-      const STALE_SEC = 120;
+    // ——— Power-save aware timers ———
+    let pingTimer = null;
+    let statusTimer = null;
 
-      let lastEpoch = 0;
-      let starting = false;
-      let backoff = 5000;
-      const MAX_BACKOFF = 30000;
+    function currentCadence() {
+      const ps = chkPower.checked;
+      const hidden = document.hidden;
 
-      async function safeFetch(url, opts = {}, timeoutMs = 8000) {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), timeoutMs);
-        try {
-          const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
-          clearTimeout(t);
-          return res;
-        } catch (e) {
-          clearTimeout(t);
-          throw e;
-        }
+      // Base intervals
+      let PING_MS  = ps ? 120_000 : 60_000;
+      let CHECK_MS = ps ? 120_000 : 60_000;
+
+      // If tab is hidden, back way off (super power-save)
+      if (hidden) {
+        PING_MS  = ps ? 300_000 : 180_000;  // 5 min / 3 min
+        CHECK_MS = ps ? 300_000 : 180_000;
       }
+      return { PING_MS, CHECK_MS, STALE_SEC: ps ? 240 : 120 };
+    }
 
-      async function keepAlive(){ try { await safeFetch('/ping', {}, 4000); } catch(_){} }
+    function clearTimers() {
+      if (pingTimer)   { clearInterval(pingTimer); pingTimer = null; }
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    }
+    function resetTimers() {
+      clearTimers();
+      const { PING_MS, CHECK_MS } = currentCadence();
+      pingTimer   = setInterval(keepAlive, PING_MS);
+      statusTimer = setInterval(checkStatusAndAutostart, CHECK_MS);
+    }
 
-      async function startScanner(manual=false) {
-        if (starting) return;
-        starting = true;
-        const interval = document.getElementById('selInterval').value || '1m';
-        try {
-          const res = await safeFetch(`/start?interval=${encodeURIComponent(interval)}`, { method:'POST' }, 6000);
-          const j = await res.json().catch(() => ({}));
-          console.log(manual ? '[manual-start]' : '[auto-start]', j);
-          backoff = 5000;
-        } catch (e) {
-          console.warn('[start] failed; retrying', e);
-          setTimeout(() => startScanner(false), backoff);
-          backoff = Math.min(MAX_BACKOFF, Math.floor(backoff * 1.6));
-        } finally {
-          setTimeout(() => { starting = false; }, 1500);
-        }
+    document.addEventListener('visibilitychange', () => {
+      resetTimers(); // re-arm with new cadence
+      if (!document.hidden) {
+        // When user returns, do an immediate refresh (power-save friendly)
+        keepAlive(); checkStatusAndAutostart();
       }
+    });
 
-      function renderStatus(d) {
-        document.getElementById('lblStatus').textContent = d.status || '—';
-        document.getElementById('lblLast').textContent = d.last
-          ? (/\d{10,}/.test(String(d.last)) ? fmtIST(d.last) : String(d.last))
-          : '—';
+    // ——— Start/Status logic ———
+    let starting = false;
+    let backoff = 5000;
+    const MAX_BACKOFF = 30000;
 
-        // balances as-is from backend
-        document.getElementById('lblUSDT').textContent   = Number(d.usdt ?? 0).toFixed(2);
-        setEpochPill(d.status_epoch);
-
-        // scans & trades to screen (trimmed)
-        const scans = Array.isArray(d.scans) ? d.scans.slice(-MAX_SCANS) : [];
-        document.getElementById('scanLog').textContent =
-          scans.map(line => {
-            const m = String(line).match(/epoch[=:]\s*(\d{9,10})/);
-            return m ? String(line).replace(m[1], `${m[1]} (${fmtIST(Number(m[1]))})`) : String(line);
-          }).join('\n') || '—';
-
-        const trades = Array.isArray(d.trades) ? d.trades.slice(-MAX_TRADES) : [];
-        const prettyTrades = trades.map(t => {
-          try {
-            const x = typeof t === 'string' ? JSON.parse(t) : t;
-            if (x && (x.time || x.ts || x.epoch)) {
-              const ts = x.time ?? x.ts ?? x.epoch;
-              x.time_ist = fmtIST(ts);
-            }
-            return JSON.stringify(x);
-          } catch { return safeJson(t); }
-        }).join('\n');
-        document.getElementById('tradeLog').textContent = prettyTrades || '—';
-
-        // ——— P&L from scans (success-only) ———
-        // Use the untrimmed list if backend provides it; else our trimmed "scans"
-        const pnl = computePnlFromScans(Array.isArray(d.scans) ? d.scans : scans);
-        document.getElementById('lblPNLT').textContent   = Number(pnl.today).toFixed(2);
-        document.getElementById('lblPNLY').textContent   = Number(pnl.yesterday).toFixed(2);
-        document.getElementById('lblPNLAll').textContent = Number(pnl.total).toFixed(2);
+    async function safeFetch(url, opts = {}, timeoutMs = 8000) {
+      // Skip most network when hidden + power-save (still one periodic check via timers)
+      if (document.hidden && chkPower.checked && !/^(\/ping|\/status)/.test(url)) {
+        return { ok: true, json: async () => ({}) };
       }
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
+        clearTimeout(t);
+        return res;
+      } catch (e) {
+        clearTimeout(t);
+        throw e;
+      }
+    }
 
-      async function checkStatusAndAutostart() {
+    async function keepAlive(){ try { await safeFetch('/ping', {}, 4000); } catch(_){} }
+
+    async function startScanner(manual=false) {
+      if (starting) return;
+      starting = true;
+      const interval = document.getElementById('selInterval').value || '1m';
+      try {
+        const res = await safeFetch(`/start?interval=${encodeURIComponent(interval)}`, { method:'POST' }, 6000);
+        const j = await res.json().catch(() => ({}));
+        console.log(manual ? '[manual-start]' : '[auto-start]', j);
+        backoff = 5000;
+      } catch (e) {
+        console.warn('[start] failed; retrying', e);
+        setTimeout(() => startScanner(false), backoff);
+        backoff = Math.min(MAX_BACKOFF, Math.floor(backoff * 1.6));
+      } finally {
+        setTimeout(() => { starting = false; }, 1500);
+      }
+    }
+
+    function renderStatus(d) {
+      document.getElementById('lblStatus').textContent = d.status || '—';
+      document.getElementById('lblLast').textContent = d.last
+        ? (/\d{10,}/.test(String(d.last)) ? fmtIST(d.last) : String(d.last))
+        : '—';
+
+      // balances as-is from backend
+      document.getElementById('lblUSDT').textContent = Number(d.usdt ?? 0).toFixed(2);
+      setEpochPill(d.status_epoch);
+
+      // scans & trades (trimmed for screen)
+      const scans = Array.isArray(d.scans) ? d.scans.slice(-MAX_SCANS) : [];
+      document.getElementById('scanLog').textContent =
+        scans.map(line => {
+          const m = String(line).match(/epoch[=:]\s*(\d{9,10})/);
+          return m ? String(line).replace(m[1], `${m[1]} (${fmtIST(Number(m[1]))})`) : String(line);
+        }).join('\n') || '—';
+
+      const trades = Array.isArray(d.trades) ? d.trades.slice(-MAX_TRADES) : [];
+      const prettyTrades = trades.map(t => {
         try {
-          const res = await safeFetch('/status', {}, 8000);
-          if (!res.ok) throw new Error('status not ok');
-          const data = await res.json();
-          renderStatus(data);
-
-          const nowSec = Math.floor(Date.now() / 1000);
-          const epoch = Number(data.status_epoch || 0);
-          const isIdle = (data.status || '').toLowerCase() !== 'running';
-          const isStale = epoch && (nowSec - epoch > STALE_SEC);
-
-          if (isIdle || isStale) {
-            console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
-            startScanner(false);
+          const x = typeof t === 'string' ? JSON.parse(t) : t;
+          if (x && (x.time || x.ts || x.epoch)) {
+            const ts = x.time ?? x.ts ?? x.epoch;
+            x.time_ist = fmtIST(ts);
           }
-          lastEpoch = epoch || lastEpoch;
-        } catch (e) {
-          console.warn('[watchdog] /status failed; nudging /start', e);
+          return JSON.stringify(x);
+        } catch { return safeJson(t); }
+      }).join('\n');
+      document.getElementById('tradeLog').textContent = prettyTrades || '—';
+
+      // -------- P&L from EXECUTED ORDERS (backend provided) --------
+      // Prefer backend's realized P&L fields (computed from confirmed fills):
+      const hasBackendPnL = (typeof d.profit_today !== 'undefined')
+                         || (typeof d.profit_yesterday !== 'undefined')
+                         || (typeof d.pnl_cumulative !== 'undefined');
+
+      if (hasBackendPnL) {
+        document.getElementById('lblPNLT').textContent   = Number(d.profit_today ?? 0).toFixed(6);
+        document.getElementById('lblPNLY').textContent   = Number(d.profit_yesterday ?? 0).toFixed(6);
+        document.getElementById('lblPNLAll').textContent = Number(d.pnl_cumulative ?? 0).toFixed(6);
+      } else {
+        // Fallback (legacy): parse from scan lines if backend not sending P&L
+        const pnl = computePnlFromScans(Array.isArray(d.scans) ? d.scans : scans);
+        document.getElementById('lblPNLT').textContent   = Number(pnl.today).toFixed(6);
+        document.getElementById('lblPNLY').textContent   = Number(pnl.yesterday).toFixed(6);
+        document.getElementById('lblPNLAll').textContent = Number(pnl.total).toFixed(6);
+      }
+    }
+
+    async function checkStatusAndAutostart() {
+      // If hidden and power-save, skip this tick (super conservative)
+      if (document.hidden && chkPower.checked) return;
+
+      try {
+        const res = await safeFetch('/status', {}, 8000);
+        if (!res.ok) throw new Error('status not ok');
+        const data = await res.json();
+        renderStatus(data);
+
+        const nowSec = Math.floor(Date.now() / 1000);
+        const epoch = Number(data.status_epoch || 0);
+        const { STALE_SEC } = currentCadence();
+        const isIdle = (data.status || '').toLowerCase() !== 'running';
+        const isStale = epoch && (nowSec - epoch > STALE_SEC);
+
+        if (isIdle || isStale) {
+          console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
           startScanner(false);
         }
+      } catch (e) {
+        console.warn('[watchdog] /status failed; nudging /start', e);
+        // In power-save, avoid aggressive retries when hidden
+        if (!(document.hidden && chkPower.checked)) startScanner(false);
       }
+    }
 
-      // kick
+    // Kick + timers
+    keepAlive();
+    checkStatusAndAutostart();
+    resetTimers();
+
+    // Also refresh once on focus (useful after long background)
+    window.addEventListener('focus', () => {
       keepAlive();
       checkStatusAndAutostart();
-      // repeats
-      setInterval(keepAlive, PING_MS);
-      setInterval(checkStatusAndAutostart, CHECK_MS);
-      // focus resume
-      window.addEventListener('focus', () => {
-        keepAlive();
-        checkStatusAndAutostart();
-      });
-    })();
+    });
   </script>
 </body>
 </html>
