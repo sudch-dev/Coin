@@ -2,6 +2,8 @@
 import threading
 from collections import deque
 
+DEFAULT_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
+
 # ---- Tunables ----
 TRADE_INTERVAL_SEC = 5 * 1     # candle interval built from tick log (5s)
 POLL_EVERY_SEC      = 5           # how often to poll ticker
