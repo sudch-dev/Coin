@@ -9,8 +9,8 @@
     body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
     h2 { margin: 0 0 12px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:360px; }
-    button, input[type="checkbox"] { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:380px; }
+    button, input[type="checkbox"], input[type="text"], select { padding:8px 12px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
     button:hover { background:#fafafa; }
     pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:320px; overflow:auto; }
     .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
@@ -20,17 +20,29 @@
     th { background: var(--card); }
     .spacer { flex:1; }
     label.chk { display:flex; align-items:center; gap:6px; user-select:none; }
+    .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   </style>
 </head>
 <body>
   <h2>CoinDCX SMC Scanner <span class="pill" id="lblEpoch">—</span></h2>
 
   <div class="row" style="margin-bottom:10px">
-    <button id="btnRefresh">Refresh Status</button>
-    <label class="chk muted" title="Reduce network & CPU; backs off when tab is hidden">
-      <input type="checkbox" id="chkPowerSave" />
-      Power Saving
-    </label>
+    <div class="controls">
+      <label>Interval:
+        <select id="selInterval">
+          <option>1m</option><option>3m</option><option>5m</option><option>10m</option><option selected>15m</option>
+          <option>30m</option><option>60m</option><option>1h</option><option>4h</option><option>1d</option><option>day</option>
+        </select>
+      </label>
+      <label>Pairs (CSV):
+        <input id="inpPairs" type="text" style="min-width:260px" placeholder="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,DOGEUSDT"/>
+      </label>
+      <button id="btnRefresh">Refresh</button>
+      <label class="chk muted" title="Reduce network & CPU; backs off when tab is hidden">
+        <input type="checkbox" id="chkPowerSave" />
+        Power Saving
+      </label>
+    </div>
     <span class="spacer"></span>
     <span>Status: <b id="lblStatus">Idle</b></span>
     <span>Last: <span id="lblLast">—</span></span>
@@ -38,7 +50,7 @@
 
   <div class="row" style="margin-bottom:16px">
     <div class="card">
-      <div class="muted" style="margin-bottom:6px">Universe</div>
+      <div class="muted" style="margin-bottom:6px">Live scan</div>
       <table id="tbl">
         <thead><tr><th>Pair</th><th>Price</th><th>Signal</th><th>Notes</th></tr></thead>
         <tbody id="tbody"></tbody>
@@ -60,21 +72,28 @@
   </div>
 
   <script>
+    const selInterval = document.getElementById('selInterval');
+    const inpPairs = document.getElementById('inpPairs');
     const chkPower = document.getElementById('chkPowerSave');
+    const tbody = document.getElementById('tbody');
+    const scanOut = document.getElementById('scanOut');
+
+    // persist interval & pairs
+    selInterval.value = localStorage.getItem('interval') || '15m';
+    inpPairs.value = localStorage.getItem('pairs') || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,DOGEUSDT';
+    selInterval.addEventListener('change', () => localStorage.setItem('interval', selInterval.value));
+    inpPairs.addEventListener('change', () => localStorage.setItem('pairs', inpPairs.value));
+
+    // power save
     chkPower.checked = localStorage.getItem('power_save') === '1';
     chkPower.addEventListener('change', () => {
       localStorage.setItem('power_save', chkPower.checked ? '1' : '0');
       resetTimers();
     });
 
-    document.getElementById('btnRefresh').onclick = () => fetchStatus();
-
-    const tbody = document.getElementById('tbody');
-    const scanOut = document.getElementById('scanOut');
-
     // precision map {PAIR: precision}
     let PREC = {};
-    // cache last smc-scan response for download
+    // cache last smc-scan response
     let lastScanJson = null;
 
     function setEpochPill(epochSec){
@@ -86,28 +105,27 @@
       try{
         const r = await fetch('/api/precisions', { cache:'no-store' });
         const j = await r.json();
-        if (j && j.status === 'ok' && j.precisions) {
-          PREC = j.precisions;
-        }
-      }catch(e){
-        console.warn('precisions error', e);
-      }
-    }
-
-    async function fetchStatus(){
-      try{
-        const res = await fetch('/api/smc-status', { cache:'no-store' });
-        const data = await res.json();
-        renderStatus(data);
-      }catch(e){
-        console.warn('status error', e);
-      }
+        if (j && j.status === 'ok' && j.precisions) PREC = j.precisions;
+      }catch(e){ console.warn('precisions error', e); }
     }
 
     function fmtPrice(pair, val){
       if (typeof val !== 'number' || !isFinite(val)) return '-';
       const p = PREC[pair] ?? 4;
       return Number(val).toFixed(p);
+    }
+
+    async function fetchStatus(){
+      const interval = encodeURIComponent(selInterval.value || '15m');
+      const pairs = encodeURIComponent(inpPairs.value || '');
+      const url = `/api/smc-status?interval=${interval}&pairs=${pairs}`;
+      try{
+        const res = await fetch(url, { cache:'no-store' });
+        const data = await res.json();
+        renderStatus(data);
+      }catch(e){
+        console.warn('status error', e);
+      }
     }
 
     function renderStatus(d){
@@ -125,6 +143,8 @@
       }).join('');
       tbody.innerHTML = rows || '<tr><td colspan="4" class="muted">No data</td></tr>';
     }
+
+    document.getElementById('btnRefresh').onclick = fetchStatus;
 
     document.getElementById('btnUpload').onclick = async () => {
       const f = document.getElementById('fileJson').files[0];
