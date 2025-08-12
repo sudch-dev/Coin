@@ -2,202 +2,261 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>CoinDCX SMC Scanner</title>
+  <title>CoinDCX SMC + Trader</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f7f7f7; --border:#e5e5e5; }
     body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
-    h2 { margin: 0 0 12px; }
+    h2 { margin:0 0 12px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:380px; }
-    button, input[type="checkbox"], input[type="text"], select { padding:8px 12px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:320px; }
+    button, input, select { padding:8px 12px; border:1px solid var(--border); background:#fff; border-radius:8px; }
+    button { cursor:pointer; }
     button:hover { background:#fafafa; }
-    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:320px; overflow:auto; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
-    .muted { color: var(--muted); font-size: 12px; }
+    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:240px; overflow:auto; }
     table { border-collapse: collapse; width: 100%; }
-    th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; font-size: 13px; }
-    th { background: var(--card); }
+    th, td { border:1px solid var(--border); padding:6px 8px; text-align:left; font-size:13px; }
+    th { background:var(--card); }
+    .muted { color: var(--muted); font-size:12px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
     .spacer { flex:1; }
-    label.chk { display:flex; align-items:center; gap:6px; user-select:none; }
+    .ok { color:#0a0; }
+    .bad { color:#a00; }
     .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    label.chk { display:flex; align-items:center; gap:6px; user-select:none; }
   </style>
 </head>
 <body>
-  <h2>CoinDCX SMC Scanner <span class="pill" id="lblEpoch">—</span></h2>
+  <h2>CoinDCX SMC + Trader <span class="pill" id="lblBeat">—</span></h2>
 
+  <!-- Controls -->
   <div class="row" style="margin-bottom:10px">
     <div class="controls">
-      <label>Interval:
+      <label>Pairs (CSV)
+        <input id="inpPairs" type="text" style="min-width:260px" placeholder="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,DOGEUSDT">
+      </label>
+      <label>Interval
         <select id="selInterval">
-          <option>1m</option><option>3m</option><option>5m</option><option>10m</option><option selected>15m</option>
-          <option>30m</option><option>60m</option><option>1h</option><option>4h</option><option>1d</option><option>day</option>
+          <option value="300">5m</option>
+          <option value="600">10m</option>
+          <option value="900" selected>15m</option>
+          <option value="1800">30m</option>
+          <option value="3600">60m</option>
         </select>
       </label>
-      <label>Pairs (CSV):
-        <input id="inpPairs" type="text" style="min-width:260px" placeholder="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,DOGEUSDT"/>
-      </label>
+      <button id="btnStart">Start</button>
+      <button id="btnStop">Stop</button>
       <button id="btnRefresh">Refresh</button>
       <label class="chk muted" title="Reduce network & CPU; backs off when tab is hidden">
-        <input type="checkbox" id="chkPowerSave" />
+        <input type="checkbox" id="chkPowerSave">
         Power Saving
       </label>
     </div>
     <span class="spacer"></span>
-    <span>Status: <b id="lblStatus">Idle</b></span>
-    <span>Last: <span id="lblLast">—</span></span>
+    <span>Status: <b id="lblStatus" class="bad">Stopped</b></span>
+    <span>Now: <span id="lblNow">—</span></span>
   </div>
 
+  <!-- Live scan (price-only, optional quick view) -->
   <div class="row" style="margin-bottom:16px">
     <div class="card">
-      <div class="muted" style="margin-bottom:6px">Live scan</div>
-      <table id="tbl">
+      <div class="muted" style="margin-bottom:6px">Live scan (/api/smc-status)</div>
+      <table>
         <thead><tr><th>Pair</th><th>Price</th><th>Signal</th><th>Notes</th></tr></thead>
-        <tbody id="tbody"></tbody>
+        <tbody id="tbodyScan"><tr><td colspan="4" class="muted">—</td></tr></tbody>
       </table>
     </div>
 
+    <!-- Trader status -->
     <div class="card">
-      <div class="muted" style="margin-bottom:6px">Upload Candles → /api/smc-scan</div>
-      <input id="fileJson" type="file" accept="application/json" />
-      <div class="muted" style="margin-top:8px">Expected JSON:
-        <code>{ pairs:[...], candles:{PAIR:[...]}, options:{...} }</code>
-      </div>
-      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
-        <button id="btnUpload">Run SMC on Candles</button>
-        <button id="btnDownload" title="Download last /api/smc-scan response">Download JSON</button>
-      </div>
-      <pre id="scanOut" style="margin-top:8px">—</pre>
+      <div class="muted" style="margin-bottom:6px">Trader status (/trade/status)</div>
+      <table>
+        <tbody>
+          <tr><th>Running</th><td id="tdRunning">—</td></tr>
+          <tr><th>Interval (sec)</th><td id="tdInt">—</td></tr>
+          <tr><th>Open exits</th><td id="tdExitsCount">—</td></tr>
+          <tr><th>Pairs</th><td id="tdPairs">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Open exits + Cooldowns -->
+  <div class="row" style="margin-bottom:16px">
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Open exits</div>
+      <table>
+        <thead><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th></tr></thead>
+        <tbody id="tbodyExits"><tr><td colspan="6" class="muted">—</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px">Cooldowns</div>
+      <table>
+        <thead><tr><th>Pair</th><th>Cooldown until (epoch)</th></tr></thead>
+        <tbody id="tbodyCooldowns"><tr><td colspan="2" class="muted">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Logs -->
+  <div class="row">
+    <div class="card" style="min-width:420px">
+      <div class="muted" style="margin-bottom:6px">Last scans</div>
+      <pre id="preScans">—</pre>
+    </div>
+    <div class="card" style="min-width:420px">
+      <div class="muted" style="margin-bottom:6px">Last trades</div>
+      <pre id="preTrades">—</pre>
     </div>
   </div>
 
   <script>
-    const selInterval = document.getElementById('selInterval');
+    // Persisted controls
     const inpPairs = document.getElementById('inpPairs');
-    const chkPower = document.getElementById('chkPowerSave');
-    const tbody = document.getElementById('tbody');
-    const scanOut = document.getElementById('scanOut');
-
-    // persist interval & pairs
-    selInterval.value = localStorage.getItem('interval') || '15m';
+    const selInterval = document.getElementById('selInterval');
     inpPairs.value = localStorage.getItem('pairs') || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,DOGEUSDT';
-    selInterval.addEventListener('change', () => localStorage.setItem('interval', selInterval.value));
+    selInterval.value = localStorage.getItem('interval_sec') || '900';
     inpPairs.addEventListener('change', () => localStorage.setItem('pairs', inpPairs.value));
+    selInterval.addEventListener('change', () => localStorage.setItem('interval_sec', selInterval.value));
 
-    // power save
+    // Power saving
+    const chkPower = document.getElementById('chkPowerSave');
     chkPower.checked = localStorage.getItem('power_save') === '1';
     chkPower.addEventListener('change', () => {
       localStorage.setItem('power_save', chkPower.checked ? '1' : '0');
       resetTimers();
     });
 
-    // precision map {PAIR: precision}
-    let PREC = {};
-    // cache last smc-scan response
-    let lastScanJson = null;
+    // UI elems
+    const lblBeat = document.getElementById('lblBeat');
+    const lblStatus = document.getElementById('lblStatus');
+    const lblNow = document.getElementById('lblNow');
+    const tbodyScan = document.getElementById('tbodyScan');
+    const tbodyExits = document.getElementById('tbodyExits');
+    const tbodyCooldowns = document.getElementById('tbodyCooldowns');
+    const tdRunning = document.getElementById('tdRunning');
+    const tdInt = document.getElementById('tdInt');
+    const tdExitsCount = document.getElementById('tdExitsCount');
+    const tdPairs = document.getElementById('tdPairs');
+    const preScans = document.getElementById('preScans');
+    const preTrades = document.getElementById('preTrades');
 
-    function setEpochPill(epochSec){
-      const s = Number(epochSec || 0);
-      document.getElementById('lblEpoch').textContent = s ? `t:${s}` : '—';
-    }
-
-    async function fetchPrecisions(){
-      try{
-        const r = await fetch('/api/precisions', { cache:'no-store' });
-        const j = await r.json();
-        if (j && j.status === 'ok' && j.precisions) PREC = j.precisions;
-      }catch(e){ console.warn('precisions error', e); }
-    }
-
-    function fmtPrice(pair, val){
-      if (typeof val !== 'number' || !isFinite(val)) return '-';
-      const p = PREC[pair] ?? 4;
-      return Number(val).toFixed(p);
-    }
-
-    async function fetchStatus(){
-      const interval = encodeURIComponent(selInterval.value || '15m');
-      const pairs = encodeURIComponent(inpPairs.value || '');
-      const url = `/api/smc-status?interval=${interval}&pairs=${pairs}`;
-      try{
-        const res = await fetch(url, { cache:'no-store' });
-        const data = await res.json();
-        renderStatus(data);
-      }catch(e){
-        console.warn('status error', e);
-      }
-    }
-
-    function renderStatus(d){
-      document.getElementById('lblStatus').textContent = (d.status || 'ok').toUpperCase();
-      document.getElementById('lblLast').textContent = new Date().toLocaleString();
-      setEpochPill(d.timestamp);
-
-      const rows = (d.results || []).map(r => {
-        return `<tr>
-          <td>${r.pair ?? ''}</td>
-          <td>${fmtPrice(r.pair, r.price)}</td>
-          <td><b>${r.signal ?? '-'}</b></td>
-          <td class="muted">${r.notes ?? ''}</td>
-        </tr>`;
-      }).join('');
-      tbody.innerHTML = rows || '<tr><td colspan="4" class="muted">No data</td></tr>';
-    }
-
-    document.getElementById('btnRefresh').onclick = fetchStatus;
-
-    document.getElementById('btnUpload').onclick = async () => {
-      const f = document.getElementById('fileJson').files[0];
-      if(!f){ alert('Choose a JSON file first'); return; }
-      try{
-        const text = await f.text();
-        const payload = JSON.parse(text);
-        const res = await fetch('/api/smc-scan', {
+    // Buttons
+    document.getElementById('btnRefresh').onclick = () => { fetchStatus(); fetchTrader(); };
+    document.getElementById('btnStart').onclick = async () => {
+      const pairs = inpPairs.value.trim();
+      const interval_sec = Number(selInterval.value || '900');
+      try {
+        const r = await fetch('/trade/start', {
           method:'POST',
           headers:{'Content-Type':'application/json'},
-          body: JSON.stringify(payload)
+          body: JSON.stringify({ pairs, interval_sec })
         });
-        const data = await res.json();
-        lastScanJson = data;
-        scanOut.textContent = JSON.stringify(data, null, 2);
-      }catch(e){
-        scanOut.textContent = 'Error: ' + e;
-      }
+        const j = await r.json();
+        console.log('start', j);
+        fetchTrader();
+      } catch(e){ console.warn(e); }
+    };
+    document.getElementById('btnStop').onclick = async () => {
+      try {
+        const r = await fetch('/trade/stop', { method:'POST' });
+        console.log('stop', await r.json());
+        fetchTrader();
+      } catch(e){ console.warn(e); }
     };
 
-    document.getElementById('btnDownload').onclick = () => {
-      if (!lastScanJson) { alert('No scan output yet. Run SMC first.'); return; }
-      const blob = new Blob([JSON.stringify(lastScanJson, null, 2)], {type:'application/json'});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `smc-scan-${Date.now()}.json`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-    };
+    // Helpers
+    function nowStr(){ return new Date().toLocaleString(); }
+    function setBeat(sec){ lblBeat.textContent = `hb:${sec}`; }
+    function fmt(n, d=6){ const x = Number(n); return Number.isFinite(x) ? x.toFixed(d) : String(n); }
 
-    // power-saving timers
-    let statusTimer = null;
-    function cadence(){
-      const ps = chkPower.checked;
-      const hidden = document.hidden;
-      let ms = ps ? 60_000 : 30_000;       // normal cadence
-      if (hidden) ms = ps ? 180_000 : 90_000; // when hidden
-      return ms;
+    // Live price scan
+    async function fetchStatus(){
+      const interval_map = { "300":"5m", "600":"10m", "900":"15m", "1800":"30m", "3600":"60m" };
+      const interval = interval_map[selInterval.value] || '15m';
+      const pairs = encodeURIComponent(inpPairs.value.trim());
+      try{
+        const r = await fetch(`/api/smc-status?interval=${interval}&pairs=${pairs}`, { cache:'no-store' });
+        const j = await r.json();
+        renderScan(j);
+      }catch(e){ console.warn(e); }
+    }
+    function renderScan(d){
+      lblNow.textContent = nowStr();
+      setBeat(d.timestamp || Math.floor(Date.now()/1000));
+      const rows = (d.results || []).map(r => `
+        <tr>
+          <td>${r.pair ?? '-'}</td>
+          <td>${typeof r.price === 'number' ? fmt(r.price, 6) : '-'}</td>
+          <td><b>${r.signal ?? '-'}</b></td>
+          <td class="muted">${r.notes ?? ''}</td>
+        </tr>
+      `).join('');
+      tbodyScan.innerHTML = rows || '<tr><td colspan="4" class="muted">No data</td></tr>';
+    }
+
+    // Trader status
+    async function fetchTrader(){
+      try{
+        const r = await fetch('/trade/status', { cache:'no-store' });
+        const j = await r.json();
+        renderTrader(j);
+      }catch(e){ console.warn(e); }
+    }
+    function renderTrader(j){
+      const running = !!j.running;
+      lblStatus.textContent = running ? 'Running' : 'Stopped';
+      lblStatus.className = running ? 'ok' : 'bad';
+      tdRunning.textContent = running ? 'Yes' : 'No';
+      tdInt.textContent = j.interval_sec ?? '-';
+      tdPairs.textContent = Array.isArray(j.pairs) ? j.pairs.join(', ') : '-';
+      tdExitsCount.textContent = Array.isArray(j.open_exits) ? j.open_exits.length : 0;
+
+      // exits
+      const exrows = (j.open_exits || []).map(x => `
+        <tr>
+          <td>${x.pair}</td><td>${x.side}</td><td>${fmt(x.qty, 6)}</td>
+          <td>${fmt(x.entry, 6)}</td><td>${fmt(x.tp, 6)}</td><td>${fmt(x.sl, 6)}</td>
+        </tr>
+      `).join('');
+      tbodyExits.innerHTML = exrows || '<tr><td colspan="6" class="muted">None</td></tr>';
+
+      // cooldowns
+      const cdrows = Object.entries(j.cooldowns || {}).map(([k,v]) => `
+        <tr><td>${k}</td><td>${v || '-'}</td></tr>
+      `).join('');
+      tbodyCooldowns.innerHTML = cdrows || '<tr><td colspan="2" class="muted">None</td></tr>';
+
+      // logs
+      preScans.textContent  = (j.last_scans  || []).join('\n') || '—';
+      preTrades.textContent = (j.last_trades || []).join('\n') || '—';
+
+      setBeat(j.now || Math.floor(Date.now()/1000));
+      lblNow.textContent = nowStr();
+    }
+
+    // Power-saving polling
+    let timerScan=null, timerTrader=null;
+    function cadence(){ const ps = chkPower.checked; const hid = document.hidden;
+      return {
+        scan:   hid ? (ps? 180000: 90000) : (ps? 60000: 30000),
+        trader: hid ? (ps? 180000: 90000) : (ps? 30000: 15000)
+      };
     }
     function resetTimers(){
-      if(statusTimer) clearInterval(statusTimer);
-      statusTimer = setInterval(() => {
-        if (document.hidden && chkPower.checked) return; // skip tick
-        fetchStatus();
-      }, cadence());
+      if (timerScan)   clearInterval(timerScan);
+      if (timerTrader) clearInterval(timerTrader);
+      const c = cadence();
+      timerScan = setInterval(() => { if (document.hidden && chkPower.checked) return; fetchStatus(); }, c.scan);
+      timerTrader = setInterval(() => { if (document.hidden && chkPower.checked) return; fetchTrader(); }, c.trader);
     }
     document.addEventListener('visibilitychange', resetTimers);
 
-    // kick
+    // Kick
     (async () => {
-      await fetchPrecisions();
       await fetchStatus();
+      await fetchTrader();
       resetTimers();
     })();
   </script>
