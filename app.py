@@ -354,17 +354,17 @@ def ping():
 TRADE_INTERVAL_SEC = 1 * 2   # 15m candles
 POLL_EVERY_SEC = 2
 COOLDOWN_SEC = 10
-USDT_PER_TRADE = 3
+USDT_PER_TRADE = 1
 TP_MULT = 2.0
 SL_MULT = 1.0
 MIN_TICK_RISK_FRAC = 0.0015
 
 PAIR_RULES = {
-    "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
-    "ETHUSDT": {"precision": 6, "min_qty": 0.001},
+    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
     "BNBUSDT": {"precision": 3, "min_qty": 0.01},
-    "SOLUSDT": {"precision": 3, "min_qty": 0.01},
-    "DOGEUSDT": {"precision": 0, "min_qty": 10},
+    "SOLUSDT": {"precision": 4, "min_qty": 0.01},
+    "DOGEUSDT": {"precision": 4, "min_qty": .01},
 }
 
 _ticks = {p: deque(maxlen=5000) for p in DEFAULT_PAIRS}  # (ts, price)
