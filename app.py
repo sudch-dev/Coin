@@ -20,7 +20,7 @@ DEFAULT_PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "DOGEUSDT"]
 
 # Allowed intervals (metadata for /api/smc-status; candle SMC via POST)
 ALLOWED_INTERVALS = {
-    "1m", "3m", "5m", "10m", "15m", "30m", "60m", "1h", "4h", "1d", "day"
+   "1s", "1m", "3m", "5m", "10m", "15m", "30m", "60m", "1h", "4h", "1d", "day"
 }
 
 # Flask app (create BEFORE any @app.route usage)
@@ -320,7 +320,7 @@ def api_precisions():
 def api_smc_status():
     interval = (request.args.get("interval") or "15m").strip().lower()
     if interval not in ALLOWED_INTERVALS:
-        interval = "15m"
+        interval = "1s"
     pairs_csv = (request.args.get("pairs") or "").strip()
     pairs = [p.strip().upper() for p in pairs_csv.split(",") if p.strip()] or DEFAULT_PAIRS
     res = run_smc_scan_coindcx(client, pairs, interval=interval)
@@ -351,8 +351,8 @@ def ping():
 # ─────────────────────────────────────────────────────────
 # TRADER ADD-ON (price log → candles → PSAR flip → orders)
 # ─────────────────────────────────────────────────────────
-TRADE_INTERVAL_SEC = .1 * 60   # 15m candles
-POLL_EVERY_SEC = 5
+TRADE_INTERVAL_SEC = 1 * 2   # 15m candles
+POLL_EVERY_SEC = 2
 COOLDOWN_SEC = 10
 USDT_PER_TRADE = 3
 TP_MULT = 2.0
