@@ -3,10 +3,10 @@ import threading
 from collections import deque
 
 # ---- Tunables ----
-TRADE_INTERVAL_SEC = 15 * 60      # candle interval built from tick log (15m)
+TRADE_INTERVAL_SEC = 5 * 1     # candle interval built from tick log (5s)
 POLL_EVERY_SEC      = 5           # how often to poll ticker
-COOLDOWN_SEC        = 60          # cooldown after an exit per pair
-USDT_PER_TRADE      = 30.0        # position size per trade (buy side)
+COOLDOWN_SEC        = 10         # cooldown after an exit per pair
+USDT_PER_TRADE      = 1.0        # position size per trade (buy side)
 TP_MULT             = 1.2         # TP = entry + MULT * risk_unit
 SL_MULT             = 1.0         # SL = entry - MULT * risk_unit
 MIN_TICK_RISK_FRAC  = 0.0015      # min risk per unit = entry * this
