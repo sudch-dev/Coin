@@ -28,8 +28,7 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-# Per-pair quantity precision + minimum quantity (coin-wise)
-# (If you prefer, you can swap this to live rules from /exchange/v1/markets_details.)
+# Pair precision (quantity) + min qty (coin-wise)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -54,6 +53,9 @@ MAX_CONCURRENT = 2        # max open positions
 MAX_TRADES_PER_DAY = 12   # throttle per day
 COOLDOWN_BARS = 3         # bars to skip after a losing exit
 
+# Candle interval (seconds). 60 = 1m candles. Lower to warm-up faster (e.g., 15).
+CANDLE_INTERVAL_SEC = 60
+
 # =========================
 # Time helpers (IST)
 # =========================
@@ -69,7 +71,7 @@ tick_logs = {p: [] for p in PAIRS}     # [(ts, price)]
 candle_logs = {p: [] for p in PAIRS}   # list of dicts: open/high/low/close/volume/start
 scan_log = []                          # text logs for UI
 trade_log = []                         # recent trades
-exit_orders = []                       # open exits to monitor (see structure below)
+exit_orders = []                       # open exits to monitor
 daily_profit = {}                      # realized P/L by date
 running = False
 status = {"msg": "Idle", "last": ""}
@@ -110,7 +112,7 @@ def fetch_all_prices():
         scan_log.append(f"{ist_now()} | PRICE_ERR: {e}")
     return {}
 
-def aggregate_candles(pair, interval=60):
+def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
     ticks = tick_logs[pair]
     if not ticks: return
     candles, candle, last_window = [], None, None
@@ -309,7 +311,7 @@ def daily_stop_hit(current_usdt):
         return False
     if usdt_day_open["balance"] is None:
         return False
-    max_loss = usdt_day_open["balance"] * MAX_DD_DAY_PCT
+    max_loss = usdt_day_open["balance"] * (0.02)  # -2% daily stop (consistent with earlier setting)
     pl_today = daily_profit.get(today, 0.0)
     return (-pl_today) >= max_loss
 
@@ -386,7 +388,8 @@ def monitor_exits(prices):
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if pl < 0:
                 pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res: error_message = res["error"]
+            if "error" in res:
+                error_message = res["error"]
             to_remove.append(ex)
 
         elif side == "SELL" and (price <= tp or price >= ex["sl"]):
@@ -396,7 +399,8 @@ def monitor_exits(prices):
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if pl < 0:
                 pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res: error_message = res["error"]
+            if "error" in res:
+                error_message = res["error"]
             to_remove.append(ex)
 
     for ex in to_remove:
@@ -410,7 +414,6 @@ def scan_loop():
     global running, error_message
     scan_log.clear()
     last_candle_ts = {p: 0 for p in PAIRS}
-    interval = 60  # 1-minute candles
 
     while running:
         # reset per-day counters
@@ -434,16 +437,18 @@ def scan_loop():
             if len(tick_logs[pair]) > 5000:
                 tick_logs[pair] = tick_logs[pair][-5000:]
 
-            aggregate_candles(pair, interval)
+            aggregate_candles(pair, CANDLE_INTERVAL_SEC)
             last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
             if last_candle and last_candle["start"] != last_candle_ts[pair]:
                 last_candle_ts[pair] = last_candle["start"]
                 signal = pa_buy_sell_signal(pair)
 
-                # Need sufficient history
-                if len(candle_logs[pair]) < 60:
-                    scan_log.append(f"{ist_now()} | {pair} | Skip: not enough candles")
+                # Need sufficient history (ATR needs ATR_PERIOD+1, PA needs 3)
+                needed = max(ATR_PERIOD + 1, 3)
+                have = len(candle_logs[pair])
+                if have < needed:
+                    scan_log.append(f"{ist_now()} | {pair} | Skip: not enough candles (have {have}, need {needed})")
                     continue
 
                 # Trend & Volatility filters
@@ -607,6 +612,5 @@ def ping():
 # Main
 # =========================
 if __name__ == "__main__":
-    # Program ID marker (as you asked earlier)
     # Program ID: ABCD
     app.run(host="0.0.0.0", port=10000)
