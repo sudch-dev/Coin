@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import requests
 import json
+import statistics
 from datetime import datetime, timedelta
 from pytz import timezone
 from flask import Flask, render_template, jsonify
@@ -21,12 +22,14 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = (os.environ.get("API_SECRET") or "").encode()
 BASE_URL = "https://api.coindcx.com"
 
+# Trade universe
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-# Use base-currency (quantity) precision + min qty. (You can swap to dynamic rules if you prefer.)
+# Per-pair quantity precision + minimum quantity (coin-wise)
+# (If you prefer, you can swap this to live rules from /exchange/v1/markets_details.)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -40,13 +43,16 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# Risk controls
-RISK_PCT = 0.005       # risk 0.5% of USDT per trade
+# ====== Risk & Safety knobs (tighter to reduce losses) ======
+RISK_PCT = 0.002          # risk 0.2% of USDT per trade
 ATR_PERIOD = 14
-ATR_K = 0.8            # SL distance = ATR_K * ATR
-RR = 1.5               # TP distance = RR * SL distance
-MAX_DD_DAY_PCT = 0.02  # daily stop at -2% of day-open USDT
-COOLDOWN_BARS = 2      # bars to skip after a losing exit
+ATR_K = 0.8               # SL distance = ATR_K * ATR
+RR = 1.2                  # TP distance = RR * SL distance
+ATR_MIN_PCT = 0.002       # 0.2%  min volatility cutoff
+ATR_MAX_PCT = 0.03        # 3.0%  max volatility cutoff
+MAX_CONCURRENT = 2        # max open positions
+MAX_TRADES_PER_DAY = 12   # throttle per day
+COOLDOWN_BARS = 3         # bars to skip after a losing exit
 
 # =========================
 # Time helpers (IST)
@@ -63,7 +69,7 @@ tick_logs = {p: [] for p in PAIRS}     # [(ts, price)]
 candle_logs = {p: [] for p in PAIRS}   # list of dicts: open/high/low/close/volume/start
 scan_log = []                          # text logs for UI
 trade_log = []                         # recent trades
-exit_orders = []                       # open exits to monitor
+exit_orders = []                       # open exits to monitor (see structure below)
 daily_profit = {}                      # realized P/L by date
 running = False
 status = {"msg": "Idle", "last": ""}
@@ -71,6 +77,7 @@ error_message = ""
 
 pair_cooldown = {p: 0 for p in PAIRS}
 usdt_day_open = {"date": None, "balance": None}
+trades_today = {"date": None, "count": 0}
 
 # =========================
 # Utils / API
@@ -119,7 +126,7 @@ def aggregate_candles(pair, interval=60):
             candle["close"] = price
             candle["volume"] += 1
     if candle: candles.append(candle)
-    candle_logs[pair] = candles[-500:]  # keep enough for ATR/SMC
+    candle_logs[pair] = candles[-500:]  # keep enough history for ATR/SMC
 
 def clamp_qty(pair, qty):
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
@@ -131,6 +138,7 @@ def clamp_qty(pair, qty):
     return round(qty, precision)
 
 def place_order(pair, side, qty):
+    """Order protocol unchanged: market order with total_quantity."""
     payload = {
         "market": pair,
         "side": side.lower(),             # "buy" / "sell"
@@ -163,6 +171,21 @@ def compute_atr(candles, period=14):
         atr = (atr * (period - 1) + x) / period
     return atr
 
+def ema(values, period):
+    if len(values) < period: return None
+    k = 2/(period+1)
+    e = float(values[0])
+    for v in values[1:]:
+        e = float(v)*k + e*(1-k)
+    return e
+
+def atr_pct(candles, period=14):
+    atr_v = compute_atr(candles, period)
+    if not atr_v: return None
+    price = candles[-1]["close"]
+    return (atr_v / price) if price else None
+
+# Relaxed PA: more frequent trades
 def pa_buy_sell_signal(pair):
     candles = candle_logs[pair]
     if len(candles) < 3: return None
@@ -173,9 +196,7 @@ def pa_buy_sell_signal(pair):
         return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: close<prev & low<last2"}
     return None
 
-# ===== SMC (Order Blocks) =====
-import statistics
-
+# ===== SMC (Order Blocks) from aggregated candles =====
 def detect_order_blocks(data):
     """ data: list of dicts: {date, open, high, low, close, volume} """
     bullish_ob, bearish_ob = [], []
@@ -204,10 +225,10 @@ def calculate_ema_from_closes(closes, period):
     if not closes: return []
     k = 2 / (period + 1)
     ema_values = []
-    ema = float(closes[0])
+    ema_val = float(closes[0])
     for c in closes:
-        ema = (float(c) * k) + (ema * (1 - k))
-        ema_values.append(ema)
+        ema_val = float(c) * k + ema_val * (1 - k)
+        ema_values.append(ema_val)
     return [round(v, 6) for v in ema_values]
 
 def rsi_wilder_from_closes(closes, period=14):
@@ -279,6 +300,9 @@ def run_smc_scan_coindcx():
 # =========================
 def daily_stop_hit(current_usdt):
     today = ist_date()
+    if trades_today["date"] != today:
+        trades_today["date"] = today
+        trades_today["count"] = 0
     if usdt_day_open["date"] != today or usdt_day_open["balance"] is None:
         usdt_day_open["date"] = today
         usdt_day_open["balance"] = float(current_usdt)
@@ -290,41 +314,94 @@ def daily_stop_hit(current_usdt):
     return (-pl_today) >= max_loss
 
 # =========================
-# Exits
+# Exits (partial TP, BE move, ATR trail, hard TP/SL)
 # =========================
 def monitor_exits(prices):
     global error_message
     to_remove = []
     for ex in exit_orders:
-        pair, side, qty, tp, sl, entry = ex["pair"], ex["side"], ex["qty"], ex["tp"], ex["sl"], ex["entry"]
+        pair = ex["pair"]; side = ex["side"]; qty = ex["qty"]
+        tp = ex["tp"]; sl = ex["sl"]; entry = ex["entry"]
+        be_moved = ex.get("be_moved", False)
+        half_taken = ex.get("half_taken", False)
+        trail_active = ex.get("trail_active", True)
+
         price = prices.get(pair, {}).get("price")
         if not price:
             continue
 
-        if side == "BUY" and (price >= tp or price <= sl):
+        # Risk distance (per unit)
+        risk_dist = abs(entry - sl)
+
+        # ---- Partial TP at +1R (take 50%) ----
+        if not half_taken and risk_dist > 0:
+            hit_1R = (side == "BUY" and price >= entry + risk_dist) or (side == "SELL" and price <= entry - risk_dist)
+            if hit_1R:
+                half_qty = clamp_qty(pair, qty * 0.5)
+                if half_qty > 0:
+                    res = place_order(pair, "SELL" if side == "BUY" else "BUY", half_qty)
+                    scan_log.append(f"{ist_now()} | {pair} | PARTIAL {('SELL' if side=='BUY' else 'BUY')} {half_qty} @ {price} | {res}")
+                    pl = (price - entry) * half_qty if side == "BUY" else (entry - price) * half_qty
+                    daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
+                    if "error" in res: error_message = res["error"]
+                    ex["qty"] = clamp_qty(pair, qty - half_qty)
+                    ex["half_taken"] = True
+                    qty = ex["qty"]
+                    if qty <= 0:
+                        to_remove.append(ex)
+                        continue
+
+        # ---- Move SL to Breakeven at +0.7R ----
+        if not be_moved and risk_dist > 0:
+            hit_BE = (side == "BUY" and price >= entry + 0.7 * risk_dist) or (side == "SELL" and price <= entry - 0.7 * risk_dist)
+            if hit_BE:
+                ex["sl"] = entry
+                ex["be_moved"] = True
+                scan_log.append(f"{ist_now()} | {pair} | SL moved to BE @ {entry}")
+
+        # ---- ATR trailing after BE ----
+        if trail_active:
+            recent = candle_logs[pair][-(ATR_PERIOD + 5):]
+            atr_now = compute_atr(recent, ATR_PERIOD) if len(recent) >= ATR_PERIOD + 1 else None
+            if atr_now:
+                trail_dist = 0.8 * atr_now
+                if side == "BUY":
+                    new_sl = max(ex["sl"], price - trail_dist)
+                    if new_sl > ex["sl"]:
+                        ex["sl"] = round(new_sl, 6)
+                else:
+                    new_sl = min(ex["sl"], price + trail_dist)
+                    if new_sl < ex["sl"]:
+                        ex["sl"] = round(new_sl, 6)
+
+        # ---- Hard exits: TP/SL on remaining qty ----
+        qty = ex["qty"]
+        if qty <= 0:
+            to_remove.append(ex); continue
+
+        if side == "BUY" and (price >= tp or price <= ex["sl"]):
             res = place_order(pair, "SELL", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
             pl = (price - entry) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if pl < 0:
                 pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res:
-                error_message = res["error"]
+            if "error" in res: error_message = res["error"]
             to_remove.append(ex)
 
-        elif side == "SELL" and (price <= tp or price >= sl):
+        elif side == "SELL" and (price <= tp or price >= ex["sl"]):
             res = place_order(pair, "BUY", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
             pl = (entry - price) * qty
             daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
             if pl < 0:
                 pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res:
-                error_message = res["error"]
+            if "error" in res: error_message = res["error"]
             to_remove.append(ex)
 
     for ex in to_remove:
-        exit_orders.remove(ex)
+        if ex in exit_orders:
+            exit_orders.remove(ex)
 
 # =========================
 # Trading Loop
@@ -336,6 +413,12 @@ def scan_loop():
     interval = 60  # 1-minute candles
 
     while running:
+        # reset per-day counters
+        today = ist_date()
+        if trades_today["date"] != today:
+            trades_today["date"] = today
+            trades_today["count"] = 0
+
         prices = fetch_all_prices()
         now = int(time.time())
         monitor_exits(prices)
@@ -343,7 +426,7 @@ def scan_loop():
 
         for pair in PAIRS:
             info = prices.get(pair)
-            if not info: 
+            if not info:
                 continue
 
             price = info["price"]
@@ -358,16 +441,59 @@ def scan_loop():
                 last_candle_ts[pair] = last_candle["start"]
                 signal = pa_buy_sell_signal(pair)
 
+                # Need sufficient history
+                if len(candle_logs[pair]) < 60:
+                    scan_log.append(f"{ist_now()} | {pair} | Skip: not enough candles")
+                    continue
+
+                # Trend & Volatility filters
+                closes = [c["close"] for c in candle_logs[pair]]
+                ema20 = ema(closes, 20); ema50 = ema(closes, 50)
+                ema200 = ema(closes, 200) if len(closes) >= 200 else None
+                atrp = atr_pct(candle_logs[pair], ATR_PERIOD)
+
+                # Volatility window: avoid chop (too low) and chaos (too high)
+                if not atrp or atrp < ATR_MIN_PCT or atrp > ATR_MAX_PCT:
+                    pct = round(atrp*100, 2) if atrp else None
+                    scan_log.append(f"{ist_now()} | {pair} | Skip: ATR% out of band ({pct}%)")
+                    signal = None
+
+                # Trend alignment: only long above EMAs, only short below
+                if signal:
+                    if signal["side"] == "BUY":
+                        if not (ema20 and ema50 and (ema20 > ema50) and (closes[-1] > ema20) and (ema200 is None or closes[-1] > ema200)):
+                            scan_log.append(f"{ist_now()} | {pair} | Skip BUY: trend not aligned")
+                            signal = None
+                    else:
+                        if not (ema20 and ema50 and (ema20 < ema50) and (closes[-1] < ema20) and (ema200 is None or closes[-1] < ema200)):
+                            scan_log.append(f"{ist_now()} | {pair} | Skip SELL: trend not aligned")
+                            signal = None
+
+                # Skip weak body candles (avoid false breaks)
+                if signal:
+                    curr = candle_logs[pair][-1]
+                    true_range = max(curr["high"] - curr["low"], 1e-9)
+                    body = abs(curr["close"] - curr["open"])
+                    if body / true_range < 0.35:
+                        scan_log.append(f"{ist_now()} | {pair} | Skip: weak body ({round(body/true_range, 2)})")
+                        signal = None
+
                 if signal:
                     # Daily stop
                     if daily_stop_hit(balances.get("USDT", 0.0)):
                         scan_log.append(f"{ist_now()} | DAILY STOP HIT — skipping trades")
                         continue
 
-                    # Cooldown after losing exit
+                    # Cooldown & limits
                     if pair_cooldown.get(pair, 0) > 0:
                         pair_cooldown[pair] -= 1
                         scan_log.append(f"{ist_now()} | {pair} | Cooldown active ({pair_cooldown[pair]} left)")
+                        continue
+                    if len(exit_orders) >= MAX_CONCURRENT:
+                        scan_log.append(f"{ist_now()} | LIMIT | Max concurrent positions reached")
+                        continue
+                    if trades_today["count"] >= MAX_TRADES_PER_DAY:
+                        scan_log.append(f"{ist_now()} | LIMIT | Max trades reached for today")
                         continue
 
                     error_message = ""
@@ -390,7 +516,7 @@ def scan_loop():
                         sl = round(entry + sl_dist, 6)
                         tp = round(entry - tp_dist, 6)
 
-                    # Sizing
+                    # Sizing (risk-based + cap); SELL uses full coin balance (100%)
                     usdt = balances.get("USDT", 0.0)
                     coin = pair[:-4]
                     if signal["side"] == "BUY":
@@ -399,7 +525,6 @@ def scan_loop():
                         qty_budget = (0.3 * usdt) / entry if entry else 0.0
                         raw_qty = max(0.0, min(qty_risk, qty_budget))
                     else:
-                        # SELL: exit spot holding fully
                         raw_qty = balances.get(coin, 0.0)
 
                     qty = clamp_qty(pair, raw_qty)
@@ -407,6 +532,7 @@ def scan_loop():
                         scan_log.append(f"{ist_now()} | {pair} | Qty=0 after clamp — skip")
                         continue
 
+                    # Place order (protocol unchanged)
                     res = place_order(pair, signal["side"], qty)
 
                     scan_log.append(f"{ist_now()} | {pair} | {signal['side']} qty={qty} @ {entry} | TP={tp} SL={sl} | {res}")
@@ -414,8 +540,16 @@ def scan_loop():
                         "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
                         "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
                     })
-                    exit_orders.append({"pair": pair, "side": signal["side"], "qty": qty,
-                                        "tp": tp, "sl": sl, "entry": entry})
+
+                    # Track exit with richer state for better management
+                    exit_orders.append({
+                        "pair": pair, "side": signal["side"], "qty": qty,
+                        "tp": tp, "sl": sl, "entry": entry,
+                        "half_taken": False, "be_moved": False, "trail_active": True
+                    })
+
+                    trades_today["count"] += 1
+
                     if "error" in res:
                         error_message = res["error"]
                 else:
@@ -473,4 +607,6 @@ def ping():
 # Main
 # =========================
 if __name__ == "__main__":
+    # Program ID marker (as you asked earlier)
+    # Program ID: ABCD
     app.run(host="0.0.0.0", port=10000)
