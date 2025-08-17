@@ -5,7 +5,6 @@ import hmac
 import hashlib
 import requests
 import json
-import statistics
 from datetime import datetime, timedelta
 from pytz import timezone
 from flask import Flask, render_template, jsonify
@@ -42,18 +41,7 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# ====== Risk & Safety knobs (tighter to reduce losses) ======
-RISK_PCT = 0.002          # risk 0.2% of USDT per trade
-ATR_PERIOD = 14
-ATR_K = 0.8               # SL distance = ATR_K * ATR
-RR = 1.2                  # TP distance = RR * SL distance
-ATR_MIN_PCT = 0.002       # 0.2%  min volatility cutoff
-ATR_MAX_PCT = 0.03        # 3.0%  max volatility cutoff
-MAX_CONCURRENT = 2        # max open positions
-MAX_TRADES_PER_DAY = 12   # throttle per day
-COOLDOWN_BARS = 3         # bars to skip after a losing exit
-
-# Candle interval (seconds). 60 = 1m candles. Lower to warm-up faster (e.g., 15).
+# Candle interval (seconds). 60 = 1m candles.
 CANDLE_INTERVAL_SEC = 60
 
 # =========================
@@ -68,18 +56,12 @@ def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime("%Y
 # State
 # =========================
 tick_logs = {p: [] for p in PAIRS}     # [(ts, price)]
-candle_logs = {p: [] for p in PAIRS}   # list of dicts: open/high/low/close/volume/start
+candle_logs = {p: [] for p in PAIRS}   # dicts: open/high/low/close/volume/start
 scan_log = []                          # text logs for UI
-trade_log = []                         # recent trades
-exit_orders = []                       # open exits to monitor
-daily_profit = {}                      # realized P/L by date
+trade_log = []                         # recent trades (entries only)
 running = False
 status = {"msg": "Idle", "last": ""}
 error_message = ""
-
-pair_cooldown = {p: 0 for p in PAIRS}
-usdt_day_open = {"date": None, "balance": None}
-trades_today = {"date": None, "count": 0}
 
 # =========================
 # Utils / API
@@ -128,7 +110,7 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
             candle["close"] = price
             candle["volume"] += 1
     if candle: candles.append(candle)
-    candle_logs[pair] = candles[-500:]  # keep enough history for ATR/SMC
+    candle_logs[pair] = candles[-500:]
 
 def clamp_qty(pair, qty):
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
@@ -158,80 +140,11 @@ def place_order(pair, side, qty):
         return {"error": str(e)}
 
 # =========================
-# Indicators / Logic
+# Indicators / Signal
 # =========================
-def compute_atr(candles, period=14):
-    """ Wilder ATR on OHLC candles (oldest->newest). """
-    if len(candles) < period + 1: return None
-    trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]; l = candles[i]["low"]; pc = candles[i-1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    atr = sum(trs[:period]) / period
-    for x in trs[period:]:
-        atr = (atr * (period - 1) + x) / period
-    return atr
-
-def ema(values, period):
+def sma(values, period):
     if len(values) < period: return None
-    k = 2/(period+1)
-    e = float(values[0])
-    for v in values[1:]:
-        e = float(v)*k + e*(1-k)
-    return e
-
-def atr_pct(candles, period=14):
-    atr_v = compute_atr(candles, period)
-    if not atr_v: return None
-    price = candles[-1]["close"]
-    return (atr_v / price) if price else None
-
-# Relaxed PA: more frequent trades
-def pa_buy_sell_signal(pair):
-    candles = candle_logs[pair]
-    if len(candles) < 3: return None
-    prev1, prev2, curr = candles[-3], candles[-2], candles[-1]
-    if curr["close"] > prev2["close"] and curr["high"] > max(prev1["high"], prev2["high"]):
-        return {"side": "BUY", "entry": curr["close"], "msg": "PA BUY: close>prev & high>last2"}
-    if curr["close"] < prev2["close"] and curr["low"] < min(prev1["low"], prev2["low"]):
-        return {"side": "SELL", "entry": curr["close"], "msg": "PA SELL: close<prev & low<last2"}
-    return None
-
-# ===== SMC (Order Blocks) from aggregated candles =====
-def detect_order_blocks(data):
-    """ data: list of dicts: {date, open, high, low, close, volume} """
-    bullish_ob, bearish_ob = [], []
-    n = len(data)
-    for i in range(2, n - 2):
-        curr = data[i]; n1 = data[i+1]; n2 = data[i+2]
-        # Bearish OB: up candle then two closes below its low
-        if curr["close"] > curr["open"] and n1["close"] < curr["low"] and n2["close"] < curr["low"]:
-            zone_low, zone_high = curr["open"], curr["high"]
-            mitigated = any((data[j]["high"] >= zone_low) and (data[j]["low"] <= zone_high) for j in range(i+3, n))
-            if not mitigated:
-                bearish_ob.append({"index": i, "timestamp": curr.get("date"),
-                                   "type": "bearish", "zone_low": float(zone_low), "zone_high": float(zone_high),
-                                   "candle": curr})
-        # Bullish OB: down candle then two closes above its high
-        if curr["open"] > curr["close"] and n1["close"] > curr["high"] and n2["close"] > curr["high"]:
-            zone_low, zone_high = curr["low"], curr["open"]
-            mitigated = any((data[j]["high"] >= zone_low) and (data[j]["low"] <= zone_high) for j in range(i+3, n))
-            if not mitigated:
-                bullish_ob.append({"index": i, "timestamp": curr.get("date"),
-                                   "type": "bullish", "zone_low": float(zone_low), "zone_high": float(zone_high),
-                                   "candle": curr})
-    return bullish_ob, bearish_ob
-
-def calculate_ema_from_closes(closes, period):
-    if not closes: return []
-    k = 2 / (period + 1)
-    ema_values = []
-    ema_val = float(closes[0])
-    for c in closes:
-        ema_val = float(c) * k + ema_val * (1 - k)
-        ema_values.append(ema_val)
-    return [round(v, 6) for v in ema_values]
+    return sum(values[-period:]) / period
 
 def rsi_wilder_from_closes(closes, period=14):
     if len(closes) < period + 1: return None
@@ -249,166 +162,109 @@ def rsi_wilder_from_closes(closes, period=14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
-def run_smc_scan_coindcx():
-    results = {}
-    for pair in PAIRS:
-        candles = candle_logs.get(pair, [])
-        if len(candles) < 60:
-            continue
-        data = [{
-            "date": datetime.fromtimestamp(c["start"], tz=IST).isoformat(),
-            "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]
-        } for c in candles]
+def stoch_kd(candles, k_period=14, smooth_k=3, d_period=3):
+    """Stoch(14,3,3): %K = SMA(%K_raw,3); %D = SMA(%K,3). Returns (k, d, k_prev, d_prev)."""
+    need = k_period + smooth_k + d_period
+    if len(candles) < need: return None, None, None, None
 
-        bullish_obs, bearish_obs = detect_order_blocks(data)
-        closes = [d["close"] for d in data]
-        last_close = closes[-1]
-        ema20 = calculate_ema_from_closes(closes, 20)[-1]
-        ema50 = calculate_ema_from_closes(closes, 50)[-1]
-        rsi = rsi_wilder_from_closes(closes[-(50+1):], 14)
+    highs  = [c["high"] for c in candles]
+    lows   = [c["low"]  for c in candles]
+    closes = [c["close"] for c in candles]
 
-        if len(data) >= 12:
-            avg_vol = statistics.mean([d["volume"] for d in data[-11:-1]])
-        else:
-            avg_vol = statistics.mean([d["volume"] for d in data[:-1]]) if len(data) > 1 else 0
-        volume_spike = data[-1]["volume"] > 1.5 * avg_vol if avg_vol else False
-        trend_tag = "Bullish" if ema20 > ema50 else ("Bearish" if ema20 < ema50 else "Neutral")
+    k_raw_series = []
+    for i in range(k_period-1, len(candles)):
+        hh = max(highs[i-k_period+1:i+1])
+        ll = min(lows[i-k_period+1:i+1])
+        denom = (hh - ll) if (hh - ll) != 0 else 1e-9
+        k_raw = (closes[i] - ll) * 100.0 / denom
+        k_raw_series.append(k_raw)
 
-        flagged = False
-        for ob in reversed(bullish_obs):
-            if ob["zone_low"] <= last_close <= ob["zone_high"]:
-                results[pair] = {
-                    "status": "In Buy Block",
-                    "zone": [round(ob["zone_low"], 6), round(ob["zone_high"], 6)],
-                    "price": last_close, "ema20": ema20, "ema50": ema50, "rsi14": rsi,
-                    "volume_spike": volume_spike, "trend": trend_tag, "ob_time": ob["timestamp"]
-                }
-                flagged = True
-                break
-        if flagged: continue
-        for ob in reversed(bearish_obs):
-            if ob["zone_low"] <= last_close <= ob["zone_high"]:
-                results[pair] = {
-                    "status": "In Sell Block",
-                    "zone": [round(ob["zone_low"], 6), round(ob["zone_high"], 6)],
-                    "price": last_close, "ema20": ema20, "ema50": ema50, "rsi14": rsi,
-                    "volume_spike": volume_spike, "trend": trend_tag, "ob_time": ob["timestamp"]
-                }
-                break
-    return results
+    if len(k_raw_series) < smooth_k + d_period: return None, None, None, None
 
-# =========================
-# Risk Helpers
-# =========================
-def daily_stop_hit(current_usdt):
-    today = ist_date()
-    if trades_today["date"] != today:
-        trades_today["date"] = today
-        trades_today["count"] = 0
-    if usdt_day_open["date"] != today or usdt_day_open["balance"] is None:
-        usdt_day_open["date"] = today
-        usdt_day_open["balance"] = float(current_usdt)
-        return False
-    if usdt_day_open["balance"] is None:
-        return False
-    max_loss = usdt_day_open["balance"] * (0.02)  # -2% daily stop (consistent with earlier setting)
-    pl_today = daily_profit.get(today, 0.0)
-    return (-pl_today) >= max_loss
+    k_smooth = []
+    for j in range(smooth_k-1, len(k_raw_series)):
+        k_smooth.append(sum(k_raw_series[j-smooth_k+1:j+1]) / smooth_k)
 
-# =========================
-# Exits (partial TP, BE move, ATR trail, hard TP/SL)
-# =========================
-def monitor_exits(prices):
-    global error_message
-    to_remove = []
-    for ex in exit_orders:
-        pair = ex["pair"]; side = ex["side"]; qty = ex["qty"]
-        tp = ex["tp"]; sl = ex["sl"]; entry = ex["entry"]
-        be_moved = ex.get("be_moved", False)
-        half_taken = ex.get("half_taken", False)
-        trail_active = ex.get("trail_active", True)
+    if len(k_smooth) < d_period + 1: return None, None, None, None
 
-        price = prices.get(pair, {}).get("price")
-        if not price:
-            continue
+    d_smooth = []
+    for j in range(d_period-1, len(k_smooth)):
+        d_smooth.append(sum(k_smooth[j-d_period+1:j+1]) / d_period)
 
-        # Risk distance (per unit)
-        risk_dist = abs(entry - sl)
+    k = round(k_smooth[-1], 2)
+    d = round(d_smooth[-1], 2)
+    k_prev = round(k_smooth[-2], 2) if len(k_smooth) >= 2 else None
+    d_prev = round(d_smooth[-2], 2) if len(d_smooth) >= 2 else None
+    return k, d, k_prev, d_prev
 
-        # ---- Partial TP at +1R (take 50%) ----
-        if not half_taken and risk_dist > 0:
-            hit_1R = (side == "BUY" and price >= entry + risk_dist) or (side == "SELL" and price <= entry - risk_dist)
-            if hit_1R:
-                half_qty = clamp_qty(pair, qty * 0.5)
-                if half_qty > 0:
-                    res = place_order(pair, "SELL" if side == "BUY" else "BUY", half_qty)
-                    scan_log.append(f"{ist_now()} | {pair} | PARTIAL {('SELL' if side=='BUY' else 'BUY')} {half_qty} @ {price} | {res}")
-                    pl = (price - entry) * half_qty if side == "BUY" else (entry - price) * half_qty
-                    daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
-                    if "error" in res: error_message = res["error"]
-                    ex["qty"] = clamp_qty(pair, qty - half_qty)
-                    ex["half_taken"] = True
-                    qty = ex["qty"]
-                    if qty <= 0:
-                        to_remove.append(ex)
-                        continue
+def pa_buy_sell_signal(pair):
+    """
+    1m entry trigger based on: SMA(5/10) cross + RSI(14) + candle bias + Stoch(14,3,3).
+    Returns dict: {"side","entry","msg"} or None.
+    """
+    candles = candle_logs[pair]
+    need = max(10, 15, 20)  # SMA10, RSI14, Stoch(14,3,3)
+    if len(candles) < need:
+        return None
 
-        # ---- Move SL to Breakeven at +0.7R ----
-        if not be_moved and risk_dist > 0:
-            hit_BE = (side == "BUY" and price >= entry + 0.7 * risk_dist) or (side == "SELL" and price <= entry - 0.7 * risk_dist)
-            if hit_BE:
-                ex["sl"] = entry
-                ex["be_moved"] = True
-                scan_log.append(f"{ist_now()} | {pair} | SL moved to BE @ {entry}")
+    closes = [c["close"] for c in candles]
+    curr   = candles[-1]
 
-        # ---- ATR trailing after BE ----
-        if trail_active:
-            recent = candle_logs[pair][-(ATR_PERIOD + 5):]
-            atr_now = compute_atr(recent, ATR_PERIOD) if len(recent) >= ATR_PERIOD + 1 else None
-            if atr_now:
-                trail_dist = 0.8 * atr_now
-                if side == "BUY":
-                    new_sl = max(ex["sl"], price - trail_dist)
-                    if new_sl > ex["sl"]:
-                        ex["sl"] = round(new_sl, 6)
-                else:
-                    new_sl = min(ex["sl"], price + trail_dist)
-                    if new_sl < ex["sl"]:
-                        ex["sl"] = round(new_sl, 6)
+    # SMAs for cross detection
+    sma5_now   = sma(closes, 5)
+    sma10_now  = sma(closes, 10)
+    sma5_prev  = sma(closes[:-1], 5)
+    sma10_prev = sma(closes[:-1], 10)
+    if None in (sma5_now, sma10_now, sma5_prev, sma10_prev):
+        return None
 
-        # ---- Hard exits: TP/SL on remaining qty ----
-        qty = ex["qty"]
-        if qty <= 0:
-            to_remove.append(ex); continue
+    cross_up   = (sma5_prev <= sma10_prev) and (sma5_now > sma10_now)
+    cross_down = (sma5_prev >= sma10_prev) and (sma5_now < sma10_now)
 
-        if side == "BUY" and (price >= tp or price <= ex["sl"]):
-            res = place_order(pair, "SELL", qty)
-            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
-            pl = (price - entry) * qty
-            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
-            if pl < 0:
-                pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res:
-                error_message = res["error"]
-            to_remove.append(ex)
+    # RSI(14) on last 15 closes
+    rsi = rsi_wilder_from_closes(closes[-15:], period=14)
 
-        elif side == "SELL" and (price <= tp or price >= ex["sl"]):
-            res = place_order(pair, "BUY", qty)
-            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
-            pl = (entry - price) * qty
-            daily_profit[ist_date()] = daily_profit.get(ist_date(), 0) + pl
-            if pl < 0:
-                pair_cooldown[pair] = COOLDOWN_BARS
-            if "error" in res:
-                error_message = res["error"]
-            to_remove.append(ex)
+    # Stoch(14,3,3)
+    k, d, k_prev, d_prev = stoch_kd(candles, k_period=14, smooth_k=3, d_period=3)
 
-    for ex in to_remove:
-        if ex in exit_orders:
-            exit_orders.remove(ex)
+    # Candle bias
+    bullish = curr["close"] > curr["open"]
+    bearish = curr["close"] < curr["open"]
+
+    # BUY
+    buy_ok = (
+        cross_up and
+        rsi is not None and 50 < rsi < 70 and
+        bullish and curr["close"] > sma10_now and
+        k is not None and d is not None and k_prev is not None and d_prev is not None and
+        (k_prev <= d_prev) and (k > d) and (k < 80)
+    )
+    if buy_ok:
+        return {
+            "side": "BUY",
+            "entry": curr["close"],
+            "msg": f"BUY 1m: SMA5>10 cross, RSI={rsi}, Stoch {k}>{d}, bullish"
+        }
+
+    # SELL
+    sell_ok = (
+        cross_down and
+        rsi is not None and 30 < rsi < 50 and
+        bearish and curr["close"] < sma10_now and
+        k is not None and d is not None and k_prev is not None and d_prev is not None and
+        (k_prev >= d_prev) and (k < d) and (k > 20)
+    )
+    if sell_ok:
+        return {
+            "side": "SELL",
+            "entry": curr["close"],
+            "msg": f"SELL 1m: SMA5<10 cross, RSI={rsi}, Stoch {k}<{d}, bearish"
+        }
+
+    return None
 
 # =========================
-# Trading Loop
+# Trading Loop (entry-only)
 # =========================
 def scan_loop():
     global running, error_message
@@ -416,15 +272,8 @@ def scan_loop():
     last_candle_ts = {p: 0 for p in PAIRS}
 
     while running:
-        # reset per-day counters
-        today = ist_date()
-        if trades_today["date"] != today:
-            trades_today["date"] = today
-            trades_today["count"] = 0
-
         prices = fetch_all_prices()
         now = int(time.time())
-        monitor_exits(prices)
         balances = get_wallet_balances()
 
         for pair in PAIRS:
@@ -440,95 +289,20 @@ def scan_loop():
             aggregate_candles(pair, CANDLE_INTERVAL_SEC)
             last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
+            # act only at the *close* of a new candle
             if last_candle and last_candle["start"] != last_candle_ts[pair]:
                 last_candle_ts[pair] = last_candle["start"]
                 signal = pa_buy_sell_signal(pair)
 
-                # Need sufficient history (ATR needs ATR_PERIOD+1, PA needs 3)
-                needed = max(ATR_PERIOD + 1, 3)
-                have = len(candle_logs[pair])
-                if have < needed:
-                    scan_log.append(f"{ist_now()} | {pair} | Skip: not enough candles (have {have}, need {needed})")
-                    continue
-
-                # Trend & Volatility filters
-                closes = [c["close"] for c in candle_logs[pair]]
-                ema20 = ema(closes, 20); ema50 = ema(closes, 50)
-                ema200 = ema(closes, 200) if len(closes) >= 200 else None
-                atrp = atr_pct(candle_logs[pair], ATR_PERIOD)
-
-                # Volatility window: avoid chop (too low) and chaos (too high)
-                if not atrp or atrp < ATR_MIN_PCT or atrp > ATR_MAX_PCT:
-                    pct = round(atrp*100, 2) if atrp else None
-                    scan_log.append(f"{ist_now()} | {pair} | Skip: ATR% out of band ({pct}%)")
-                    signal = None
-
-                # Trend alignment: only long above EMAs, only short below
                 if signal:
-                    if signal["side"] == "BUY":
-                        if not (ema20 and ema50 and (ema20 > ema50) and (closes[-1] > ema20) and (ema200 is None or closes[-1] > ema200)):
-                            scan_log.append(f"{ist_now()} | {pair} | Skip BUY: trend not aligned")
-                            signal = None
-                    else:
-                        if not (ema20 and ema50 and (ema20 < ema50) and (closes[-1] < ema20) and (ema200 is None or closes[-1] < ema200)):
-                            scan_log.append(f"{ist_now()} | {pair} | Skip SELL: trend not aligned")
-                            signal = None
-
-                # Skip weak body candles (avoid false breaks)
-                if signal:
-                    curr = candle_logs[pair][-1]
-                    true_range = max(curr["high"] - curr["low"], 1e-9)
-                    body = abs(curr["close"] - curr["open"])
-                    if body / true_range < 0.35:
-                        scan_log.append(f"{ist_now()} | {pair} | Skip: weak body ({round(body/true_range, 2)})")
-                        signal = None
-
-                if signal:
-                    # Daily stop
-                    if daily_stop_hit(balances.get("USDT", 0.0)):
-                        scan_log.append(f"{ist_now()} | DAILY STOP HIT — skipping trades")
-                        continue
-
-                    # Cooldown & limits
-                    if pair_cooldown.get(pair, 0) > 0:
-                        pair_cooldown[pair] -= 1
-                        scan_log.append(f"{ist_now()} | {pair} | Cooldown active ({pair_cooldown[pair]} left)")
-                        continue
-                    if len(exit_orders) >= MAX_CONCURRENT:
-                        scan_log.append(f"{ist_now()} | LIMIT | Max concurrent positions reached")
-                        continue
-                    if trades_today["count"] >= MAX_TRADES_PER_DAY:
-                        scan_log.append(f"{ist_now()} | LIMIT | Max trades reached for today")
-                        continue
-
                     error_message = ""
-
-                    # ATR-based SL/TP
-                    recent = candle_logs[pair][-(ATR_PERIOD + 20):]
-                    atr = compute_atr(recent, ATR_PERIOD)
-                    if not atr:
-                        scan_log.append(f"{ist_now()} | {pair} | ATR not ready")
-                        continue
-
                     entry = signal["entry"]
-                    sl_dist = ATR_K * atr
-                    tp_dist = RR * sl_dist
-
-                    if signal["side"] == "BUY":
-                        sl = round(entry - sl_dist, 6)
-                        tp = round(entry + tp_dist, 6)
-                    else:
-                        sl = round(entry + sl_dist, 6)
-                        tp = round(entry - tp_dist, 6)
-
-                    # Sizing (risk-based + cap); SELL uses full coin balance (100%)
-                    usdt = balances.get("USDT", 0.0)
                     coin = pair[:-4]
+
+                    # Sizing: BUY up to 30% USDT; SELL 100% coin balance
                     if signal["side"] == "BUY":
-                        usdt_risk = usdt * RISK_PCT
-                        qty_risk = (usdt_risk / sl_dist) if sl_dist > 0 else 0.0
-                        qty_budget = (0.3 * usdt) / entry if entry else 0.0
-                        raw_qty = max(0.0, min(qty_risk, qty_budget))
+                        usdt = balances.get("USDT", 0.0)
+                        raw_qty = (0.3 * usdt) / entry if entry else 0.0
                     else:
                         raw_qty = balances.get(coin, 0.0)
 
@@ -540,20 +314,16 @@ def scan_loop():
                     # Place order (protocol unchanged)
                     res = place_order(pair, signal["side"], qty)
 
-                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} qty={qty} @ {entry} | TP={tp} SL={sl} | {res}")
+                    scan_log.append(f"{ist_now()} | {pair} | {signal['side']} qty={qty} @ {entry} | {res}")
                     trade_log.append({
-                        "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
-                        "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
+                        "time": ist_now(),
+                        "pair": pair,
+                        "side": signal["side"],
+                        "entry": entry,
+                        "msg": signal["msg"],
+                        "qty": qty,
+                        "order_result": res
                     })
-
-                    # Track exit with richer state for better management
-                    exit_orders.append({
-                        "pair": pair, "side": signal["side"], "qty": qty,
-                        "tp": tp, "sl": sl, "entry": entry,
-                        "half_taken": False, "be_moved": False, "trail_active": True
-                    })
-
-                    trades_today["count"] += 1
 
                     if "error" in res:
                         error_message = res["error"]
@@ -592,17 +362,14 @@ def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
     return jsonify({
-        "status": status["msg"], "last": status["last"],
+        "status": status["msg"],
+        "last": status["last"],
         "usdt": balances.get("USDT", 0.0),
-        "profit_today": round(daily_profit.get(ist_date(), 0), 4),
-        "profit_yesterday": round(daily_profit.get(ist_yesterday(), 0), 4),
-        "coins": coins, "trades": trade_log[-10:][::-1], "scans": scan_log[-30:][::-1],
+        "coins": coins,
+        "trades": trade_log[-10:][::-1],
+        "scans": scan_log[-30:][::-1],
         "error": error_message
     })
-
-@app.route("/api/smc-status")
-def api_smc_status():
-    return jsonify(run_smc_scan_coindcx())
 
 @app.route("/ping")
 def ping():
