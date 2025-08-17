@@ -122,12 +122,37 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
     candle_logs[pair] = candles[-500:]  # keep history
 
 def clamp_qty(pair, qty):
+    """Clamp for BUY sizing (round down to allowed step, ensure >= min)."""
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
     precision = int(rule["precision"])
     min_qty = float(rule["min_qty"])
-    qty = max(qty, min_qty)
     step = (10 ** (-precision)) if precision > 0 else 1.0
+    # floor to step so we never exceed balance when later used for SELL, too
     qty = (int(qty / step)) * step
+    if qty < min_qty:
+        return 0.0
+    return round(qty, precision)
+
+def precise_sell_qty(pair, balance_qty):
+    """
+    SELL-specific clamp:
+    - Floors to step so qty <= balance
+    - Enforces min_qty
+    """
+    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
+    precision = int(rule["precision"])
+    min_qty = float(rule["min_qty"])
+    step = (10 ** (-precision)) if precision > 0 else 1.0
+
+    # Floor to the nearest valid step, guaranteeing qty <= wallet balance
+    qty = (int(balance_qty / step)) * step
+
+    # Some exchanges are strict — subtract a single step if qty == balance to avoid “insufficient balance”
+    if qty == balance_qty and qty >= step:
+        qty = qty - 0.0  # keep same; Coindcx usually accepts exact balance, change to "- step" if you still see errors
+
+    if qty < min_qty:
+        return 0.0
     return round(qty, precision)
 
 def place_order(pair, side, qty):
@@ -323,10 +348,10 @@ def scan_loop():
                     coin  = pair[:-4]
 
                     if side == "SELL":
-                        # Reverse-exit: close any open long (sell wallet balance)
+                        # Reverse-exit: close any open long (sell wallet balance) with precise pair precision
                         had_pos = positions.get(pair) is not None
                         raw_qty = balances.get(coin, 0.0)
-                        qty = clamp_qty(pair, raw_qty)
+                        qty = precise_sell_qty(pair, raw_qty)
                         if qty > 0:
                             res = place_order(pair, "SELL", qty)
                             tag = "EXIT LONG & SELL" if had_pos else "SELL"
@@ -339,7 +364,7 @@ def scan_loop():
                                 error_message = res["error"]
                             positions[pair] = None
                         else:
-                            scan_log.append(f"{ist_now()} | {pair} | SELL signal, no {coin} balance")
+                            scan_log.append(f"{ist_now()} | {pair} | SELL signal, no {coin} balance (or below min qty)")
 
                     else:  # BUY
                         # Avoid pyramiding: if already long, skip
