@@ -5,9 +5,10 @@ import hmac
 import hashlib
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pytz import timezone
 from flask import Flask, render_template, jsonify
+from statistics import mean
 
 # =========================
 # Flask
@@ -21,7 +22,7 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = (os.environ.get("API_SECRET") or "").encode()
 BASE_URL = "https://api.coindcx.com"
 
-# Pairs to scan (spot)
+# Spot pairs to scan
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
@@ -41,29 +42,21 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# Candle intervals we track simultaneously (seconds)
-INTERVALS = [15, 30, 60]
+# Candle interval (seconds) -> 5s scalper
+CANDLE_INTERVAL_SEC = 5
 
-# History / warm start
-WARMUP_BARS = 60          # indicators ready right away (we preload)
-PRELOAD_LIMIT = 200       # bars to fetch/seed at startup
+# Loop cadence (seconds)
+POLL_SEC = 1.0
 
-# PSAR parameters
-PSAR_STEP = 0.02
-PSAR_MAX  = 0.20
+# Allocation per BUY from USDT
+BUY_USDT_ALLOC = 0.35
 
-# Fees and edge gate (~1% round trip)
-FEE_ROUND_TRIP = 0.010
-EDGE_BUFFER    = 0.002   # extra headroom
-
-# Buying & polling
-BUY_USDT_ALLOC = 0.35    # use 35% of USDT per buy
-POLL_SEC       = 0.6     # faster loop
-
-# Exits: none (entry/exit = triggers); we ride until opposite signal
+# Target & SL policy
+TP_PCT = 0.002   # +0.2% take-profit
+# SL: reverse signal (signal-based exit), not a price level
 
 # =========================
-# Time (IST)
+# Time helpers (IST)
 # =========================
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
@@ -72,18 +65,21 @@ def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 # State
 # =========================
 session = requests.Session()
-tick_logs            = {p: [] for p in PAIRS}               # [(ts, price)]
-candle_logs_map      = {p: {iv: [] for iv in INTERVALS} for p in PAIRS}  # per interval
-last_candle_ts_map   = {p: {iv: 0 for iv in INTERVALS} for p in PAIRS}
-scan_log             = []
-trade_log            = []
-positions            = {p: None for p in PAIRS}  # {"side":"BUY","qty":float,"entry":float}
-running              = False
-status               = {"msg": "Idle", "last": ""}
-error_message        = ""
+
+tick_logs   = {p: [] for p in PAIRS}   # [(ts, price)]
+candle_logs = {p: [] for p in PAIRS}   # dicts: open/high/low/close/volume/start
+scan_log    = []                       # rolling text logs for UI
+trade_log   = []                       # entries & exits
+running     = False
+status      = {"msg": "Idle", "last": ""}
+error_message = ""
+
+# Track open LONG positions only (spot)
+# positions[pair] = {"side":"BUY","qty":float,"entry":float,"tp":float}
+positions = {p: None for p in PAIRS}
 
 # =========================
-# API utils (order protocol unchanged)
+# Utils / API
 # =========================
 def hmac_signature(payload: str) -> str:
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
@@ -153,30 +149,11 @@ def place_order(pair, side, qty):
         return {"error": str(e)}
 
 # =========================
-# Indicators
+# Indicators (5s candles)
 # =========================
 def sma(values, period):
     if len(values) < period: return None
     return sum(values[-period:]) / period
-
-def ema(values, period):
-    if len(values) < period: return None
-    k = 2 / (period + 1)
-    e = float(values[0])
-    for v in values[1:]:
-        e = float(v) * k + e * (1 - k)
-    return e
-
-def compute_atr(c, period=14):
-    if len(c) < period + 1: return None
-    trs = []
-    for i in range(1, len(c)):
-        h,l,pc = c[i]["high"], c[i]["low"], c[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    atr = sum(trs[:period]) / period
-    for x in trs[period:]:
-        atr = (atr*(period-1)+x)/period
-    return atr
 
 def rsi_wilder_from_closes(closes, period=14):
     if len(closes) < period + 1: return None
@@ -195,7 +172,7 @@ def rsi_wilder_from_closes(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 def stoch_kd(c, period=14, smooth_k=3, smooth_d=3):
-    if len(c) < period + smooth_k + smooth_d: return None, None
+    if len(c) < period + max(smooth_k, smooth_d): return (None, None)
     ks = []
     for i in range(period-1, len(c)):
         win = c[i-period+1:i+1]
@@ -213,224 +190,66 @@ def stoch_kd(c, period=14, smooth_k=3, smooth_d=3):
     d_s = smooth(k_s, smooth_d)
     return k_s[-1], d_s[-1]
 
-def psar_series(highs, lows, step=0.02, max_step=0.2):
-    n = len(highs)
-    if n < 2: return [], []
-    sar = [0.0] * n; bull = [False] * n
-    uptrend = highs[1] >= highs[0]
-    bull[1] = uptrend
-    ep = highs[1] if uptrend else lows[1]
-    sar[1] = lows[0] if uptrend else highs[0]
-    af = step
-    for i in range(2, n):
-        prev_sar = sar[i-1]; prev_up = bull[i-1]
-        sar_i = prev_sar + af * (ep - prev_sar)
-        if prev_up:
-            sar_i = min(sar_i, lows[i-1], lows[i-2] if i-2 >= 0 else lows[i-1])
-        else:
-            sar_i = max(sar_i, highs[i-1], highs[i-2] if i-2 >= 0 else highs[i-1])
-        if prev_up:
-            if lows[i] < sar_i:
-                bull[i] = False; sar[i] = ep; af = step; ep = lows[i]
-            else:
-                bull[i] = True; sar[i] = sar_i
-                if highs[i] > ep:
-                    ep = highs[i]; af = min(max_step, af + step)
-        else:
-            if highs[i] > sar_i:
-                bull[i] = True; sar[i] = ep; af = step; ep = highs[i]
-            else:
-                bull[i] = False; sar[i] = sar_i
-                if lows[i] < ep:
-                    ep = lows[i]; af = min(max_step, af + step)
-    sar[0] = sar[1]; bull[0] = bull[1]
-    return sar, bull
-
 # =========================
-# Candle aggregation
+# Aggregation (5s candles)
 # =========================
-def aggregate_for_intervals(pair):
-    # Build candles for all INTERVALS from tick log
+def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
     ticks = tick_logs[pair]
     if not ticks: return
-    ticks_sorted = sorted(ticks, key=lambda x: x[0])
-    for interval in INTERVALS:
-        candles = []
-        candle = None; last_window = None
-        for ts, price in ticks_sorted:
-            wstart = ts - (ts % interval)
-            if last_window != wstart:
-                if candle: candles.append(candle)
-                candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
-                last_window = wstart
-            else:
-                candle["high"] = max(candle["high"], price)
-                candle["low"]  = min(candle["low"], price)
-                candle["close"]= price
-                candle["volume"] += 1
-        if candle: candles.append(candle)
-        candle_logs_map[pair][interval] = candles[-600:]
+    candles, candle, last_window = [], None, None
+    for ts, price in sorted(ticks, key=lambda x: x[0]):
+        wstart = ts - (ts % interval)
+        if last_window != wstart:
+            if candle: candles.append(candle)
+            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
+            last_window = wstart
+        else:
+            candle["high"] = max(candle["high"], price)
+            candle["low"]  = min(candle["low"], price)
+            candle["close"]= price
+            candle["volume"] += 1
+    if candle: candles.append(candle)
+    candle_logs[pair] = candles[-600:]  # enough history
 
 # =========================
-# Preload history (try DCX; else synthetic seed)
+# Signals (entry/exit; reverse = SL)
 # =========================
-def _try_fetch_dcx_klines(pair, interval_sec, limit=200):
-    # Known DCX public endpoint pattern (may vary). We protect with try/except and fall back.
-    try:
-        now = int(time.time())
-        start = now - limit * interval_sec * 2
-        # interval label guess: "1m","30s","15s"
-        if interval_sec == 60: ilabel = "1m"
-        elif interval_sec == 30: ilabel = "30s"
-        else: ilabel = "15s"
-        url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={ilabel}&from={start}&to={now}"
-        r = session.get(url, timeout=6)
-        if not r.ok: return None
-        data = r.json()
-        out = []
-        for k in data[-limit:]:
-            # Expected (ts, open, high, low, close, volume) — we adapt if keys differ
-            ts = int(k[0])
-            o,h,l,c,v = float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]) if len(k) > 5 else 1.0
-            out.append({"open":o,"high":h,"low":l,"close":c,"volume":v,"start":ts - (ts % interval_sec)})
-        return out[-limit:]
-    except Exception:
+def compute_signal(candles):
+    """Return 'BUY' or 'SELL' or None based on last CLOSED candle."""
+    if len(candles) < 10:  # need at least SMA10
         return None
 
-def _synthetic_seed_from_price(price, now, interval_sec, limit=200):
-    # Build mild-noise bars around price so indicators initialize instantly.
-    out=[]; ts = now - limit*interval_sec
-    base = price
-    for i in range(limit):
-        drift = (i % 7 - 3) * (base * 0.00015)  # ±0.045% wiggle
-        o = base + drift*0.2
-        c = base + drift
-        h = max(o, c) + abs(base)*0.0002
-        l = min(o, c) - abs(base)*0.0002
-        out.append({"open":o,"high":h,"low":l,"close":c,"volume":1,"start":ts})
-        ts += interval_sec
-    return out
-
-def preload_pair(pair, last_price):
-    now = int(time.time())
-    for iv in INTERVALS:
-        bars = _try_fetch_dcx_klines(pair, iv, PRELOAD_LIMIT)
-        if bars is None or len(bars) < WARMUP_BARS:
-            bars = _synthetic_seed_from_price(last_price, now, iv, PRELOAD_LIMIT)
-        candle_logs_map[pair][iv] = bars[-600:]
-        last_candle_ts_map[pair][iv] = bars[-1]["start"] if bars else 0
-    scan_log.append(f"{ist_now()} | {pair} | Preloaded bars for {INTERVALS} secs")
-
-# =========================
-# Regime & edge scoring
-# =========================
-def atr_pct(c, period=14):
-    atr = compute_atr(c, period)
-    if not atr: return None
-    px = c[-1]["close"] or 1.0
-    return atr / px
-
-def market_regime(c):
-    if len(c) < WARMUP_BARS: return "neutral"
-    closes = [x["close"] for x in c]
-    ema20 = ema(closes, 20); ema50 = ema(closes, 50)
-    if ema20 is None or ema50 is None: return "neutral"
-    ap = atr_pct(c, 14)
-    if ap is None: return "neutral"
-    if ap < 0.002: return "silent"  # <0.2% per bar
-    slope = abs((ema20 - ema50) / (closes[-1] or 1.0))
-    if slope > 1.3 * ap: return "trend"
-    return "range"
-
-def fee_gate(c):
-    ap = atr_pct(c, 14)
-    if ap is None: return False
-    needed = FEE_ROUND_TRIP + EDGE_BUFFER
-    proj = ap * 2.0  # heuristic: can we get ~2*ATR on direction flip/swing
-    return proj >= needed
-
-def pick_best_interval(pair):
-    best = None; best_score = -1e9; best_regime = "neutral"
-    for iv in INTERVALS:
-        C = candle_logs_map[pair][iv]
-        if len(C) < WARMUP_BARS: continue
-        ap = atr_pct(C, 14)
-        if ap is None: continue
-        rg = market_regime(C)
-        if not fee_gate(C): continue
-        # favor higher ATR% and trending
-        trend_bonus = 1.15 if rg == "trend" else (1.0 if rg == "range" else 0.8)
-        score = (ap - (FEE_ROUND_TRIP+EDGE_BUFFER)) * trend_bonus
-        if score > best_score:
-            best_score = score; best = iv; best_regime = rg
-    # fallback to 60s if nothing passed
-    return (best if best else 60), (best_regime if best else "neutral")
-
-# =========================
-# Signal generation on chosen interval
-# =========================
-def gen_signal_on(candles, regime):
-    if len(candles) < WARMUP_BARS: return None
     closes = [c["close"] for c in candles]
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
-    curr   = candles[-1]
-
     sma5  = sma(closes, 5)
     sma10 = sma(closes, 10)
-    rsi14 = rsi_wilder_from_closes(closes[-15:], 14)
-    k, d  = stoch_kd(candles, 14, 3, 3)
-    sar, bull = psar_series(highs, lows, step=PSAR_STEP, max_step=PSAR_MAX)
+    rsi14 = rsi_wilder_from_closes(closes[-15:], 14) if len(closes) >= 15 else None
+    k, d  = stoch_kd(candles, 14, 3, 3) if len(candles) >= 20 else (None, None)
 
-    if any(x is None for x in [sma5, sma10, rsi14, k, d]) or len(sar) < 2:
-        return None
+    # Tolerant rule: SMA cross is primary; RSI/Stoch confirm if available
+    buy_core  = sma5 is not None and sma10 is not None and (sma5 > sma10)
+    sell_core = sma5 is not None and sma10 is not None and (sma5 < sma10)
 
-    crossed_up   = (sma5 > sma10) or (closes[-1] > sma10)
-    crossed_down = (sma5 < sma10) or (closes[-1] < sma10)
-    sar_bull     = bool(bull[-1])
-    sar_bear     = not sar_bull
-    gap = abs((k or 0) - (d or 0))
+    buy_ok  = buy_core
+    sell_ok = sell_core
 
-    # TREND: continuation
-    if regime == "trend":
-        if crossed_up and sar_bull and rsi14 > 50 and k > d and gap >= 1.0:
-            return {"side":"BUY","entry":curr["close"],"msg":"TREND BUY"}
-        if crossed_down and sar_bear and rsi14 < 50 and k < d and gap >= 1.0:
-            return {"side":"SELL","entry":curr["close"],"msg":"TREND SELL"}
-        return None
+    if rsi14 is not None:
+        buy_ok  = buy_ok  and (rsi14 > 55)
+        sell_ok = sell_ok and (rsi14 < 45)
+    if k is not None and d is not None:
+        buy_ok  = buy_ok  and (k > d)  # optional: and k < 80
+        sell_ok = sell_ok and (k < d)  # optional: and k > 20
 
-    # RANGE: mean-reversion
-    if regime == "range":
-        if (rsi14 < 40 and k > d) or (crossed_up and sar_bull and rsi14 < 48):
-            return {"side":"BUY","entry":curr["close"],"msg":"RANGE BUY"}
-        if (rsi14 > 60 and k < d) or (crossed_down and sar_bear and rsi14 > 52):
-            return {"side":"SELL","entry":curr["close"],"msg":"RANGE SELL"}
-        return None
-
-    # NEUTRAL: light filters
-    if regime == "neutral":
-        if crossed_up and sar_bull and rsi14 >= 51:
-            return {"side":"BUY","entry":curr["close"],"msg":"NEUTRAL BUY"}
-        if crossed_down and sar_bear and rsi14 <= 49:
-            return {"side":"SELL","entry":curr["close"],"msg":"NEUTRAL SELL"}
-        return None
-
-    # SILENT: skip
+    if buy_ok:  return "BUY"
+    if sell_ok: return "SELL"
     return None
 
 # =========================
-# Trading loop
+# Trading Loop (5s candles)
 # =========================
 def scan_loop():
     global running, error_message
     scan_log.clear()
-
-    # ---- Preload history from last price
-    prices0 = fetch_all_prices()
-    for p in PAIRS:
-        px = prices0.get(p, {}).get("price")
-        if px:
-            preload_pair(p, px)
+    last_candle_ts = {p: 0 for p in PAIRS}
 
     while running:
         prices = fetch_all_prices()
@@ -439,69 +258,120 @@ def scan_loop():
 
         for pair in PAIRS:
             info = prices.get(pair)
-            if not info: 
+            if not info:
                 continue
 
-            # tick ingest
+            # Tick ingest
             price = info["price"]
             tick_logs[pair].append((now, price))
             if len(tick_logs[pair]) > 10000:
                 tick_logs[pair] = tick_logs[pair][-10000:]
 
-            # aggregate all intervals
-            aggregate_for_intervals(pair)
-
-            # pick best interval for this bar
-            best_iv, regime = pick_best_interval(pair)
-            C = candle_logs_map[pair][best_iv]
-            if not C: 
+            # Candle aggregation
+            aggregate_candles(pair, CANDLE_INTERVAL_SEC)
+            C = candle_logs[pair]
+            if not C:
                 continue
 
-            # only act when the chosen interval has a new closed bar
-            if C[-1]["start"] == last_candle_ts_map[pair][best_iv]:
+            # Only act on a *new* closed candle
+            if C[-1]["start"] == last_candle_ts[pair]:
+                # While waiting for a new bar, still check TP for open longs
+                pos = positions.get(pair)
+                if pos and pos["side"] == "BUY":
+                    if price >= pos["tp"]:
+                        qty = precise_sell_qty(pair, pos["qty"])
+                        if qty > 0:
+                            res = place_order(pair, "SELL", qty)
+                            scan_log.append(f"{ist_now()} | {pair} | TP HIT: SELL {qty} @ {price} (TP {pos['tp']}) | {res}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": "SELL",
+                                "entry": price, "msg": "TP +0.2%", "qty": qty, "order_result": res
+                            })
+                            positions[pair] = None
+                            if "error" in res: error_message = res["error"]
                 continue
-            last_candle_ts_map[pair][best_iv] = C[-1]["start"]
 
-            sig = gen_signal_on(C, regime)
-            if not sig:
-                scan_log.append(f"{ist_now()} | {pair} | NoSig on {best_iv}s ({regime})")
-                continue
+            # New closed candle
+            last_candle_ts[pair] = C[-1]["start"]
 
-            side  = sig["side"]; entry = sig["entry"]
-            coin  = pair[:-4]
+            # Generate signal on the *closed* bar
+            sig = compute_signal(C)
 
-            if side == "SELL":
-                # sell 100% wallet balance of this coin
+            # Manage open long: reverse-signal = SL
+            pos = positions.get(pair)
+            if pos and pos["side"] == "BUY":
+                # TP check (again on bar close)
+                if price >= pos["tp"]:
+                    qty = precise_sell_qty(pair, pos["qty"])
+                    if qty > 0:
+                        res = place_order(pair, "SELL", qty)
+                        scan_log.append(f"{ist_now()} | {pair} | TP HIT: SELL {qty} @ {price} (TP {pos['tp']}) | {res}")
+                        trade_log.append({
+                            "time": ist_now(), "pair": pair, "side": "SELL",
+                            "entry": price, "msg": "TP +0.2%", "qty": qty, "order_result": res
+                        })
+                        positions[pair] = None
+                        if "error" in res: error_message = res["error"]
+                    continue  # position closed by TP
+
+                # Reverse signal (SL as per reverse trade)
+                if sig == "SELL":
+                    qty = precise_sell_qty(pair, pos["qty"])
+                    if qty > 0:
+                        res = place_order(pair, "SELL", qty)
+                        scan_log.append(f"{ist_now()} | {pair} | SL (Reverse): SELL {qty} @ {price} | {res}")
+                        trade_log.append({
+                            "time": ist_now(), "pair": pair, "side": "SELL",
+                            "entry": price, "msg": "SL via reverse signal", "qty": qty, "order_result": res
+                        })
+                        positions[pair] = None
+                        if "error" in res: error_message = res["error"]
+                    continue  # handled SL
+
+            # No open long or it was closed above; evaluate fresh actions
+            if sig == "BUY":
+                # Enter new long
+                usdt = balances.get("USDT", 0.0)
+                if price > 0 and usdt > 0:
+                    raw_qty = (BUY_USDT_ALLOC * usdt) / price
+                    qty = clamp_buy_qty(pair, raw_qty)
+                    if qty > 0:
+                        res = place_order(pair, "BUY", qty)
+                        tp = round(price * (1.0 + TP_PCT), 6)
+                        positions[pair] = {"side": "BUY", "qty": qty, "entry": price, "tp": tp}
+                        scan_log.append(f"{ist_now()} | {pair} | BUY {qty} @ {price} | TP {tp} (+0.2%) | {res}")
+                        trade_log.append({
+                            "time": ist_now(), "pair": pair, "side": "BUY",
+                            "entry": price, "msg": "BUY entry", "qty": qty, "order_result": res
+                        })
+                        if "error" in res: error_message = res["error"]
+                else:
+                    scan_log.append(f"{ist_now()} | {pair} | BUY sig but no USDT or price invalid")
+
+            elif sig == "SELL":
+                # For spot, SELL = liquidate wallet coin (no short opens)
+                coin = pair[:-4]
                 bal_qty = balances.get(coin, 0.0)
                 qty = precise_sell_qty(pair, bal_qty)
                 if qty > 0:
                     res = place_order(pair, "SELL", qty)
-                    scan_log.append(f"{ist_now()} | {pair} | SELL {qty} @ {entry} [{best_iv}s/{regime}] | {sig['msg']}")
-                    trade_log.append({"time": ist_now(),"pair": pair,"side":"SELL","entry":entry,"qty":qty,"msg":sig["msg"],"order_result":res})
+                    scan_log.append(f"{ist_now()} | {pair} | SELL {qty} @ {price} (Spot liquidation) | {res}")
+                    trade_log.append({
+                        "time": ist_now(), "pair": pair, "side": "SELL",
+                        "entry": price, "msg": "SELL (spot liquidation)", "qty": qty, "order_result": res
+                    })
+                    positions[pair] = None  # ensure no lingering pos
                     if "error" in res: error_message = res["error"]
-                    positions[pair] = None
-                    balances = get_wallet_balances()
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL sig, {coin} balance < min qty")
+                    scan_log.append(f"{ist_now()} | {pair} | SELL sig but no {coin} balance ≥ min qty")
 
-            else:  # BUY
-                usdt = balances.get("USDT", 0.0)
-                raw_qty = (BUY_USDT_ALLOC * usdt) / entry if entry > 0 else 0.0
-                qty = clamp_buy_qty(pair, raw_qty)
-                if qty > 0:
-                    res = place_order(pair, "BUY", qty)
-                    scan_log.append(f"{ist_now()} | {pair} | BUY {qty} @ {entry} [{best_iv}s/{regime}] | {sig['msg']}")
-                    trade_log.append({"time": ist_now(),"pair": pair,"side":"BUY","entry":entry,"qty":qty,"msg":sig["msg"],"order_result":res})
-                    if "error" in res: error_message = res["error"]
-                    else:
-                        positions[pair] = {"side":"BUY","qty":qty,"entry":entry}
-                    balances = get_wallet_balances()
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY sig, qty=0 after clamp")
+            else:
+                scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
-        # trim logs
-        if len(scan_log) > 800: scan_log[:] = scan_log[-800:]
-        if len(trade_log) > 250: trade_log[:] = trade_log[-250:]
+        # Trim logs to keep memory bounded
+        if len(scan_log) > 600: scan_log[:] = scan_log[-600:]
+        if len(trade_log) > 200: trade_log[:] = trade_log[-200:]
+
         status["msg"], status["last"] = "Running", ist_now()
         time.sleep(POLL_SEC)
 
