@@ -5,11 +5,9 @@ import hmac
 import hashlib
 import requests
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pytz import timezone
 from flask import Flask, render_template, jsonify
-import math
-import random
 
 # =========================
 # Flask
@@ -23,11 +21,13 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = (os.environ.get("API_SECRET") or "").encode()
 BASE_URL = "https://api.coindcx.com"
 
+# Spot pairs to scan
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
+# Pair precision (quantity) + min qty (coin-wise)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -41,15 +41,10 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# Intervals (seconds)
-INTERVALS = [60, 300, 900]  # 1m, 5m, 15m
+# Candle interval (seconds). 60 = 1m candles.
+CANDLE_INTERVAL_SEC = 60
 
-# Fees & sizing
-FEE_ROUND_TRIP = 0.01       # ~1% round trip
-EDGE_BUFFER    = 0.003      # +0.3% headroom
-BUY_USDT_ALLOC = 0.35       # 35% of USDT per buy
-
-# Parabolic SAR params
+# PSAR parameters
 PSAR_STEP = 0.02
 PSAR_MAX  = 0.20
 
@@ -57,135 +52,95 @@ PSAR_MAX  = 0.20
 POLL_SEC = 1.0
 
 # =========================
-# Time (IST)
+# Time helpers (IST)
 # =========================
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-def ist_date(): return datetime.now(IST).strftime("%Y-%m-%d")
 
 # =========================
 # State
 # =========================
-# live + closed candles per interval
-candle_logs_map = {p: {i: [] for i in INTERVALS} for p in PAIRS}
-candle_live_map = {p: {i: None for i in INTERVALS} for p in PAIRS}
-tick_logs = {p: [] for p in PAIRS}
-
-scan_log, trade_log = [], []
-running = False
-status = {"msg": "Idle", "last": ""}
+tick_logs   = {p: [] for p in PAIRS}   # [(ts, price)]
+candle_logs = {p: [] for p in PAIRS}   # dicts: open/high/low/close/volume/start
+scan_log    = []                       # rolling text logs for UI
+trade_log   = []                       # entries & exits
+running     = False
+status      = {"msg": "Idle", "last": ""}
 error_message = ""
 
-# Positions: track last BUY to compute realized PnL at SELL
-# positions[pair] = {"qty": float, "entry": float, "arm": (interval, aggression)}
-positions = {p: None for p in PAIRS}
+# Optional position hint (not required for SELL-anyway behavior)
+positions = {p: None for p in PAIRS}   # {"side":"BUY","qty":float,"entry":float}
 
-# Session + cached balances
 session = requests.Session()
-balances_cache = {"ts": 0, "data": {}}
-BAL_TTL_SEC = 8
 
 # =========================
-# Adaptive controller (Multi-armed bandit per pair)
-# Arms = all combinations of (interval ∈ {1m,5m,15m}) × (aggression ∈ {loose, base, strict})
-# UCB1 implementation (fast, simple)
-# =========================
-AGG_LEVELS = ["loose", "base", "strict"]
-ARMS = [(i, a) for i in INTERVALS for a in AGG_LEVELS]
-
-class UCB1:
-    def __init__(self, arms):
-        self.arms = list(arms)
-        self.n = {arm: 0 for arm in self.arms}       # pulls
-        self.q = {arm: 0.0 for arm in self.arms}     # mean reward
-        self.t = 0                                   # total pulls
-
-    def select(self):
-        self.t += 1
-        # try all arms at least once
-        for arm in self.arms:
-            if self.n[arm] == 0:
-                return arm
-        # UCB score
-        scores = []
-        for arm in self.arms:
-            bonus = math.sqrt(2.0 * math.log(self.t) / self.n[arm])
-            scores.append((self.q[arm] + bonus, arm))
-        scores.sort(reverse=True)
-        return scores[0][1]
-
-    def update(self, arm, reward):
-        # reward is realized PnL% net of fees (e.g., +0.6% => 0.006)
-        self.n[arm] += 1
-        lr = 1.0 / self.n[arm]
-        self.q[arm] = self.q[arm] + lr * (reward - self.q[arm])
-
-bandits = {p: UCB1(ARMS) for p in PAIRS}
-
-# =========================
-# API utils
+# Utils / API
 # =========================
 def hmac_signature(payload: str) -> str:
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def get_wallet_balances(force=False):
-    now = time.time()
-    if not force and (now - balances_cache["ts"] < BAL_TTL_SEC):
-        return dict(balances_cache["data"])
-    payload = json.dumps({"timestamp": int(now * 1000)})
+def get_wallet_balances():
+    payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
     headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    out = {}
+    balances = {}
     try:
         r = session.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=8)
         if r.ok:
             for b in r.json():
-                out[b["currency"]] = float(b["balance"])
-            balances_cache["data"] = out
-            balances_cache["ts"] = now
+                balances[b["currency"]] = float(b["balance"])
         else:
-            scan_log.append(f"{ist_now()} | BAL_ERR: {r.status_code} {r.text[:100]}")
+            scan_log.append(f"{ist_now()} | BAL_ERR: {r.status_code} {r.text[:120]}")
     except Exception as e:
         scan_log.append(f"{ist_now()} | BAL_ERR: {e}")
-    return out
+    return balances
 
 def fetch_all_prices():
     try:
         r = session.get(f"{BASE_URL}/exchange/ticker", timeout=8)
         if r.ok:
             now = int(time.time())
-            m = {}
-            for item in r.json():
-                mk = item.get("market")
-                if mk in PAIRS:
-                    m[mk] = {"price": float(item["last_price"]), "ts": now}
-            return m
+            return {
+                item["market"]: {"price": float(item["last_price"]), "ts": now}
+                for item in r.json() if item.get("market") in PAIRS
+            }
         else:
-            scan_log.append(f"{ist_now()} | PRICE_ERR: {r.status_code} {r.text[:100]}")
+            scan_log.append(f"{ist_now()} | PRICE_ERR: {r.status_code} {r.text[:120]}")
     except Exception as e:
         scan_log.append(f"{ist_now()} | PRICE_ERR: {e}")
     return {}
 
 def clamp_buy_qty(pair, qty):
+    """Clamp for BUY sizing (floor to step, ensure >= min)."""
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
-    precision = int(rule["precision"]); min_qty = float(rule["min_qty"])
+    precision = int(rule["precision"])
+    min_qty = float(rule["min_qty"])
     step = (10 ** (-precision)) if precision > 0 else 1.0
     qty = (int(max(qty, 0.0) / step)) * step
-    if qty < min_qty: return 0.0
+    if qty < min_qty:
+        return 0.0
     return round(qty, precision)
 
 def precise_sell_qty(pair, balance_qty):
+    """
+    SELL-specific clamp:
+    - Floors to step so qty <= balance
+    - Enforces min_qty
+    """
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
-    precision = int(rule["precision"]); min_qty = float(rule["min_qty"])
+    precision = int(rule["precision"])
+    min_qty = float(rule["min_qty"])
     step = (10 ** (-precision)) if precision > 0 else 1.0
     qty = (int(max(balance_qty, 0.0) / step)) * step
-    if qty < min_qty: return 0.0
+    if qty < min_qty:
+        return 0.0
     return round(qty, precision)
 
 def place_order(pair, side, qty):
+    """Order protocol unchanged: market order with total_quantity."""
     payload = {
         "market": pair,
-        "side": side.lower(),
+        "side": side.lower(),             # "buy" / "sell"
         "order_type": "market_order",
         "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000),
@@ -230,26 +185,6 @@ def rsi_wilder_from_closes(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def stoch_kd(candles, period=14, smooth_k=3, smooth_d=3):
-    if len(candles) < period + smooth_k + smooth_d: return None, None
-    ks = []
-    for i in range(period-1, len(candles)):
-        win = candles[i-period+1:i+1]
-        hi = max(c["high"] for c in win); lo = min(c["low"] for c in win)
-        cl = candles[i]["close"]
-        k_raw = 0.0 if hi == lo else (cl - lo) / (hi - lo) * 100.0
-        ks.append(k_raw)
-    # simple smoothing
-    def smooth(arr, times):
-        out = list(arr)
-        for _ in range(times-1):
-            tmp = [out[0]] + [(out[j-1]+out[j])/2.0 for j in range(1, len(out))]
-            out = tmp
-        return out
-    k_s = smooth(ks, smooth_k)
-    d_s = smooth(k_s, smooth_d)
-    return k_s[-1], d_s[-1]
-
 def psar_series(highs, lows, step=0.02, max_step=0.2):
     n = len(highs)
     if n < 2: return [], []
@@ -283,193 +218,143 @@ def psar_series(highs, lows, step=0.02, max_step=0.2):
     sar[0] = sar[1]; bull[0] = bull[1]
     return sar, bull
 
-def atr_percent(candles, period=14):
-    if len(candles) < period + 1: return None
-    trs = []
-    for i in range(1, len(candles)):
-        h,l,pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    atr = sum(trs[:period]) / period
-    for x in trs[period:]:
-        atr = (atr*(period-1)+x)/period
-    px = candles[-1]["close"] or 1.0
-    return atr / px
-
-# aggression thresholds
-AGG_THRESH = {
-    "loose":  {"rsi_buy": 48.0, "rsi_sell": 52.0, "stoch_gap": 0.0,  "edge_mult": 1.2},
-    "base":   {"rsi_buy": 50.0, "rsi_sell": 50.0, "stoch_gap": 2.0,  "edge_mult": 1.4},
-    "strict": {"rsi_buy": 52.0, "rsi_sell": 48.0, "stoch_gap": 5.0,  "edge_mult": 1.6},
-}
-
 # =========================
-# Candle building (all intervals)
+# Candle aggregation (1m)
 # =========================
-def on_price(pair, ts, price):
-    closed_any = False
-    for interval in INTERVALS:
+def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
+    ticks = tick_logs[pair]
+    if not ticks: return
+    candles, candle, last_window = [], None, None
+    for ts, price in sorted(ticks, key=lambda x: x[0]):
         wstart = ts - (ts % interval)
-        c = candle_live_map[pair][interval]
-        if (c is None) or (c["start"] != wstart):
-            if c is not None:
-                candle_logs_map[pair][interval].append(c)
-                if len(candle_logs_map[pair][interval]) > 1000:
-                    candle_logs_map[pair][interval] = candle_logs_map[pair][interval][-1000:]
-                closed_any = True
-            candle_live_map[pair][interval] = {
-                "open": price, "high": price, "low": price, "close": price,
-                "volume": 1, "start": wstart
-            }
+        if last_window != wstart:
+            if candle: candles.append(candle)
+            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
+            last_window = wstart
         else:
-            c["high"] = max(c["high"], price)
-            c["low"]  = min(c["low"], price)
-            c["close"] = price
-            c["volume"] += 1
-    return closed_any
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price
+            candle["volume"] += 1
+    if candle: candles.append(candle)
+    candle_logs[pair] = candles[-500:]  # keep history
 
 # =========================
-# Signal using chosen arm (interval, aggression) by bandit
+# Signal (SMA5/10 + RSI14 + PSAR flip as bias)
 # =========================
-def signal_for_arm(pair, interval, aggression):
-    C = candle_logs_map[pair][interval]
-    if len(C) < 25: 
+def gen_signal(pair):
+    C = candle_logs[pair]
+    if len(C) < 20:
         return None
-
     closes = [c["close"] for c in C]
     highs  = [c["high"]  for c in C]
     lows   = [c["low"]   for c in C]
     curr   = C[-1]
 
-    # Indicators
-    sma5  = sma(closes, 5); sma10 = sma(closes, 10)
+    sma5  = sma(closes, 5)
+    sma10 = sma(closes, 10)
     rsi14 = rsi_wilder_from_closes(closes[-15:], 14)
-    k, d  = stoch_kd(C, 14, 3, 3)
     sar, bull = psar_series(highs, lows, step=PSAR_STEP, max_step=PSAR_MAX)
-    atrp = atr_percent(C, 14)
 
-    if any(x is None for x in [sma5, sma10, rsi14, k, d]) or len(sar) < 2:
-        return None
-
-    # Edge gate (fee-aware) with aggression
-    need = (FEE_ROUND_TRIP + EDGE_BUFFER) * AGG_THRESH[aggression]["edge_mult"] / 1.2
-    if not atrp or atrp * 2.0 < need:  # 2.0 is a heuristic multiplier
+    if any(x is None for x in [sma5, sma10, rsi14]) or len(sar) < 2:
         return None
 
     crossed_up   = (sma5 > sma10) or (closes[-1] > sma10)
     crossed_down = (sma5 < sma10) or (closes[-1] < sma10)
-    sar_bull     = bool((psar_series(highs, lows, PSAR_STEP, PSAR_MAX)[1])[-1])  # recompute small but ok
+    sar_bull     = bool(bull[-1])
     sar_bear     = not sar_bull
-    gap = abs((k or 0) - (d or 0))
-
-    rsi_buy  = AGG_THRESH[aggression]["rsi_buy"]
-    rsi_sell = AGG_THRESH[aggression]["rsi_sell"]
-    st_gap   = AGG_THRESH[aggression]["stoch_gap"]
 
     # BUY
-    if crossed_up and sar_bull and (rsi14 >= rsi_buy) and (k is not None and d is not None and (k > d) and (gap >= st_gap)):
-        return {"side": "BUY", "entry": curr["close"], "msg": f"BUY[{interval//60}m-{aggression}] SMA/RSI/Stoch/SAR OK"}
+    if crossed_up and sar_bull and rsi14 >= 48.0:
+        return {"side": "BUY", "entry": curr["close"], "msg": "BUY: SMA(5>10)/Close>SMA10 + SAR bull + RSI>=48"}
 
     # SELL
-    if crossed_down and sar_bear and (rsi14 <= rsi_sell) and (k is not None and d is not None and (k < d) and (gap >= st_gap)):
-        return {"side": "SELL", "entry": curr["close"], "msg": f"SELL[{interval//60}m-{aggression}] SMA/RSI/Stoch/SAR OK"}
+    if crossed_down and sar_bear and rsi14 <= 52.0:
+        return {"side": "SELL", "entry": curr["close"], "msg": "SELL: SMA(5<10)/Close<SMA10 + SAR bear + RSI<=52"}
 
     return None
 
 # =========================
-# Trading loop
+# Trading Loop (BUY when USDT; SELL when coin exists)
 # =========================
 def scan_loop():
     global running, error_message
     scan_log.clear()
-    last_price_seen = {}
+    last_candle_ts = {p: 0 for p in PAIRS}
 
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
-        balances = get_wallet_balances(force=False)
+        balances = get_wallet_balances()
 
         for pair in PAIRS:
             info = prices.get(pair)
-            if not info: 
+            if not info:
                 continue
 
-            px = info["price"]
-            last_price_seen[pair] = px
+            # Tick ingest
+            price = info["price"]
+            tick_logs[pair].append((now, price))
+            if len(tick_logs[pair]) > 5000:
+                tick_logs[pair] = tick_logs[pair][-5000:]
 
-            tl = tick_logs[pair]; tl.append((now, px))
-            if len(tl) > 90: tick_logs[pair] = tl[-90:]
+            # Candle aggregation
+            aggregate_candles(pair, CANDLE_INTERVAL_SEC)
+            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
-            closed = on_price(pair, now, px)
-            if not closed:
-                continue
+            # Act only when a *new* candle has closed
+            if last_candle and last_candle["start"] != last_candle_ts[pair]:
+                last_candle_ts[pair] = last_candle["start"]
+                signal = gen_signal(pair)
 
-            # 1) pick arm with bandit
-            arm = bandits[pair].select()
-            interval, aggression = arm
+                if signal:
+                    side  = signal["side"]
+                    entry = signal["entry"]
+                    coin  = pair[:-4]
 
-            # 2) get signal for selected arm
-            sig = signal_for_arm(pair, interval, aggression)
+                    if side == "SELL":
+                        # ✅ SELL even if we never bought in-code: if wallet has that coin, SELL it
+                        raw_qty = balances.get(coin, 0.0)
+                        qty = precise_sell_qty(pair, raw_qty)
+                        if qty > 0:
+                            res = place_order(pair, "SELL", qty)
+                            scan_log.append(f"{ist_now()} | {pair} | SELL qty={qty} @ {entry} | {res} | {signal['msg']}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": "SELL",
+                                "entry": entry, "msg": signal["msg"], "qty": qty, "order_result": res
+                            })
+                            if "error" in res:
+                                error_message = res["error"]
+                            positions[pair] = None
+                            balances = get_wallet_balances()  # refresh after trade
+                        else:
+                            scan_log.append(f"{ist_now()} | {pair} | SELL signal, but {coin} balance < min qty")
 
-            if not sig:
-                scan_log.append(f"{ist_now()} | {pair} | NoSig on {interval//60}m-{aggression}")
-                continue
-
-            side = sig["side"]; entry = sig["entry"]
-            coin = pair[:-4]
-
-            if side == "SELL":
-                # Realize PnL if we had a BUY
-                had_pos = positions.get(pair)
-                raw_qty = balances.get(coin, 0.0)
-                qty = precise_sell_qty(pair, raw_qty)
-                if qty > 0:
-                    res = place_order(pair, "SELL", qty)
-                    scan_log.append(f"{ist_now()} | {pair} | SELL {qty} @ {entry} | {res} | {sig['msg']}")
-                    trade_log.append({
-                        "time": ist_now(), "pair": pair, "side": "SELL",
-                        "entry": entry, "msg": sig["msg"], "qty": qty, "order_result": res
-                    })
-                    if "error" in res:
-                        error_message = res["error"]
-                    # reward update if we had a tracked BUY arm
-                    if had_pos:
-                        # approximate PnL% net of fee (double-count fee once for round-trip)
-                        buy_entry = had_pos["entry"]; buy_qty = had_pos["qty"]
-                        gross = (entry - buy_entry) / buy_entry if buy_entry else 0.0
-                        reward = gross - FEE_ROUND_TRIP
-                        bandits[pair].update(had_pos["arm"], reward)
-                        scan_log.append(f"{ist_now()} | {pair} | UCB UPDATE arm={had_pos['arm']} reward={round(reward*100,2)}%")
-                    positions[pair] = None
-                    get_wallet_balances(force=True)
+                    else:  # BUY
+                        # Only buy if we have USDT available
+                        usdt = balances.get("USDT", 0.0)
+                        raw_qty = (0.35 * usdt) / entry if entry else 0.0
+                        qty = clamp_buy_qty(pair, raw_qty)
+                        if qty > 0:
+                            res = place_order(pair, "BUY", qty)
+                            scan_log.append(f"{ist_now()} | {pair} | BUY qty={qty} @ {entry} | {res} | {signal['msg']}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": "BUY",
+                                "entry": entry, "msg": signal["msg"], "qty": qty, "order_result": res
+                            })
+                            if "error" in res:
+                                error_message = res["error"]
+                            else:
+                                positions[pair] = {"side": "BUY", "qty": qty, "entry": entry}
+                            balances = get_wallet_balances()  # refresh after trade
+                        else:
+                            scan_log.append(f"{ist_now()} | {pair} | BUY signal, qty=0 after clamp; skip")
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL sig, no {coin} balance")
+                    scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
-            else:
-                # BUY only if not already long
-                if positions.get(pair):
-                    scan_log.append(f"{ist_now()} | {pair} | BUY sig but already long; skip")
-                    continue
-                usdt = balances.get("USDT", 0.0)
-                raw_qty = (BUY_USDT_ALLOC * usdt) / entry if entry else 0.0
-                qty = clamp_buy_qty(pair, raw_qty)
-                if qty > 0:
-                    res = place_order(pair, "BUY", qty)
-                    scan_log.append(f"{ist_now()} | {pair} | BUY {qty} @ {entry} | {res} | {sig['msg']}")
-                    trade_log.append({
-                        "time": ist_now(), "pair": pair, "side": "BUY",
-                        "entry": entry, "msg": sig["msg"], "qty": qty, "order_result": res
-                    })
-                    if "error" in res:
-                        error_message = res["error"]
-                    else:
-                        positions[pair] = {"qty": qty, "entry": entry, "arm": arm}
-                    get_wallet_balances(force=True)
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY sig qty=0 after clamp; skip")
-
-        # trim logs
-        if len(scan_log) > 700: scan_log[:] = scan_log[-700:]
-        if len(trade_log) > 300: trade_log[:] = trade_log[-300:]
+        # Trim logs a bit to prevent runaway memory
+        if len(scan_log) > 400: scan_log[:] = scan_log[-400:]
+        if len(trade_log) > 200: trade_log[:] = trade_log[-200:]
 
         status["msg"], status["last"] = "Running", ist_now()
         time.sleep(POLL_SEC)
@@ -503,14 +388,6 @@ def get_status():
     balances = get_wallet_balances()
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
     pos_view = {p: positions[p] for p in PAIRS if positions[p]}
-    # include bandit diagnostics
-    diag = {
-        p: sorted(
-            [((i//60), a, round(bandits[p].q[(i,a)]*100,2), bandits[p].n[(i,a)]) for (i,a) in ARMS],
-            key=lambda x: (-x[2], -x[3])
-        )[:4]
-        for p in PAIRS
-    }
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
@@ -519,7 +396,6 @@ def get_status():
         "positions": pos_view,
         "trades": trade_log[-12:][::-1],
         "scans": scan_log[-40:][::-1],
-        "bandit": diag,
         "error": error_message
     })
 
