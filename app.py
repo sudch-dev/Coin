@@ -9,25 +9,25 @@ from datetime import datetime, timedelta
 from pytz import timezone
 from flask import Flask, render_template, jsonify
 
-# =========================
+# ============================================================
 # Flask
-# =========================
+# ============================================================
 app = Flask(__name__)
 
-# =========================
+# ============================================================
 # Config / Constants
-# =========================
+# ============================================================
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = (os.environ.get("API_SECRET") or "").encode()
 BASE_URL = "https://api.coindcx.com"
 
-# Pairs to scan
+# Trade universe (spot)
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-# Pair precision (quantity) + min qty (coin-wise)
+# Pair precision & min qty (adjust if your DCX market specs differ)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0001},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -41,61 +41,67 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# Candle interval (seconds). 60 = 1m candles.
-CANDLE_INTERVAL_SEC = 60
+# Engine tuning (more trades, fee-aware)
+CONFIG = {
+    "POLL_SEC": 1.0,            # fast polling
+    "BUY_USDT_ALLOC": 0.35,     # 35% of USDT per BUY
+    "FEE_RT": 0.01,             # 1% round-trip cost
+    "EDGE_BUFFER": 0.005,       # +0.5% buffer => require ~1.5% move
+    # regime thresholds (based on 1m ATR%)
+    "ATR_HYPER": 0.0060,        # >=0.60% => hyper, use 1m
+    "ATR_TREND": 0.0030,        # 0.30%..0.60% => trend, use 5m
+    # confirmation gates (looser => more trades)
+    "RSI_LONG_MIN": 50.0,       # RSI >= 50 for longs
+    "RSI_SHORT_MAX": 50.0,      # RSI <= 50 for sells/exit
+    "STOCH_KD_MIN": 20.0,       # require K,D > 20 on longs (leaving oversold)
+    "STOCH_KD_MAX": 80.0,       # require K,D < 80 on sells (leaving overbought)
+    "USE_TREND_FILTER": True,   # close vs EMA50 alignment
+}
 
-# PSAR parameters
+# Parabolic SAR (final entry/exit switch)
 PSAR_STEP = 0.02
 PSAR_MAX  = 0.20
 
-# Speed & risk knobs (tune these)
-CONFIG = {
-    "POLL_SEC": 1.0,           # fetch ticker every 1s
-    "USE_TREND_FILTER": True,  # require slow EMA up/down alignment
-    "SLOW_EMA_PERIOD": 50,     # slow EMA on 1m closes
-    "RSI_LONG_MIN": 55.0,      # >55 for longs (avoid chop)
-    "RSI_SHORT_MAX": 45.0,     # <45 for shorts
-    "MIN_BODY_RATIO": 0.35,    # body / true_range must exceed this
-    "BUY_USDT_ALLOC": 0.30,    # 30% of USDT per BUY
-}
+# Intervals we maintain (seconds)
+INTERVALS = [60, 300, 900]  # 1m, 5m, 15m
 
-# =========================
+# ============================================================
 # Time helpers (IST)
-# =========================
+# ============================================================
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 def ist_date(): return datetime.now(IST).strftime("%Y-%m-%d")
 
-# =========================
+# ============================================================
 # State
-# =========================
-# Price ingest + candles
-tick_logs   = {p: [] for p in PAIRS}      # [(ts, price)] (kept tiny now)
-candle_logs = {p: [] for p in PAIRS}      # list of closed candles
-candle_live = {p: None for p in PAIRS}    # current building candle
-last_bar_ts = {p: 0 for p in PAIRS}       # last closed candle start
+# ============================================================
+# Multi-interval candles
+candle_logs_map = {p: {i: [] for i in INTERVALS} for p in PAIRS}   # closed candles
+candle_live_map = {p: {i: None for i in INTERVALS} for p in PAIRS} # building candle
+
+# Small tick buffer (optional, for visibility)
+tick_logs = {p: [] for p in PAIRS}
 
 # UI logs
-scan_log    = []                          # rolling text logs for UI
-trade_log   = []                          # entries & reverse-exits
+scan_log  = []
+trade_log = []
 
-# runtime
 running     = False
 status      = {"msg": "Idle", "last": ""}
 error_message = ""
 
-# Positions (spot longs only)
-# positions[pair] = {"side":"BUY","qty":float,"entry":float}
+# Spot positions (long-only)
+# positions[pair] = {"side": "BUY", "qty": float, "entry": float}
 positions = {p: None for p in PAIRS}
 
-# HTTP session + cached balances (for speed)
+# HTTP session + balance cache
 session = requests.Session()
 balances_cache = {"ts": 0, "data": {}}
-BAL_TTL_SEC = 12  # refresh wallet balances at most every 12s unless forced
+BAL_TTL_SEC = 10
 
-# =========================
-# Utils / API
-# =========================
+# ============================================================
+# Utils / CoinDCX API
+# ============================================================
 def hmac_signature(payload: str) -> str:
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
@@ -103,37 +109,34 @@ def get_wallet_balances(force: bool = False):
     now = time.time()
     if not force and (now - balances_cache["ts"] < BAL_TTL_SEC):
         return dict(balances_cache["data"])
-
     payload = json.dumps({"timestamp": int(now * 1000)})
     sig = hmac_signature(payload)
     headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    balances = {}
+    out = {}
     try:
         r = session.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=8)
         if r.ok:
             for b in r.json():
-                balances[b["currency"]] = float(b["balance"])
-            # cache
-            balances_cache["data"] = balances
+                out[b["currency"]] = float(b["balance"])
+            balances_cache["data"] = out
             balances_cache["ts"] = now
         else:
             scan_log.append(f"{ist_now()} | BAL_ERR: {r.status_code} {r.text[:120]}")
     except Exception as e:
         scan_log.append(f"{ist_now()} | BAL_ERR: {e}")
-    return balances
+    return out
 
 def fetch_all_prices():
     try:
-        # /exchange/ticker returns a big list; we filter our pairs
         r = session.get(f"{BASE_URL}/exchange/ticker", timeout=8)
         if r.ok:
             now = int(time.time())
-            out = {}
+            m = {}
             for item in r.json():
-                m = item.get("market")
-                if m in PAIRS:
-                    out[m] = {"price": float(item["last_price"]), "ts": now}
-            return out
+                mk = item.get("market")
+                if mk in PAIRS:
+                    m[mk] = {"price": float(item["last_price"]), "ts": now}
+            return m
         else:
             scan_log.append(f"{ist_now()} | PRICE_ERR: {r.status_code} {r.text[:120]}")
     except Exception as e:
@@ -141,7 +144,6 @@ def fetch_all_prices():
     return {}
 
 def clamp_buy_qty(pair, qty):
-    """Round down to step, ensure >= min for BUY sizing."""
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
     precision = int(rule["precision"]); min_qty = float(rule["min_qty"])
     step = (10 ** (-precision)) if precision > 0 else 1.0
@@ -150,7 +152,6 @@ def clamp_buy_qty(pair, qty):
     return round(qty, precision)
 
 def precise_sell_qty(pair, balance_qty):
-    """Round down so qty <= balance, enforce min, respect precision."""
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0})
     precision = int(rule["precision"]); min_qty = float(rule["min_qty"])
     step = (10 ** (-precision)) if precision > 0 else 1.0
@@ -159,7 +160,7 @@ def precise_sell_qty(pair, balance_qty):
     return round(qty, precision)
 
 def place_order(pair, side, qty):
-    """Order protocol unchanged: market order with total_quantity."""
+    """Protocol unchanged: market order with total_quantity."""
     payload = {
         "market": pair,
         "side": side.lower(),             # "buy" / "sell"
@@ -176,9 +177,13 @@ def place_order(pair, side, qty):
     except Exception as e:
         return {"error": str(e)}
 
-# =========================
+# ============================================================
 # Indicators
-# =========================
+# ============================================================
+def sma(values, period):
+    if len(values) < period: return None
+    return sum(values[-period:]) / period
+
 def ema(values, period):
     if len(values) < period: return None
     k = 2 / (period + 1)
@@ -203,15 +208,35 @@ def rsi_wilder_from_closes(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def stoch_kd(candles, period=14, smooth_k=3, smooth_d=3):
+    if len(candles) < period + smooth_k + smooth_d: return None, None
+    ks = []
+    for i in range(period-1, len(candles)):
+        win = candles[i-period+1:i+1]
+        high = max(c["high"] for c in win)
+        low  = min(c["low"]  for c in win)
+        close = candles[i]["close"]
+        k_raw = 0 if high == low else (close - low) / (high - low) * 100.0
+        ks.append(k_raw)
+    # smooth K
+    k_s = ks
+    for _ in range(smooth_k-1):
+        tmp = []
+        for j in range(1, len(k_s)):
+            tmp.append((k_s[j-1] + k_s[j]) / 2.0)
+        k_s = [k_s[0]] + tmp
+    # smooth D from K
+    d_s = k_s
+    for _ in range(smooth_d-1):
+        tmp = []
+        for j in range(1, len(d_s)):
+            tmp.append((d_s[j-1] + d_s[j]) / 2.0)
+        d_s = [d_s[0]] + tmp
+    return k_s[-1], d_s[-1]
+
 def psar_series(highs, lows, step=0.02, max_step=0.2):
-    """
-    Classic PSAR (Wilder). Returns:
-      sar_list: list of SAR values
-      bull: list of bools where True = uptrend (SAR below price)
-    """
     n = len(highs)
-    if n < 2:
-        return [], []
+    if n < 2: return [], []
     sar = [0.0] * n
     bull = [False] * n
     uptrend = highs[1] >= highs[0]
@@ -243,99 +268,147 @@ def psar_series(highs, lows, step=0.02, max_step=0.2):
     sar[0] = sar[1]; bull[0] = bull[1]
     return sar, bull
 
-# =========================
-# Signal (PSAR flip + EMA14 + RSI14 + filters)
-# =========================
-def psar_ema_rsi_signal(pair):
-    """
-    BUY  when PSAR flips below price AND close > EMA14 AND RSI>RSI_LONG_MIN (+ filters)
-    SELL when PSAR flips above price AND close < EMA14 AND RSI<RSI_SHORT_MAX (+ filters)
-    """
-    candles = candle_logs[pair]
-    if len(candles) < 20:   # need enough bars for EMA/RSI/PSAR
-        return None
+# ============================================================
+# Mood / Regime & Interval selection
+# ============================================================
+def atr_percent(candles, period=14):
+    if len(candles) < period + 1: return None
+    trs = []
+    for i in range(1, len(candles)):
+        h,l,pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    atr = sum(trs[:period]) / period
+    for x in trs[period:]:
+        atr = (atr*(period-1)+x)/period
+    px = candles[-1]["close"] or 1.0
+    return atr / px
 
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
-    closes = [c["close"] for c in candles]
-    curr   = candles[-1]
+def classify_regime_1m(candles_1m):
+    atrp = atr_percent(candles_1m, 14) or 0.0
+    if atrp >= CONFIG["ATR_HYPER"]:
+        return "hyper", atrp
+    if atrp >= CONFIG["ATR_TREND"]:
+        return "trend", atrp
+    return "chop", atrp
 
-    # Indicators
+def select_interval_from_regime(regime):
+    if regime == "hyper": return 60   # 1m
+    if regime == "trend": return 300  # 5m
+    return 900                        # 15m
+
+def projected_move_ok(regime, atrp_interval):
+    if not atrp_interval: return False
+    # Aggressive multipliers (still fee-aware)
+    if regime == "hyper":  proj = 3.0 * atrp_interval
+    elif regime == "trend": proj = 2.0 * atrp_interval
+    else: return False
+    return proj >= (CONFIG["FEE_RT"] + CONFIG["EDGE_BUFFER"])  # ~1.5%
+
+# ============================================================
+# Signal: SMA5/10 + RSI14 + Stoch(14,3,3) + SAR as final gate
+# ============================================================
+def mood_signal(pair, logs_by_interval):
+    """
+    Returns dict {side, entry, interval, msg} or None.
+    - Determine regime on 1m.
+    - Choose interval (1m/5m/15m).
+    - Confirm with SMA(5/10), RSI(14), Stoch(14,3,3).
+    - SAR must align (final switch).
+    - Fee-aware: projected edge must exceed ~1.5%.
+    """
+    C1 = logs_by_interval[60]
+    if len(C1) < 25: return None
+
+    regime, atrp_1m = classify_regime_1m(C1)
+    interval = select_interval_from_regime(regime)
+    C = logs_by_interval[interval]
+    if len(C) < 25: return None
+
+    closes = [c["close"] for c in C]
+    highs  = [c["high"]  for c in C]
+    lows   = [c["low"]   for c in C]
+    curr   = C[-1]
+
+    sma5  = sma(closes, 5);  sma10 = sma(closes, 10)
+    ema50 = ema(closes, 50) if CONFIG["USE_TREND_FILTER"] else None
+    rsi14 = rsi_wilder_from_closes(closes[-15:], 14)
+    k, d  = stoch_kd(C, 14, 3, 3)
     sar, bull = psar_series(highs, lows, step=PSAR_STEP, max_step=PSAR_MAX)
-    if len(sar) < 2: return None
+    atrp_int = atr_percent(C, 14)
 
-    ema14 = ema(closes, 14)
-    rsi14 = rsi_wilder_from_closes(closes[-15:], 14)  # last 15 closes for RSI
-    if ema14 is None or rsi14 is None:
+    if any(x is None for x in [sma5, sma10, rsi14, k, d]) or sar is None:
         return None
 
-    # Optional slow trend filter
-    if CONFIG["USE_TREND_FILTER"]:
-        ema_slow = ema(closes, CONFIG["SLOW_EMA_PERIOD"])
-    else:
-        ema_slow = None
-
-    # PSAR flip detection
-    flipped_up   = (bull[-2] is False) and (bull[-1] is True)
-    flipped_down = (bull[-2] is True)  and (bull[-1] is False)
-
-    # Body strength filter
-    tr = max(curr["high"] - curr["low"], 1e-9)
-    body = abs(curr["close"] - curr["open"])
-    if (body / tr) < CONFIG["MIN_BODY_RATIO"]:
+    # Fee-aware edge check
+    if not projected_move_ok(regime, atrp_int):
         return None
 
-    # BUY trigger
-    if flipped_up and curr["close"] > ema14 and rsi14 > CONFIG["RSI_LONG_MIN"]:
-        if (ema_slow is None) or (curr["close"] > ema_slow):
-            return {"side": "BUY", "entry": curr["close"],
-                    "msg": f"BUY: PSAR up | close>{round(ema14,6)} | RSI={round(rsi14,2)}"
-                           + (f" | slowEMA={round(ema_slow,6)}" if ema_slow else "")}
+    # Cross helpers (recent cross in last bar or currently above/below)
+    crossed_up   = (closes[-2] <= sma10) and (closes[-1] > sma10) or (sma5 > sma10 and sma5 - sma10 > 0)
+    crossed_down = (closes[-2] >= sma10) and (closes[-1] < sma10) or (sma5 < sma10 and sma10 - sma5 > 0)
 
-    # SELL trigger
-    if flipped_down and curr["close"] < ema14 and rsi14 < CONFIG["RSI_SHORT_MAX"]:
-        if (ema_slow is None) or (curr["close"] < ema_slow):
-            return {"side": "SELL", "entry": curr["close"],
-                    "msg": f"SELL: PSAR down | close<{round(ema14,6)} | RSI={round(rsi14,2)}"
-                           + (f" | slowEMA={round(ema_slow,6)}" if ema_slow else "")}
+    # Long conditions
+    long_trend_ok = True if ema50 is None else (closes[-1] > ema50)
+    long_mom_ok   = (rsi14 >= CONFIG["RSI_LONG_MIN"]) and (k is not None and d is not None and k > d and k >= CONFIG["STOCH_KD_MIN"] and d >= CONFIG["STOCH_KD_MIN"])
+    sar_bull      = bool(bull[-1])  # SAR below price
+
+    if crossed_up and long_trend_ok and long_mom_ok and sar_bull:
+        return {
+            "side": "BUY",
+            "entry": curr["close"],
+            "interval": interval,
+            "msg": f"BUY[{interval//60}m] {regime}: SMA5>10, RSI={round(rsi14,1)}, Stoch K>D, SAR bullish"
+        }
+
+    # Sell/Exit conditions (spot: exit long; may also sell residual balances)
+    short_trend_ok = True if ema50 is None else (closes[-1] < ema50)
+    short_mom_ok   = (rsi14 <= CONFIG["RSI_SHORT_MAX"]) and (k is not None and d is not None and k < d and k <= CONFIG["STOCH_KD_MAX"] and d <= CONFIG["STOCH_KD_MAX"])
+    sar_bear       = not bool(bull[-1])  # SAR above price
+
+    if crossed_down and short_trend_ok and short_mom_ok and sar_bear:
+        return {
+            "side": "SELL",
+            "entry": curr["close"],
+            "interval": interval,
+            "msg": f"SELL[{interval//60}m] {regime}: SMA5<10, RSI={round(rsi14,1)}, Stoch K<D, SAR bearish"
+        }
 
     return None
 
-# =========================
-# Incremental candle builder (fast)
-# =========================
+# ============================================================
+# Incremental candle builder (no sorting; fast)
+# ============================================================
 def on_price(pair, ts, price):
     """
-    Update the live candle with a new tick.
-    If a candle closes (new minute starts), finalize it and return True.
+    Feed one tick -> update all live candles.
+    Returns True if any candle closed (so we evaluate once per batch).
     """
-    wstart = ts - (ts % CANDLE_INTERVAL_SEC)
-    c = candle_live[pair]
+    any_closed = False
+    for interval in INTERVALS:
+        wstart = ts - (ts % interval)
+        c = candle_live_map[pair][interval]
+        if (c is None) or (c["start"] != wstart):
+            # finalize previous
+            if c is not None:
+                candle_logs_map[pair][interval].append(c)
+                if len(candle_logs_map[pair][interval]) > 900:
+                    candle_logs_map[pair][interval] = candle_logs_map[pair][interval][-900:]
+                any_closed = True
+            # start new
+            candle_live_map[pair][interval] = {
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 1, "start": wstart
+            }
+        else:
+            c["high"] = max(c["high"], price)
+            c["low"]  = min(c["low"], price)
+            c["close"] = price
+            c["volume"] += 1
+    return any_closed
 
-    if (c is None) or (c["start"] != wstart):
-        # finalize previous candle if exists
-        if c is not None:
-            candle_logs[pair].append(c)
-            if len(candle_logs[pair]) > 600:
-                candle_logs[pair] = candle_logs[pair][-600:]
-        # start new live candle
-        candle_live[pair] = {
-            "open": price, "high": price, "low": price, "close": price,
-            "volume": 1, "start": wstart
-        }
-        # a new candle started -> the previous candle just closed
-        return True
-
-    # update current live candle
-    c["high"] = max(c["high"], price)
-    c["low"]  = min(c["low"], price)
-    c["close"] = price
-    c["volume"] += 1
-    return False
-
-# =========================
-# Trading Loop (entry + reverse-exit)
-# =========================
+# ============================================================
+# Trading Loop (entry + reverse-exit on opposite signal)
+# ============================================================
 def scan_loop():
     global running, error_message
     scan_log.clear()
@@ -343,89 +416,85 @@ def scan_loop():
     while running:
         prices = fetch_all_prices()
         now = int(time.time())
-
-        # lightweight balance refresh (cached)
         balances = get_wallet_balances(force=False)
 
         for pair in PAIRS:
             info = prices.get(pair)
-            if not info:
-                continue
+            if not info: continue
 
             price = info["price"]
-            # tiny tick buffer (we no longer sort or rebuild candles)
-            tl = tick_logs[pair]
-            tl.append((now, price))
-            if len(tl) > 50:
-                tick_logs[pair] = tl[-50:]
+            # keep tiny tick buffer for visibility
+            tl = tick_logs[pair]; tl.append((now, price))
+            if len(tl) > 60: tick_logs[pair] = tl[-60:]
 
-            # update incremental candle; if previous just closed, evaluate
-            candle_closed = on_price(pair, now, price)
-            if candle_closed:
-                # only act on *closed* candle
-                signal = psar_ema_rsi_signal(pair)
-                if signal:
-                    side  = signal["side"]
-                    entry = signal["entry"]
-                    coin  = pair[:-4]
+            # update candles for all intervals
+            closed = on_price(pair, now, price)
+            if not closed:
+                continue  # wait for a close to evaluate
 
-                    if side == "SELL":
-                        # Reverse-exit: close any open long (sell wallet balance) with precise pair precision
-                        had_pos = positions.get(pair) is not None
-                        raw_qty = balances.get(coin, 0.0)
-                        qty = precise_sell_qty(pair, raw_qty)
+            # evaluate mood signal
+            signal = mood_signal(pair, candle_logs_map[pair])
+
+            if signal:
+                side  = signal["side"]
+                entry = signal["entry"]
+                coin  = pair[:-4]
+
+                if side == "SELL":
+                    had_pos = positions.get(pair) is not None
+                    raw_qty = balances.get(coin, 0.0)
+                    qty = precise_sell_qty(pair, raw_qty)
+                    if qty > 0:
+                        res = place_order(pair, "SELL", qty)
+                        tag = "EXIT LONG & SELL" if had_pos else "SELL"
+                        scan_log.append(f"{ist_now()} | {pair} | {tag} qty={qty} @ {entry} | {res} | {signal['msg']}")
+                        trade_log.append({
+                            "time": ist_now(), "pair": pair, "side": "SELL",
+                            "entry": entry, "msg": signal["msg"], "qty": qty, "order_result": res
+                        })
+                        if "error" in res: error_message = res["error"]
+                        positions[pair] = None
+                        get_wallet_balances(force=True)
+                    else:
+                        scan_log.append(f"{ist_now()} | {pair} | SELL signal, no {coin} balance (or < min qty)")
+
+                else:  # BUY
+                    pos = positions.get(pair)
+                    if pos and pos["side"] == "BUY" and pos["qty"] > 0:
+                        scan_log.append(f"{ist_now()} | {pair} | BUY signal but already long; skip")
+                    else:
+                        usdt = balances.get("USDT", 0.0)
+                        raw_qty = (CONFIG["BUY_USDT_ALLOC"] * usdt) / entry if entry else 0.0
+                        qty = clamp_buy_qty(pair, raw_qty)
                         if qty > 0:
-                            res = place_order(pair, "SELL", qty)
-                            scan_log.append(f"{ist_now()} | {pair} | {'EXIT LONG & ' if had_pos else ''}SELL qty={qty} @ {entry} | {res}")
+                            res = place_order(pair, "BUY", qty)
+                            scan_log.append(f"{ist_now()} | {pair} | BUY qty={qty} @ {entry} | {res} | {signal['msg']}")
                             trade_log.append({
-                                "time": ist_now(), "pair": pair, "side": "SELL",
+                                "time": ist_now(), "pair": pair, "side": "BUY",
                                 "entry": entry, "msg": signal["msg"], "qty": qty, "order_result": res
                             })
                             if "error" in res:
                                 error_message = res["error"]
-                            positions[pair] = None
-                            # force balance refresh after trading
+                            else:
+                                positions[pair] = {"side": "BUY", "qty": qty, "entry": entry}
                             get_wallet_balances(force=True)
                         else:
-                            scan_log.append(f"{ist_now()} | {pair} | SELL signal, no {coin} balance (or below min qty)")
-                    else:
-                        # Avoid pyramiding: if already long, skip
-                        pos = positions.get(pair)
-                        if pos and pos["side"] == "BUY" and pos["qty"] > 0:
-                            scan_log.append(f"{ist_now()} | {pair} | BUY signal but already long; skip")
-                        else:
-                            usdt = balances.get("USDT", 0.0)
-                            raw_qty = (CONFIG["BUY_USDT_ALLOC"] * usdt) / entry if entry else 0.0
-                            qty = clamp_buy_qty(pair, raw_qty)
-                            if qty > 0:
-                                res = place_order(pair, "BUY", qty)
-                                scan_log.append(f"{ist_now()} | {pair} | BUY qty={qty} @ {entry} | {res}")
-                                trade_log.append({
-                                    "time": ist_now(), "pair": pair, "side": "BUY",
-                                    "entry": entry, "msg": signal["msg"], "qty": qty, "order_result": res
-                                })
-                                if "error" in res:
-                                    error_message = res["error"]
-                                else:
-                                    positions[pair] = {"side": "BUY", "qty": qty, "entry": entry}
-                                get_wallet_balances(force=True)
-                            else:
-                                scan_log.append(f"{ist_now()} | {pair} | BUY signal, qty=0 after clamp; skip")
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | No Signal")
+                            scan_log.append(f"{ist_now()} | {pair} | BUY signal, qty=0 after clamp; skip")
+            else:
+                scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
-        # trim logs for memory stability
-        if len(scan_log) > 500: scan_log[:] = scan_log[-500:]
-        if len(trade_log) > 250: trade_log[:] = trade_log[-250:]
+        # Trim logs
+        if len(scan_log) > 600: scan_log[:] = scan_log[-600:]
+        if len(trade_log) > 300: trade_log[:] = trade_log[-300:]
 
         status["msg"], status["last"] = "Running", ist_now()
         time.sleep(CONFIG["POLL_SEC"])
 
     status["msg"] = "Idle"
 
-# =========================
-# Routes
-# =========================
+# ============================================================
+# Routes (structure intact)
+# ============================================================
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -465,9 +534,9 @@ def get_status():
 def ping():
     return "pong"
 
-# =========================
+# ============================================================
 # Main
-# =========================
+# ============================================================
 if __name__ == "__main__":
     # Program ID: ABCD
     app.run(host="0.0.0.0", port=10000)
