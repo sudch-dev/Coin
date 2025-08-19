@@ -10,6 +10,11 @@ from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
 from collections import deque
+from decimal import Decimal, ROUND_DOWN, getcontext
+import math
+
+# Higher precision math for quantization
+getcontext().prec = 28
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -27,7 +32,7 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-# local fallbacks; we also fetch precision at boot
+# Local emergency fallbacks (will be overridden by markets_details)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0005},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -41,57 +46,46 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.01}
 }
 
-# -------------------- Maker / HFT settings --------------------
-MODE = "maker"                 # quoting engine (spread capture, inventory control)
+# Precision/meta fetched from exchange:
+# PAIR_META[pair] = {
+#   "qty_step", "qty_min", "qty_prec",
+#   "px_tick", "px_prec", "min_price", "max_price"
+# }
+PAIR_META = {p: {} for p in PAIRS}
 
-# fast, tight management to avoid stale quotes
-CANDLE_INTERVAL = 10           # 10s bars for trend/vol/SMC gates
-POLL_SEC = 1.0                 # quote loop cadence
-QUOTE_TTL_SEC = 4              # replace quotes quickly
-DRIFT_REQUOTE_PCT = 0.0003     # 0.03% drift => reprice
+# -------------------- Maker / HFT settings (same as before) --------------------
+MODE = "maker"
+CANDLE_INTERVAL = 10
+POLL_SEC = 1.0
+QUOTE_TTL_SEC = 4
+DRIFT_REQUOTE_PCT = 0.0003
 
-# fees + required edge
-FEE_PCT_PER_SIDE = 0.0010      # set your maker fee tier (0.10%)
-TP_BUFFER_PCT = 0.0006         # extra buffer > fees (0.06%)
-SPREAD_OFFSET_PCT = None       # if None, auto from fees; else fixed
+FEE_PCT_PER_SIDE = 0.0010
+TP_BUFFER_PCT = 0.0006
+SPREAD_OFFSET_PCT = None
 
-# ATR / slope gating to avoid getting picked off in fast moves
-ATR_WINDOW = 18                # ~3 minutes of 10s bars
-ATR_SPREAD_MULT = 1.5          # half-spread bumps with ATR
-MAX_ATR_PCT = 0.0020           # if ATR% > 0.20%, pause new bids (danger zone)
-MAX_SLOPE_PCT = 0.0020         # if |EMA5-EMA20|/last > 0.20%, only quote away from trend
+ATR_WINDOW = 18
+ATR_SPREAD_MULT = 1.5
+MAX_ATR_PCT = 0.0020
+MAX_SLOPE_PCT = 0.0020
 
 EMA_FAST, EMA_SLOW = 5, 20
 
-# sizing & inventory control
-MAX_PER_PAIR_USDT = 40.0       # per-pair cap
-QUOTE_USDT = 12.0              # per-quote notional
-INVENTORY_USDT_CAP = 120.0     # total gross inventory cap
-INVENTORY_REDUCE_BIAS = 2.5    # stronger bias to unwind inventory
+MAX_PER_PAIR_USDT = 40.0
+QUOTE_USDT = 12.0
+INVENTORY_USDT_CAP = 120.0
+INVENTORY_REDUCE_BIAS = 2.5
 
-# anti-sudden-drop protections
-FAST_MOVE_PCT = 0.0015         # 0.15% move within window -> cancel & freeze
+FAST_MOVE_PCT = 0.0015
 FAST_MOVE_WINDOW_SEC = 5
 FREEZE_SEC_AFTER_FAST_MOVE = 6
 
-KILL_SWITCH_PCT = 0.0030       # 0.3% below latest BUY fill entry -> market-reduce
-KILL_SWITCH_SELL_FRAC = 0.6    # sell 60% of recent-filled size
-KILL_SWITCH_COOLDOWN_SEC = 20  # cooldown to avoid repeated triggers
+KILL_SWITCH_PCT = 0.0030
+KILL_SWITCH_SELL_FRAC = 0.6
+KILL_SWITCH_COOLDOWN_SEC = 20
 
-# last-resort inventory reducer (market)
 ORPHAN_MAX_SEC = 900
-
-# keep Render awake
 KEEPALIVE_SEC = 240
-
-# -------------------- SMC settings --------------------
-SMC_LOOKBACK = 60              # number of completed candles to scan swings/BOS
-SMC_LEFT = 2                   # swing pivot strength (left/right)
-SMC_RIGHT = 2
-SMC_DISPLACEMENT_MULT = 1.2    # BOS displacement must exceed (mult * ATR)
-FVG_LOOKBACK = 30              # scan last N completed candles for FVG
-FVG_MIN_FILL = 0.5             # require ≥50% fill before quoting into an FVG
-SMC_LOG = True                 # add SMC decisions into scan_log
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
@@ -108,9 +102,8 @@ status = {"msg": "Idle", "last": ""}
 status_epoch = 0
 error_message = ""
 
-# active quotes {pair: {"bid": {...}, "ask": {...}}}
 active_quotes = {p: {"bid": None, "ask": None} for p in PAIRS}
-inventory_timer = {}           # pair -> ts when long inventory began
+inventory_timer = {}
 last_price_state = {p: {"last": None, "ts": 0} for p in PAIRS}
 pair_freeze_until = {p: 0 for p in PAIRS}
 kill_cooldown_until = {p: 0 for p in PAIRS}
@@ -119,9 +112,9 @@ last_buy_fill = {p: {"entry": None, "qty": 0.0, "ts": 0} for p in PAIRS}
 # -------------------- Persistent P&L (FIFO) --------------------
 PROFIT_STATE_FILE = "profit_state.json"
 profit_state = {
-    "cumulative_pnl": 0.0,  # USDT
+    "cumulative_pnl": 0.0,
     "daily": {},
-    "inventory": {},        # market -> [[qty, avg_price], ...]
+    "inventory": {},
     "processed_orders": []
 }
 
@@ -233,46 +226,157 @@ def _keepalive_ping():
     except Exception:
         pass
 
+# -------------------- Precision meta fetch & quantizers --------------------
 def fetch_pair_precisions():
+    """
+    Populate PAIR_META from CoinDCX markets_details.
+    Falls back to PAIR_RULES if any field missing.
+    """
     try:
-        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
-        if r.ok:
-            for item in r.json():
-                if item.get("pair") in PAIRS:
-                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=12)
+        if not r.ok:
+            _log_http_issue("markets_details", r)
+            return
+        data = r.json()
     except Exception as e:
         scan_log.append(f"{ist_now()} | markets_details fail: {e}")
+        return
 
-def get_wallet_balances():
-    payload = json.dumps({"timestamp": int(time.time() * 1000)})
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    balances = {}
+    for item in data:
+        m = item.get("pair") or item.get("market") or item.get("coindcx_name")
+        if m not in PAIRS:
+            continue
+
+        # Try to extract common fields; many exchanges expose some variation
+        qty_min = _safe_float(item.get("min_quantity"), default=PAIR_RULES.get(m, {}).get("min_qty", 0.0))
+        qty_step = _safe_float(item.get("step_size"), default=None)
+        px_tick = _safe_float(item.get("tick_size"), default=None)
+        px_min  = _safe_float(item.get("min_price"), default=None)
+        px_max  = _safe_float(item.get("max_price"), default=None)
+
+        # Precisions (base for qty, target for price usually)
+        qty_prec = _safe_int(item.get("base_currency_precision"), default=PAIR_RULES.get(m, {}).get("precision", 6))
+        px_prec  = _safe_int(item.get("target_currency_precision"), default=6)
+
+        # If step/tick absent, derive from precision (1e-precision)
+        if qty_step is None:
+            qty_step = 10 ** (-qty_prec)
+        if px_tick is None:
+            px_tick = 10 ** (-px_prec)
+
+        PAIR_META[m] = {
+            "qty_step": qty_step,
+            "qty_min": qty_min,
+            "qty_prec": qty_prec,
+            "px_tick": px_tick,
+            "px_prec": px_prec,
+            "min_price": px_min,
+            "max_price": px_max
+        }
+
+def _safe_float(x, default=None):
     try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
-        if r.ok:
-            for b in r.json():
-                balances[b['currency']] = float(b['balance'])
-        else:
-            _log_http_issue("balances", r)
-    except Exception as e:
-        scan_log.append(f"{ist_now()} | balances fail: {e}")
-    return balances
+        if x is None: return default
+        return float(x)
+    except:
+        return default
 
+def _safe_int(x, default=None):
+    try:
+        if x is None: return default
+        return int(x)
+    except:
+        return default
+
+def _q_dec(step):
+    """
+    Return a Decimal quantum ("step") suitable for quantize().
+    e.g. step=0.001 -> Decimal('0.001')
+    """
+    return Decimal(str(step)).normalize()
+
+def quantize_qty(pair, qty, side=None, balance=None):
+    """
+    Floor quantity to step and precision; enforce min qty; cap by balance for SELL.
+    Never rounds up (avoid "precision over max" / "min qty" rejections).
+    """
+    meta = PAIR_META.get(pair, {})
+    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
+
+    step = meta.get("qty_step", 10 ** (-rule["precision"]))
+    min_q = meta.get("qty_min", rule["min_qty"])
+    prec  = meta.get("qty_prec", rule["precision"])
+
+    q = Decimal(str(max(0.0, qty)))
+    step_dec = _q_dec(step)
+    if step_dec > 0:
+        q = (q // step_dec) * step_dec  # ROUND_DOWN to step grid
+    # SELL cannot exceed balance (floored to step)
+    if side == "SELL" and balance is not None:
+        bal = Decimal(str(max(0.0, balance)))
+        if step_dec > 0:
+            bal = (bal // step_dec) * step_dec
+        q = min(q, bal)
+
+    # Enforce min qty
+    if q < Decimal(str(min_q)):
+        # try to bump up to min_q if BUY and we have balance; else stays 0
+        if side == "BUY" and balance is not None:
+            q = Decimal(str(min_q))
+        else:
+            q = Decimal("0")
+
+    # Final precision clamp (ROUND_DOWN)
+    fmt = Decimal("1e-" + str(prec)) if prec > 0 else Decimal("1")
+    try:
+        q = q.quantize(fmt, rounding=ROUND_DOWN)
+    except:
+        pass
+    return float(q)
+
+def quantize_price(pair, price, side=None):
+    """
+    Floor price to tick/precision and clamp inside min/max if exchange provides it.
+    Never rounds up across the grid; for bids, ensure we don't cross the spread.
+    """
+    meta = PAIR_META.get(pair, {})
+    px_tick = meta.get("px_tick", 10 ** (-meta.get("px_prec", 6)))
+    px_prec = meta.get("px_prec", 6)
+    px_min  = meta.get("min_price", None)
+    px_max  = meta.get("max_price", None)
+
+    p = Decimal(str(max(0.0, price)))
+    tick = _q_dec(px_tick)
+    if tick > 0:
+        p = (p // tick) * tick  # ROUND_DOWN to tick grid
+
+    # Clamp to price bounds if any
+    if px_min is not None:
+        p = max(p, Decimal(str(px_min)))
+    if px_max is not None:
+        p = min(p, Decimal(str(px_max)))
+
+    fmt = Decimal("1e-" + str(px_prec)) if px_prec > 0 else Decimal("1")
+    try:
+        p = p.quantize(fmt, rounding=ROUND_DOWN)
+    except:
+        pass
+    return float(p)
+
+# -------------------- Market data / indicators --------------------
 def fetch_all_prices():
     try:
         r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
         if r.ok:
             now = int(time.time())
-            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
-                    for item in r.json() if item.get("market") in PAIRS}
+            return {item.get("market") or item.get("pair"): {"price": float(item["last_price"]), "ts": now}
+                    for item in r.json() if (item.get("market") or item.get("pair")) in PAIRS}
         else:
             _log_http_issue("ticker", r)
     except Exception as e:
         scan_log.append(f"{ist_now()} | ticker fail: {e}")
     return {}
 
-# -------------------- Candles / Indicators --------------------
 def aggregate_candles(pair, interval=CANDLE_INTERVAL):
     ticks = tick_logs[pair]
     if not ticks:
@@ -292,7 +396,7 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
             candle["volume"] += 1
     if candle:
         candles.append(candle)
-    candle_logs[pair] = candles[-240:]  # ~40 m of 10s bars
+    candle_logs[pair] = candles[-240:]
 
 def _ema(vals, n):
     if len(vals) < n:
@@ -317,134 +421,9 @@ def _atr_and_pct(pair, last, window=ATR_WINDOW):
     atr_pct = (atr/last) if (atr and last > 0) else None
     return atr, atr_pct
 
-# ----------- SMC helpers (swings, BOS, sweeps, FVG) -----------
-def _find_swings(cs, left=2, right=2):
-    """Return indices for swing highs and lows in completed candles."""
-    highs, lows = [], []
-    n = len(cs)
-    for i in range(left, n-right):
-        h = cs[i]["high"]
-        l = cs[i]["low"]
-        if all(h >= cs[i-k]["high"] for k in range(1, left+1)) and all(h >= cs[i+k]["high"] for k in range(1, right+1)):
-            highs.append(i)
-        if all(l <= cs[i-k]["low"] for k in range(1, left+1)) and all(l <= cs[i+k]["low"] for k in range(1, right+1)):
-            lows.append(i)
-    return highs, lows
-
-def _recent_bos(cs, highs, lows, atr, side="up", lookback=60, displacement_mult=1.2):
-    """
-    Detect recent Break of Structure:
-    - side="up": close > last swing high + displacement
-    - side="down": close < last swing low  - displacement
-    Returns (True/False, level_index, level_price)
-    """
-    if not cs or atr is None:
-        return False, None, None
-    start = max(0, len(cs)-lookback)
-    segment = cs[start:-1] if len(cs) > 1 else cs
-    if side == "up" and highs:
-        hidx = [i for i in highs if i >= start]
-        if not hidx: return False, None, None
-        last_high_i = hidx[-1]
-        key_level = cs[last_high_i]["high"]
-        for i in range(last_high_i+1, len(cs)-1):
-            if cs[i]["close"] > key_level + displacement_mult*atr:
-                return True, last_high_i, key_level
-    if side == "down" and lows:
-        lidx = [i for i in lows if i >= start]
-        if not lidx: return False, None, None
-        last_low_i = lidx[-1]
-        key_level = cs[last_low_i]["low"]
-        for i in range(last_low_i+1, len(cs)-1):
-            if cs[i]["close"] < key_level - displacement_mult*atr:
-                return True, last_low_i, key_level
-    return False, None, None
-
-def _recent_sweep(cs, highs, lows, lookback=60):
-    """
-    Liquidity sweep:
-    - Sell-side sweep (SSL): price takes out recent low (wick closes back within prior range)
-    - Buy-side sweep (BSL): price takes out recent high (wick closes back)
-    Returns one of: "SSL", "BSL", None
-    """
-    if len(cs) < 5:
-        return None
-    start = max(0, len(cs)-lookback-1)
-    prev = cs[start: -1]  # completed candles excluding last closed
-    last_closed = cs[-2]  # the most recent completed candle
-    if not prev:
-        return None
-    recent_low = min(c["low"] for c in prev[-10:])
-    recent_high = max(c["high"] for c in prev[-10:])
-
-    # SSL: low pierces below recent_low but closes back above it
-    if last_closed["low"] < recent_low and last_closed["close"] > recent_low:
-        return "SSL"
-    # BSL: high pierces above recent_high but closes back below it
-    if last_closed["high"] > recent_high and last_closed["close"] < recent_high:
-        return "BSL"
-    return None
-
-def _recent_fvg(cs, lookback=30):
-    """
-    Fair Value Gap (3-candle): bullish if L1 > H-1; bearish if H1 < L-1
-    Return dict {"type": "bull"/"bear", "gap": (low, high), "filled_pct": 0..1}
-    using last discovered FVG within lookback, else None.
-    """
-    n = len(cs)
-    start = max(0, n - lookback)
-    fvg = None
-    for i in range(start+2, n):  # need i-2, i-1, i
-        c0, c1, c2 = cs[i-2], cs[i-1], cs[i]
-        # bullish FVG: low(c2) > high(c0)
-        if c2["low"] > c0["high"]:
-            gap_low, gap_high = c0["high"], c2["low"]
-            # fill measure on subsequent candles (including c2 close onward)
-            post = cs[i:]
-            min_after = min([x["low"] for x in post]) if post else c2["low"]
-            filled = max(0.0, min(1.0, (gap_high - max(gap_low, min_after)) / max(1e-12, (gap_high-gap_low))))
-            fvg = {"type": "bull", "gap": (gap_low, gap_high), "filled_pct": filled}
-        # bearish FVG: high(c2) < low(c0)
-        if c2["high"] < c0["low"]:
-            gap_low, gap_high = c2["high"], c0["low"]
-            post = cs[i:]
-            max_after = max([x["high"] for x in post]) if post else c2["high"]
-            filled = max(0.0, min(1.0, (min(gap_high, max_after) - gap_low) / max(1e-12, (gap_high-gap_low))))
-            fvg = {"type": "bear", "gap": (gap_low, gap_high), "filled_pct": filled}
-    return fvg
-
-def _smc_bias(pair, last, atr):
-    """
-    Compute SMC context using completed candles:
-    - BOS up/down using swings + displacement
-    - recent liquidity sweep (SSL/BSL)
-    - last FVG and its filled percentage
-    Returns dict with 'bias' ('bull'/'bear'/None), 'sweep', 'fvg'
-    """
-    cs = candle_logs.get(pair) or []
-    if len(cs) < max(SMC_LOOKBACK, ATR_WINDOW) + 3:
-        return {"bias": None, "sweep": None, "fvg": None}
-
-    completed = cs[:-1] if len(cs) >= 2 else cs
-    highs, lows = _find_swings(completed[-SMC_LOOKBACK:], SMC_LEFT, SMC_RIGHT)
-    # adjust indices relative to completed window
-    offset = len(completed[-SMC_LOOKBACK:])
-    highs = [i + len(completed) - offset for i in highs]
-    lows  = [i + len(completed) - offset for i in lows]
-
-    bos_up, _, key_high = _recent_bos(completed, highs, lows, atr, side="up",
-                                      lookback=SMC_LOOKBACK, displacement_mult=SMC_DISPLACEMENT_MULT)
-    bos_dn, _, key_low  = _recent_bos(completed, highs, lows, atr, side="down",
-                                      lookback=SMC_LOOKBACK, displacement_mult=SMC_DISPLACEMENT_MULT)
-    bias = "bull" if (bos_up and not bos_dn) else "bear" if (bos_dn and not bos_up) else None
-
-    sweep = _recent_sweep(completed, highs, lows, lookback=SMC_LOOKBACK)
-    fvg   = _recent_fvg(completed, lookback=FVG_LOOKBACK)
-
-    return {"bias": bias, "sweep": sweep, "fvg": fvg}
-
-# -------------------- Exchange calls --------------------
+# -------------------- Exchange calls (names unchanged) --------------------
 def place_order(pair, side, qty):
+    qty = quantize_qty(pair, qty, side=side)  # ensure precision for market too
     payload = {
         "market": pair, "side": side.lower(), "order_type": "market_order",
         "total_quantity": str(qty), "timestamp": int(time.time() * 1000)
@@ -452,11 +431,13 @@ def place_order(pair, side, qty):
     return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
 
 def place_limit_order(pair, side, qty, price):
+    qty = quantize_qty(pair, qty, side=side)
+    price = quantize_price(pair, price, side=side)
     payload = {
         "market": pair, "side": side.lower(), "order_type": "limit_order",
         "price_per_unit": str(price), "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000)
-        # If supported by CoinDCX, add post-only flag here to avoid taker fills.
+        # add post-only here if CoinDCX supports it
     }
     return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
 
@@ -516,21 +497,26 @@ def _effective_half_spread_pct(adapt_with_atr_pct=None):
 
 def _quote_prices(last, atr_pct=None):
     off = _effective_half_spread_pct(atr_pct)
-    bid = round(last * (1.0 - off), 6)
-    ask = round(last * (1.0 + off), 6)
+    bid = round(last * (1.0 - off), 8)  # rough, will be quantized by tick later
+    ask = round(last * (1.0 + off), 8)
     return bid, ask
 
 def _qty_for_pair(pair, price, usdt_avail, coin_avail, side, trend_skew):
-    q = max(1e-12, QUOTE_USDT) / max(price, 1e-9)
-    q *= trend_skew
-    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
-    q = min(q, MAX_PER_PAIR_USDT / max(price, 1e-9))
+    # base size from notional, then quantize safely
+    raw_q = max(1e-12, QUOTE_USDT) / max(price, 1e-9)
+    raw_q *= trend_skew
+
+    # cap by global per-pair notional
+    raw_q = min(raw_q, MAX_PER_PAIR_USDT / max(price, 1e-9))
+
+    # cap by balances
     if side == "BUY":
-        q = min(q, usdt_avail / max(price, 1e-9))
+        raw_q = min(raw_q, usdt_avail / max(price, 1e-9))
+        q = quantize_qty(pair, raw_q, side="BUY", balance=usdt_avail / max(price, 1e-9))
     else:
-        q = min(q, coin_avail)
-    q = max(q, rule["min_qty"])
-    q = round(q, rule["precision"])
+        raw_q = min(raw_q, coin_avail)
+        q = quantize_qty(pair, raw_q, side="SELL", balance=coin_avail)
+
     return q
 
 def _net_inventory_units(pair):
@@ -559,7 +545,12 @@ def cancel_all_quotes(pair):
     _cancel_quote(pair, "ask")
 
 def _place_quote(pair, side_word, price, qty):
-    # side_word: "BUY" or "SELL"
+    # Quantize both
+    price = quantize_price(pair, price, side=side_word)
+    qty = quantize_qty(pair, qty, side=side_word)
+    if qty <= 0:
+        scan_log.append(f"{ist_now()} | {pair} | skip quote {side_word}: qty<=0 after quantize")
+        return None
     res = place_limit_order(pair, side_word, qty, price)
     oid = _extract_order_id(res)
     side_key = "bid" if side_word == "BUY" else "ask"
@@ -568,11 +559,6 @@ def _place_quote(pair, side_word, price, qty):
     return oid
 
 def _check_quote_fill(pair, side_key, last_price):
-    """
-    side_key: 'bid' or 'ask'
-    Translates to order side 'BUY' (bid) or 'SELL' (ask) for P&L accounting.
-    Also updates last_buy_fill for kill-switch after BUY fills.
-    """
     q = active_quotes.get(pair, {}).get(side_key)
     if not q or not q.get("id"):
         return False
@@ -589,7 +575,6 @@ def _check_quote_fill(pair, side_key, last_price):
         active_quotes[pair][side_key] = None
         scan_log.append(f"{ist_now()} | {pair} | FILL {order_side} {filled_qty} @ {avg_px} | st={st}")
 
-        # Track the latest BUY fill for kill-switch
         if order_side == "BUY" and filled_qty > 0 and avg_px > 0:
             last_buy_fill[pair] = {"entry": float(avg_px), "qty": float(filled_qty), "ts": int(time.time())}
         return True
@@ -605,13 +590,10 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
         return
     if now_ts - inventory_timer[pair] < ORPHAN_MAX_SEC:
         return
-    # last resort: market-out a chunk
     coin = pair[:-4]
     coin_bal = balances.get(coin, 0.0)
     qty = min(0.3 * q_units, coin_bal)
-    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
-    qty = max(qty, rule["min_qty"])
-    qty = round(qty, rule["precision"])
+    qty = quantize_qty(pair, qty, side="SELL", balance=coin_bal)
     if qty <= 0: return
     res = place_order(pair, "SELL", qty)
     oid = _extract_order_id(res)
@@ -631,7 +613,6 @@ def scan_loop():
     running = True
 
     while running:
-        # keep Render awake
         now_real = time.time()
         if now_real - last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
@@ -641,7 +622,6 @@ def scan_loop():
         now_ts = int(time.time())
         balances = get_wallet_balances()
 
-        # ticks & candles
         for pair in PAIRS:
             if pair in prices:
                 px = prices[pair]["price"]
@@ -650,39 +630,33 @@ def scan_loop():
                     tick_logs[pair] = tick_logs[pair][-4000:]
                 aggregate_candles(pair, CANDLE_INTERVAL)
 
-        # risk guard
         gross_usdt = _gross_inventory_usdt(prices)
         if gross_usdt > INVENTORY_USDT_CAP:
             scan_log.append(f"{ist_now()} | RISK | Gross inventory {round(gross_usdt,2)} > cap {INVENTORY_USDT_CAP} — pause new bids")
 
-        # per-pair logic
         for pair in PAIRS:
             if pair not in prices:
                 continue
 
             last = prices[pair]["price"]
 
-            # -------- Fast-move detection & freeze --------
+            # Fast move cancel/freeze
             prev = last_price_state[pair]["last"]
             pts  = last_price_state[pair]["ts"]
             last_price_state[pair] = {"last": last, "ts": now_ts}
-
             if prev and (now_ts - pts) <= FAST_MOVE_WINDOW_SEC:
                 move_pct = abs(last - prev) / max(prev, 1e-9)
                 if move_pct >= FAST_MOVE_PCT:
                     cancel_all_quotes(pair)
                     pair_freeze_until[pair] = now_ts + FREEZE_SEC_AFTER_FAST_MOVE
                     scan_log.append(f"{ist_now()} | {pair} | FAST MOVE {round(move_pct*100,3)}% — freeze until {pair_freeze_until[pair]}")
-                    # skip quoting this tick
                     continue
 
             if now_ts < pair_freeze_until[pair]:
-                # while frozen, still check fills (in case partials were resting)
                 for side_key in ("bid", "ask"):
                     _check_quote_fill(pair, side_key, last)
                 continue
 
-            # -------- Indicators / gates --------
             closes = [c["close"] for c in (candle_logs.get(pair) or [])[:-1]]
             ema_fast = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_FAST) if len(closes) >= EMA_SLOW else None
             ema_slow = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_SLOW) if len(closes) >= EMA_SLOW else None
@@ -693,35 +667,29 @@ def scan_loop():
 
             atr_abs, atr_pct = _atr_and_pct(pair, last, ATR_WINDOW)
 
-            # -------- SMC context --------
-            smc = _smc_bias(pair, last, atr_abs)
-            smc_bias = smc.get("bias")
-            smc_sweep = smc.get("sweep")
-            smc_fvg = smc.get("fvg")
-
-            # base quotes with adaptive spread
             bid_px, ask_px = _quote_prices(last, atr_pct)
+            # Final tick-quantize the quotes (non-cross, then quantize)
+            bid_px = min(bid_px, last * (1 - 1e-6))
+            ask_px = max(ask_px, last * (1 + 1e-6))
+            bid_px = quantize_price(pair, bid_px, side="BUY")
+            ask_px = quantize_price(pair, ask_px, side="SELL")
 
             usdt = balances.get("USDT", 0.0)
             coin = pair[:-4]
             coin_bal = balances.get(coin, 0.0)
             net_units = _net_inventory_units(pair)
 
-            # inventory & trend bias
             reduce_bias_bid = INVENTORY_REDUCE_BIAS if net_units < 0 else 1.0
             reduce_bias_ask = INVENTORY_REDUCE_BIAS if net_units > 0 else 1.0
             trend_bias_bid = 1.2 if bullish else 0.9
             trend_bias_ask = 1.2 if not bullish else 0.9
 
-            # -------- Allowed sides (ATR/slope + SMC) --------
             allow_bid, allow_ask = True, True
             if gross_usdt > INVENTORY_USDT_CAP:
                 allow_bid = False
             if atr_pct is not None and atr_pct > MAX_ATR_PCT:
-                allow_bid = False  # turbulence: avoid catching knives
-
+                allow_bid = False
             if slope_pct is not None and slope_pct > MAX_SLOPE_PCT:
-                # steep trend: quote only away from direction
                 if bullish:
                     allow_ask = False
                     allow_bid = True
@@ -729,37 +697,7 @@ def scan_loop():
                     allow_bid = False
                     allow_ask = True
 
-            # SMC bias: prefer side with structure (BOS) and react to sweeps
-            if smc_bias == "bull":
-                allow_ask = min(allow_ask, True)
-                allow_bid = True
-            elif smc_bias == "bear":
-                allow_bid = min(allow_bid, True)
-                allow_ask = True
-
-            # Liquidity sweeps: SSL -> favor BUY (mean reversion); BSL -> favor SELL
-            if smc_sweep == "SSL":
-                allow_ask = False  # avoid offering into recovery; let it revert then sell later
-                allow_bid = True
-            elif smc_sweep == "BSL":
-                allow_bid = False
-                allow_ask = True
-
-            # FVG filter: avoid quoting INTO an unfilled adverse FVG
-            # - If bullish FVG and filled < 50%, prefer buys, avoid sells into the gap
-            # - If bearish FVG and filled < 50%, prefer sells, avoid buys into the gap
-            if smc_fvg and smc_fvg.get("filled_pct", 1.0) < FVG_MIN_FILL:
-                if smc_fvg.get("type") == "bull":
-                    allow_ask = False
-                    allow_bid = allow_bid and True
-                elif smc_fvg.get("type") == "bear":
-                    allow_bid = False
-                    allow_ask = allow_ask and True
-
-            if SMC_LOG:
-                scan_log.append(f"{ist_now()} | {pair} | SMC bias={smc_bias} sweep={smc_sweep} fvg={smc_fvg}")
-
-            # cancel stale/moved quotes
+            # Cancel stale/moved quotes
             for side_key, q in list(active_quotes[pair].items()):
                 if not q:
                     continue
@@ -769,20 +707,18 @@ def scan_loop():
                 if age >= QUOTE_TTL_SEC or drift >= DRIFT_REQUOTE_PCT:
                     _cancel_quote(pair, side_key)
 
-            # check fills (also updates last_buy_fill on BUY)
+            # Check fills
             for side_key in ("bid", "ask"):
                 _check_quote_fill(pair, side_key, last)
 
-            # -------- Inventory kill-switch after BUY fill --------
+            # Kill-switch (after BUY fills)
             lb = last_buy_fill.get(pair, {})
             if lb and lb.get("entry") and now_ts >= kill_cooldown_until[pair]:
                 entry = float(lb["entry"]); filled_qty = float(lb["qty"])
                 if last <= entry * (1.0 - KILL_SWITCH_PCT):
                     qty_to_sell = filled_qty * KILL_SWITCH_SELL_FRAC
                     qty_to_sell = min(qty_to_sell, coin_bal)
-                    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
-                    qty_to_sell = max(qty_to_sell, rule["min_qty"])
-                    qty_to_sell = round(qty_to_sell, rule["precision"])
+                    qty_to_sell = quantize_qty(pair, qty_to_sell, side="SELL", balance=coin_bal)
                     if qty_to_sell > 0:
                         _cancel_quote(pair, "bid")
                         res = place_order(pair, "SELL", qty_to_sell)
@@ -794,19 +730,14 @@ def scan_loop():
                         kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
                         last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
 
-            # sizing for quotes
+            # Size quotes with precision-aware qty
             qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY", reduce_bias_bid * trend_bias_bid) if allow_bid else 0.0
             qty_ask = _qty_for_pair(pair, ask_px, usdt, coin_bal, "SELL", reduce_bias_ask * trend_bias_ask) if allow_ask else 0.0
 
-            # place quotes if empty
             if qty_bid > 0 and not active_quotes[pair]["bid"]:
-                bpx = min(bid_px, round(last * (1 - 1e-6), 6))  # do not cross
-                _place_quote(pair, "BUY", bpx, qty_bid)
-
-            if qty_ask > 0 and coin_bal >= PAIR_RULES.get(pair, {"min_qty": 0.0})["min_qty"]:
-                if not active_quotes[pair]["ask"]:
-                    apx = max(ask_px, round(last * (1 + 1e-6), 6))
-                    _place_quote(pair, "SELL", apx, qty_ask)
+                _place_quote(pair, "BUY", bid_px, qty_bid)
+            if qty_ask > 0 and coin_bal > 0 and not active_quotes[pair]["ask"]:
+                _place_quote(pair, "SELL", ask_px, qty_ask)
 
             _manage_orphan_inventory(pair, now_ts, prices, balances)
 
@@ -893,7 +824,6 @@ def _start_loop_once():
             t = threading.Thread(target=scan_loop, daemon=True)
             t.start()
 
-# Kick the loop shortly after module import
 def _boot_kick():
     try:
         time.sleep(1.0)
@@ -904,10 +834,9 @@ def _boot_kick():
 if os.environ.get("AUTOSTART", "1") == "1":
     threading.Thread(target=_boot_kick, daemon=True).start()
 
-# Also autostart when running directly
 if __name__ == "__main__":
     load_profit_state()
-    fetch_pair_precisions()
+    fetch_pair_precisions()  # <== pulls tick/step/min/precisions
     _start_loop_once()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
