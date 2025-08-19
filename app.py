@@ -159,7 +159,7 @@ def ema20_angle_deg_from_candles(candles):
     Angle is atan( (ΔEMA) / (0.01 * EMA_prev) ) in degrees, so a +30° means ~+0.577% step.
     """
     closes = [c["close"] for c in candles]
-    ema20 = ema_series(closes, 20)
+    ema20 = ema_series(closes, 5)
     if len(ema20) < 2:
         return None
     prev = ema20[-2]
