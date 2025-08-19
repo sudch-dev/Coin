@@ -206,11 +206,6 @@ def buy_signal(candles):
     last = candles[-1]
     prev = candles[-2]
 
-    # (1) slope
-    ang = ema20_angle_deg_from_candles(candles)
-    if ang is None or ang <= 30.0:
-        return False
-
     # (2) open within -0.1% of prev close and below it
     if not (last["open"] < prev["close"] and last["open"] >= prev["close"] * 0.999):
         return False
@@ -233,10 +228,6 @@ def sell_signal(candles):
     idx = len(candles) - 1
     last = candles[-1]
     prev = candles[-2]
-
-    ang = ema20_angle_deg_from_candles(candles)
-    if ang is None or ang >= -30.0:
-        return False
 
     if not (last["open"] > prev["close"] and last["open"] <= prev["close"] * 1.001):
         return False
