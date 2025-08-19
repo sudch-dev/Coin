@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import requests
 import json
+import math
 from datetime import datetime
 from pytz import timezone
 from flask import Flask, render_template, jsonify
@@ -41,14 +42,12 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.001},
 }
 
-# Candle interval -> 5s scalper
+# Candle interval -> strict 5s
 CANDLE_INTERVAL_SEC = 5
 # Poll cadence for REST
 POLL_SEC = 1.0
 # Allocation per BUY from USDT
 BUY_USDT_ALLOC = 0.35
-# Target profit
-TP_PCT = 0.0005  # +0.05% (0.0005)
 
 # =========================
 # Time helpers (IST)
@@ -68,8 +67,8 @@ running     = False
 status      = {"msg": "Idle", "last": ""}
 error_message = ""
 
-# Track open LONG positions only (spot)
-# positions[pair] = {"side":"BUY","qty":float,"entry":float,"tp":float}
+# Track open LONG positions (spot)
+# positions[pair] = {"side":"BUY","qty":float,"entry":float,"entry_bar_start":int}
 positions = {p: None for p in PAIRS}
 
 # =========================
@@ -145,46 +144,30 @@ def place_order(pair, side, qty):
 # =========================
 # Indicators
 # =========================
-def rsi_wilder_from_closes(closes, period=14):
-    if len(closes) < period + 1: return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        ch = closes[i] - closes[i-1]
-        gains.append(max(0.0, ch)); losses.append(max(0.0, -ch))
-    avg_gain = sum(gains)/period; avg_loss = sum(losses)/period
-    for i in range(period + 1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gain = max(0.0, ch); loss = max(0.0, -ch)
-        avg_gain = (avg_gain*(period-1) + gain)/period
-        avg_loss = (avg_loss*(period-1) + loss)/period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def ema_series(values, period):
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    out = [float(values[0])]
+    for v in values[1:]:
+        out.append(float(v) * k + out[-1] * (1 - k))
+    return out
 
-def stoch_kd_series(candles, period=14, smooth_k=3, smooth_d=3):
-    """Return full series of K, D (for crossover detection)."""
-    n = len(candles)
-    if n < period: return [], []
-    k_vals = []
-    for i in range(period - 1, n):
-        win = candles[i - period + 1:i + 1]
-        hi = max(x["high"] for x in win); lo = min(x["low"] for x in win)
-        cl = candles[i]["close"]
-        k_raw = 0.0 if hi == lo else (cl - lo) / (hi - lo) * 100.0
-        k_vals.append(k_raw)
-
-    # Simple moving average smoothing
-    def sma(arr, p):
-        if p <= 1: return arr[:]
-        out = []
-        for j in range(len(arr)):
-            s = arr[max(0, j - p + 1): j + 1]
-            out.append(sum(s) / len(s))
-        return out
-
-    k_s = sma(k_vals, smooth_k)
-    d_s = sma(k_s, smooth_d)
-    return k_s, d_s
+def ema20_angle_deg_from_candles(candles):
+    """
+    Compute EMA20 on closes and return the angle (deg) between last two EMA points.
+    Angle is atan( (ΔEMA) / (0.01 * EMA_prev) ) in degrees, so a +30° means ~+0.577% step.
+    """
+    closes = [c["close"] for c in candles]
+    ema20 = ema_series(closes, 20)
+    if len(ema20) < 2:
+        return None
+    prev = ema20[-2]
+    curr = ema20[-1]
+    if prev <= 0:
+        return None
+    slope_ratio = (curr - prev) / (0.01 * prev)  # ΔEMA per 1% of price
+    return math.degrees(math.atan(slope_ratio))
 
 # =========================
 # Aggregation (5s candles)
@@ -205,37 +188,66 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL_SEC):
             candle["close"]= price
             candle["volume"] += 1
     if candle: candles.append(candle)
-    candle_logs[pair] = candles[-1200:]  # enough history
+    candle_logs[pair] = candles[-1500:]  # enough history
 
 # =========================
-# Signals (Stoch cross + RSI filter)
+# Signals per your rules
 # =========================
-def signal_from_stoch_rsi(candles):
+def buy_signal(candles):
     """
-    Return 'BUY' or 'SELL' or None on last CLOSED candle:
-      BUY  when %K crosses above %D AND RSI(14) > 55
-      SELL when %K crosses below %D AND RSI(14) < 45
+    Conditions on last CLOSED candle (index -1), referencing previous (-2):
+      1) EMA20 slope > +30°
+      2) open < prev_close AND open >= prev_close * 0.999  (within -0.1%)
+      3) last candle index is ODD (0-based)
     """
-    if len(candles) < 20:
-        return None
+    if len(candles) < 22:
+        return False
+    idx = len(candles) - 1
+    last = candles[-1]
+    prev = candles[-2]
 
-    closes = [c["close"] for c in candles]
-    rsi14 = rsi_wilder_from_closes(closes[-15:], 14) if len(closes) >= 15 else None
-    K, D = stoch_kd_series(candles, 14, 3, 3)
-    if rsi14 is None or len(K) < 2 or len(D) < 2:
-        return None
+    # (1) slope
+    ang = ema20_angle_deg_from_candles(candles)
+    if ang is None or ang <= 30.0:
+        return False
 
-    k_prev, k_curr = K[-2], K[-1]
-    d_prev, d_curr = D[-2], D[-1]
-    bullish = (k_prev <= d_prev) and (k_curr > d_curr)
-    bearish = (k_prev >= d_prev) and (k_curr < d_curr)
+    # (2) open within -0.1% of prev close and below it
+    if not (last["open"] < prev["close"] and last["open"] >= prev["close"] * 0.999):
+        return False
 
-    if bullish and rsi14 > 55: return "BUY"
-    if bearish and rsi14 < 45: return "SELL"
-    return None
+    # (3) odd candle eligibility
+    if (idx % 2) != 1:
+        return False
+
+    return True
+
+def sell_signal(candles):
+    """
+    Reverse of buy:
+      1) EMA20 slope < -30°
+      2) open > prev_close AND open <= prev_close * 1.001  (within +0.1%)
+      3) last candle index is EVEN (reverse of buy)
+    """
+    if len(candles) < 22:
+        return False
+    idx = len(candles) - 1
+    last = candles[-1]
+    prev = candles[-2]
+
+    ang = ema20_angle_deg_from_candles(candles)
+    if ang is None or ang >= -30.0:
+        return False
+
+    if not (last["open"] > prev["close"] and last["open"] <= prev["close"] * 1.001):
+        return False
+
+    if (idx % 2) != 0:
+        return False
+
+    return True
 
 # =========================
-# Trading Loop (5s candles, polling)
+# Trading Loop (5s candles)
 # =========================
 def scan_loop():
     global running, error_message
@@ -264,94 +276,83 @@ def scan_loop():
             if not C:
                 continue
 
-            # TP check between bars (for open long)
-            pos = positions.get(pair)
-            if pos and pos["side"] == "BUY":
-                if price >= pos["tp"]:
-                    qty = precise_sell_qty(pair, pos["qty"])
-                    if qty > 0:
-                        res = place_order(pair, "SELL", qty)
-                        scan_log.append(f"{ist_now()} | {pair} | TP HIT: SELL {qty} @ {price} (TP {pos['tp']}) | {res}")
-                        trade_log.append({
-                            "time": ist_now(), "pair": pair, "side": "SELL",
-                            "entry": price, "msg": "TP +0.05%", "qty": qty, "order_result": res
-                        })
-                        positions[pair] = None
-                        if "error" in res: error_message = res["error"]
-
-            # Only act on NEW closed candle
+            # Act only when a *new* candle has closed
             if C[-1]["start"] == last_candle_ts[pair]:
                 continue
             last_candle_ts[pair] = C[-1]["start"]
 
-            # New bar signal
-            sig = signal_from_stoch_rsi(C)
-            close_px = C[-1]["close"]
-
-            # Manage existing long: SL = SELL signal (bearish stoch cross + RSI<45)
+            # --- Exit rule for existing BUY: exit at the close of the next candle ---
             pos = positions.get(pair)
             if pos and pos["side"] == "BUY":
-                if close_px >= pos["tp"]:
+                # If we have moved to a candle whose start > entry_bar_start, that candle just closed
+                if C[-1]["start"] > pos["entry_bar_start"]:
                     qty = precise_sell_qty(pair, pos["qty"])
                     if qty > 0:
                         res = place_order(pair, "SELL", qty)
-                        scan_log.append(f"{ist_now()} | {pair} | TP HIT: SELL {qty} @ {close_px} (TP {pos['tp']}) | {res}")
+                        scan_log.append(f"{ist_now()} | {pair} | EXIT (close of next bar): SELL {qty} @ {C[-1]['close']} | {res}")
                         trade_log.append({
                             "time": ist_now(), "pair": pair, "side": "SELL",
-                            "entry": close_px, "msg": "TP +0.05%", "qty": qty, "order_result": res
+                            "entry": C[-1]["close"], "msg": "Exit at close of next candle",
+                            "qty": qty, "order_result": res
                         })
                         positions[pair] = None
                         if "error" in res: error_message = res["error"]
-                    continue
-                if sig == "SELL":
-                    qty = precise_sell_qty(pair, pos["qty"])
-                    if qty > 0:
-                        res = place_order(pair, "SELL", qty)
-                        scan_log.append(f"{ist_now()} | {pair} | SL (Stoch bearish): SELL {qty} @ {close_px} | {res}")
-                        trade_log.append({
-                            "time": ist_now(), "pair": pair, "side": "SELL",
-                            "entry": close_px, "msg": "SL via bearish stoch", "qty": qty, "order_result": res
-                        })
-                        positions[pair] = None
-                        if "error" in res: error_message = res["error"]
-                    continue
+                    # After exit, continue to evaluate fresh signals on this bar as well
+            # -------------------------------------------------------------
 
-            # No open long → act on fresh signal
-            if sig == "BUY":
-                usdt = balances.get("USDT", 0.0)
-                if close_px > 0 and usdt > 0:
-                    raw_qty = (BUY_USDT_ALLOC * usdt) / close_px
-                    qty = clamp_buy_qty(pair, raw_qty)
-                    if qty > 0:
-                        res = place_order(pair, "BUY", qty)
-                        tp = round(close_px * (1.0 + TP_PCT), 6)
-                        positions[pair] = {"side": "BUY", "qty": qty, "entry": close_px, "tp": tp}
-                        scan_log.append(f"{ist_now()} | {pair} | BUY {qty} @ {close_px} | TP {tp} (+0.05%) | {res}")
-                        trade_log.append({
-                            "time": ist_now(), "pair": pair, "side": "BUY",
-                            "entry": close_px, "msg": "BUY (stoch cross + RSI)", "qty": qty, "order_result": res
-                        })
-                        if "error" in res: error_message = res["error"]
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY sig but no USDT or bad price")
+            # Signals based on last closed candle
+            will_buy = buy_signal(C)
+            will_sell = sell_signal(C)
 
-            elif sig == "SELL":
-                # Spot liquidation of any wallet holdings for that coin
+            # SELL (reverse): liquidate wallet if signal
+            if will_sell:
                 coin = pair[:-4]
                 bal_qty = balances.get(coin, 0.0)
                 qty = precise_sell_qty(pair, bal_qty)
                 if qty > 0:
                     res = place_order(pair, "SELL", qty)
-                    scan_log.append(f"{ist_now()} | {pair} | SELL {qty} @ {close_px} (Spot liquidation) | {res}")
+                    scan_log.append(f"{ist_now()} | {pair} | SELL signal: liquidate {qty} @ {C[-1]['close']} | {res}")
                     trade_log.append({
                         "time": ist_now(), "pair": pair, "side": "SELL",
-                        "entry": close_px, "msg": "SELL (stoch bearish + RSI)", "qty": qty, "order_result": res
+                        "entry": C[-1]["close"], "msg": "SELL signal (reverse rules)",
+                        "qty": qty, "order_result": res
                     })
                     positions[pair] = None
                     if "error" in res: error_message = res["error"]
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL sig but no {coin} balance ≥ min qty")
-            else:
+                    scan_log.append(f"{ist_now()} | {pair} | SELL signal but no {coin} balance ≥ min qty")
+
+            # BUY if signal (and not already long)
+            if will_buy:
+                pos = positions.get(pair)
+                if pos and pos["side"] == "BUY" and pos["qty"] > 0:
+                    scan_log.append(f"{ist_now()} | {pair} | BUY signal but already long; skip")
+                else:
+                    usdt = balances.get("USDT", 0.0)
+                    close_px = C[-1]["close"]
+                    if close_px > 0 and usdt > 0:
+                        raw_qty = (BUY_USDT_ALLOC * usdt) / close_px
+                        qty = clamp_buy_qty(pair, raw_qty)
+                        if qty > 0:
+                            res = place_order(pair, "BUY", qty)
+                            # We exit at close of next candle -> remember the entry bar start
+                            positions[pair] = {
+                                "side": "BUY", "qty": qty, "entry": close_px,
+                                "entry_bar_start": C[-1]["start"]
+                            }
+                            scan_log.append(f"{ist_now()} | {pair} | BUY {qty} @ {close_px} | Exit next bar close | {res}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": "BUY",
+                                "entry": close_px, "msg": "BUY signal (odd bar + slope + open condition)",
+                                "qty": qty, "order_result": res
+                            })
+                            if "error" in res: error_message = res["error"]
+                        else:
+                            scan_log.append(f"{ist_now()} | {pair} | BUY signal but qty < min after clamp")
+                    else:
+                        scan_log.append(f"{ist_now()} | {pair} | BUY sig but no USDT or bad price")
+
+            if not will_buy and not will_sell and not positions.get(pair):
                 scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
         # Trim logs to keep memory bounded
