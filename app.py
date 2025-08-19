@@ -36,22 +36,18 @@ PAIR_RULES = {
 
 # --- Fast scalping tunables (TP only, NO SL) ---
 CANDLE_INTERVAL = 10                 # 10s candles
-TRADE_COOLDOWN_SEC = 60              # cooldown to reduce churn
+TRADE_COOLDOWN_SEC = 20              # shorter cooldown so it can re-enter quickly
 
 # Costs & targets
-FEE_PCT_PER_SIDE = 0.0010            # 0.10% taker per side (adjust to your tier)
+FEE_PCT_PER_SIDE = 0.0010            # 0.10% taker per side (set to your tier)
 TP_PCT_BASE = 0.0020                 # +0.20% desired target
 TP_BUFFER_PCT = 0.0003               # +0.03% above 2*fee to stay net-positive
-SL_PCT = 0.0015                      # used ONLY for sizing, not for exits
-MIN_RISK_PCT = 0.0006                # used ONLY for sizing
-RISK_PCT_PER_TRADE = 0.002           # risk 0.2% of USDT per trade (by position size)
-
-# Volatility gates (on 10s TF)
-MIN_ATR_PCT = 0.0010                 # ≥0.10% atr% to avoid dead markets
-MAX_ATR_PCT = 0.0080                 # ≤0.80% atr% to avoid chaos
+SL_PCT = 0.0015                      # for SIZING ONLY; no SL is placed
+MIN_RISK_PCT = 0.0006                # for SIZING ONLY
+RISK_PCT_PER_TRADE = 0.002           # risk 0.2% of USDT by position size
 
 # Trade management
-MAX_HOLD_SEC = 90                    # time stop (~9 bars) — flatten at market if TP not hit
+MAX_HOLD_SEC = 90                    # time stop: flatten at market if TP not hit by then
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -65,6 +61,7 @@ running = False
 status = {"msg": "Idle", "last": ""}
 status_epoch = 0
 error_message = ""
+pair_cooldown_until = {p: 0 for p in PAIRS}
 
 # ===== Persistent P&L (executed fills only; FIFO spot) =====
 PROFIT_STATE_FILE = "profit_state.json"
@@ -74,7 +71,6 @@ profit_state = {
     "inventory": {},
     "processed_orders": []
 }
-pair_cooldown_until = {p: 0 for p in PAIRS}
 
 def load_profit_state():
     global profit_state
@@ -219,66 +215,51 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
     if candle: candles.append(candle)
     candle_logs[pair] = candles[-180:]  # ~30 minutes of 10s bars
 
-# ========= indicators =========
-def _compute_ema(values, n):
-    if len(values) < n: return None
-    sma = sum(values[:n]) / n
-    k = 2 / (n + 1)
-    ema = sma
-    for v in values[n:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
-def _atr_14(candles):
-    if len(candles) < 15: return None
-    trs = []
-    prev_close = candles[-15]["close"]
-    for c in candles[-14:]:
-        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
-        trs.append(tr)
-        prev_close = c["close"]
-    return sum(trs) / len(trs) if trs else None
-
-# ========= signal (EMA + Donchian + ATR gate) =========
+# ========= simple & frequent signal (3-candle breakout) =========
 def pa_buy_sell_signal(pair, live_price=None):
+    """
+    Very simple/fast:
+      - Use last 3 completed 10s candles (≈30s window).
+      - BUY if live price > highest high of last 3 candles and EMA5 >= EMA20 (soft filter).
+      - SELL if live price < lowest low of last 3 candles and EMA5 <= EMA20.
+    """
     candles = candle_logs[pair]
-    if len(candles) < 25:
+    if len(candles) < 5:
         return None
 
-    completed = candles[:-1] if len(candles) >= 2 else candles
-    if len(completed) < 20:
+    # completed candles only (exclude the forming one)
+    completed = candles[:-1]
+    if len(completed) < 4:
         return None
+
+    recent = completed[-3:]
+    don_high = max(c["high"] for c in recent)
+    don_low  = min(c["low"]  for c in recent)
 
     closes = [c["close"] for c in completed]
     price = float(live_price) if live_price else completed[-1]["close"]
 
-    N = 6  # last minute on 10s bars
-    recent = completed[-N:]
-    don_high = max(c["high"] for c in recent)
-    don_low  = min(c["low"]  for c in recent)
+    # Soft EMAs (non-blocking if insufficient history)
+    def _ema(vals, n):
+        if len(vals) < n: return None
+        k = 2/(n+1)
+        ema = sum(vals[:n]) / n
+        for v in vals[n:]:
+            ema = v*k + ema*(1-k)
+        return ema
 
-    closes_plus_live = closes[-30:] + [price]
-    ema_fast = _compute_ema(closes_plus_live, 5)
-    ema_slow = _compute_ema(closes_plus_live, 20)
-    atr14 = _atr_14(completed)
+    ema_fast = _ema(closes[-25:] + [price], 5)
+    ema_slow = _ema(closes[-25:] + [price], 20)
+    if ema_fast is None or ema_slow is None:
+        ema_fast = ema_slow = price
 
-    if ema_fast is None or ema_slow is None or atr14 is None:
-        return None
+    if price > don_high and ema_fast >= ema_slow:
+        return {"side": "BUY", "entry": price, "atr": None,
+                "msg": "BUY: live > 3-bar high (EMA5>=EMA20)"}
 
-    atr_pct = atr14 / max(price, 1e-9)
-    if not (MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT):
-        return None
-
-    last = completed[-1]
-    last_range = last["high"] - last["low"]
-    bull_impulse = (last_range >= 0.5 * atr14) and (last["close"] >= last["high"] - 0.25 * atr14)
-    bear_impulse = (last_range >= 0.5 * atr14) and (last["close"] <= last["low"] + 0.25 * atr14)
-
-    if price > don_high and ema_fast > ema_slow and bull_impulse:
-        return {"side": "BUY", "entry": price, "atr": atr14, "msg": f"BUY: EMA5>EMA20 + breakout({N}) + impulse"}
-
-    if price < don_low and ema_fast < ema_slow and bear_impulse:
-        return {"side": "SELL", "entry": price, "atr": atr14, "msg": f"SELL: EMA5<EMA20 + breakdown({N}) + impulse"}
+    if price < don_low and ema_fast <= ema_slow:
+        return {"side": "SELL", "entry": price, "atr": None,
+                "msg": "SELL: live < 3-bar low (EMA5<=EMA20)"}
 
     return None
 
@@ -376,8 +357,7 @@ def _effective_tp_pct():
 # ========= TP-only placement (NO SL) =========
 def _place_oco_children(pair, parent_side, qty, entry, tp_price, sl_price):
     """
-    Modified for NO SL:
-    Place ONLY TP limit order. sl_price ignored here (kept in signature for compatibility).
+    NO SL: place ONLY TP limit order. sl_price kept in signature for compatibility.
     Returns (tp_id, None, tp_res, None).
     """
     child_side = "SELL" if parent_side == "BUY" else "BUY"
@@ -469,6 +449,7 @@ def scan_loop():
             last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
             if last_candle:
+                # Cooldown / pending exits
                 if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
                     scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
                 else:
@@ -476,14 +457,12 @@ def scan_loop():
                     if signal:
                         error_message = ""
                         entry = signal["entry"]
-                        atr = signal.get("atr", None)
 
                         usdt_bal = balances.get("USDT", 0.0)
                         tp_pct = _effective_tp_pct()
 
-                        # we still size using a virtual SL distance (but we do NOT place SL)
-                        atr_pct = (atr / entry) if (atr and entry > 0) else 0.0
-                        risk_unit_pct = max(SL_PCT, 0.5 * atr_pct, MIN_RISK_PCT)
+                        # virtual stop distance for SIZING ONLY (no actual SL order)
+                        risk_unit_pct = max(SL_PCT, MIN_RISK_PCT)
                         risk_unit = entry * risk_unit_pct
 
                         tp_up  = round(entry * (1.0 + tp_pct), 6)
@@ -514,7 +493,7 @@ def scan_loop():
                         else:
                             # 1) Market entry
                             res = place_order(pair, signal["side"], qty)
-                            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | EntryRes {res}")
+                            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SLvirt {sl_virtual} | TP {tp} | EntryRes {res}")
                             trade_log.append({
                                 "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
                                 "msg": signal["msg"], "tp": tp, "sl": sl_virtual, "qty": qty, "order_result": res
@@ -542,7 +521,15 @@ def scan_loop():
                             if "error" in res:
                                 error_message = res["error"]
                     else:
-                        scan_log.append(f"{ist_now()} | {pair} | No Signal")
+                        # Breadcrumbs: show why it didn't trigger
+                        if len(candle_logs[pair]) >= 3:
+                            completed = candle_logs[pair][:-1]
+                            recent = completed[-3:]
+                            don_high = max(c["high"] for c in recent)
+                            don_low  = min(c["low"]  for c in recent)
+                            scan_log.append(f"{ist_now()} | {pair} | No Signal | 3h:{round(don_high,6)} 3l:{round(don_low,6)} live:{round(price,6)}")
+                        else:
+                            scan_log.append(f"{ist_now()} | {pair} | No Signal (insufficient candles)")
 
         status["msg"], status["last"] = "Running", ist_now()
         status_epoch = int(time.time())
@@ -594,7 +581,7 @@ def get_status():
         "coins": coins,
         "trades": trade_log[-10:][::-1],
         "scans": scan_log[-30:][::-1],
-        "open_exits": exit_orders,   # exposes TP-only exits to the UI
+        "open_exits": exit_orders,   # expose TP-only exits to the UI
         "error": error_message
     })
 
