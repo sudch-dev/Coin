@@ -30,20 +30,31 @@ PAIR_RULES = {
     "DOGEUSDT": {"precision": 4, "min_qty": 0.01},
     "SOLUSDT": {"precision": 4, "min_qty": 0.01},
     "AEROUSDT": {"precision": 2, "min_qty": 0.01},
-    "ADAUSDT": {"precision": 2, "min_qty": 2},       # (per your last post)
+    "ADAUSDT": {"precision": 2, "min_qty": 2},
     "LTCUSDT": {"precision": 2, "min_qty": 0.001},
     "BNBUSDT": {"precision": 4, "min_qty": 0.001}
 }
 
-# --- Tunables (fast scalp) ---
-CANDLE_INTERVAL = 10                 # 10s candles for fast trades
-TRADE_COOLDOWN_SEC = 45              # cooldown after exit for quick re-entries
+# --- Scalping tunables ---
+CANDLE_INTERVAL = 10                # 10s candles
+TRADE_COOLDOWN_SEC = 60             # slightly longer to reduce churn
 
-# Fixed-target + risk controls (fast scalp)
-TP_PCT = 0.002           # +0.20% take profit
-SL_PCT = 0.0015          # -0.15% stop loss (widened by ATR if needed)
-MIN_RISK_PCT = 0.0006    # minimum ~0.06% so SL isn't absurdly tight
-RISK_PCT_PER_TRADE = 0.002  # risk 0.2% of USDT per trade
+# Costs & targets
+FEE_PCT_PER_SIDE = 0.0010           # 0.10% taker per side (adjust to your fee tier)
+TP_PCT_BASE = 0.0020                # +0.20% desired target
+TP_BUFFER_PCT = 0.0003              # +0.03% buffer above 2*fee to stay net-positive
+SL_PCT = 0.0015                     # -0.15% base SL (widen via ATR if needed)
+MIN_RISK_PCT = 0.0006               # ≥0.06% min SL
+RISK_PCT_PER_TRADE = 0.002          # risk 0.2% of USDT per trade
+
+# Volatility gates (on 10s TF)
+MIN_ATR_PCT = 0.0010                # ≥0.10% atr% to avoid dead markets
+MAX_ATR_PCT = 0.0080                # ≤0.80% atr% to avoid chaos
+
+# Trade management
+BE_TRIGGER_PCT = 0.0010             # +0.10% in favor -> move SL to breakeven
+TRAIL_GAP_PCT = 0.0012              # trailing gap ≈0.12% once BE armed
+MAX_HOLD_SEC = 90                   # time stop (~9 bars)
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -55,16 +66,16 @@ scan_log, trade_log, exit_orders = [], [], []
 daily_profit, pair_precision = {}, {}
 running = False
 status = {"msg": "Idle", "last": ""}
-status_epoch = 0         # heartbeat for the UI watchdog
+status_epoch = 0
 error_message = ""
 
-# ===== Persistent P&L state (confirmed fills only) =====
+# ===== Persistent P&L (fills only) =====
 PROFIT_STATE_FILE = "profit_state.json"
 profit_state = {
-    "cumulative_pnl": 0.0,    # in USDT
-    "daily": {},              # { "YYYY-MM-DD": pnl_in_usdt }
-    "inventory": {},          # per-market FIFO lots: { "BTCUSDT": [[qty, cost], ...] }
-    "processed_orders": []    # avoid double-counting fills
+    "cumulative_pnl": 0.0,    # USDT
+    "daily": {},
+    "inventory": {},
+    "processed_orders": []
 }
 pair_cooldown_until = {p: 0 for p in PAIRS}
 
@@ -141,7 +152,7 @@ def apply_fill_update(market, side, price, qty, ts_ms, order_id):
     dkey = ist_date()
     profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
     save_profit_state()
-# ===== end persistent P&L helpers =====
+# ===== end P&L =====
 
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
@@ -194,10 +205,10 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
         else:
             candle["high"] = max(candle["high"], price)
             candle["low"] = min(candle["low"], price)
-            candle["close"] = price  # (fixed earlier stray ')')
+            candle["close"] = price
             candle["volume"] += 1
     if candle: candles.append(candle)
-    candle_logs[pair] = candles[-120:]  # keep ~20 minutes of 10s bars
+    candle_logs[pair] = candles[-180:]  # ~30 minutes of 10s bars
 
 # ========= indicators =========
 def _compute_ema(values, n):
@@ -219,13 +230,14 @@ def _atr_14(candles):
         prev_close = c["close"]
     return sum(trs) / len(trs) if trs else None
 
-# ========= simple & fast signal for 10s scalp =========
+# ========= signal with impulse & volatility gates =========
 def pa_buy_sell_signal(pair, live_price=None):
     """
-    10s scalp:
-    - Trend: EMA(5) > EMA(20) for BUY, EMA(5) < EMA(20) for SELL
+    10s scalp with guards:
+    - Trend: EMA(5) vs EMA(20)
     - Breakout: price crosses Donchian (last 6 completed 10s candles)
-    - ATR(14) from completed candles for risk sizing
+    - Impulse: last completed candle shows directional intent
+    - ATR% gate: only trade when volatility is reasonable
     """
     candles = candle_logs[pair]
     if len(candles) < 25:
@@ -251,13 +263,23 @@ def pa_buy_sell_signal(pair, live_price=None):
     if ema_fast is None or ema_slow is None or atr14 is None:
         return None
 
-    if price > don_high and ema_fast > ema_slow:
-        return {"side": "BUY", "entry": price, "atr": atr14,
-                "msg": f"BUY: EMA5>EMA20 & breakout > Donchian({N})"}
+    atr_pct = atr14 / max(price, 1e-9)
+    if not (MIN_ATR_PCT <= atr_pct <= MAX_ATR_PCT):
+        return None
 
-    if price < don_low and ema_fast < ema_slow:
+    last = completed[-1]
+    last_range = last["high"] - last["low"]
+    # impulse: decent range and close near the directional extreme
+    has_bull_impulse = (last_range >= 0.5 * atr14) and (last["close"] >= last["high"] - 0.25 * atr14)
+    has_bear_impulse = (last_range >= 0.5 * atr14) and (last["close"] <= last["low"] + 0.25 * atr14)
+
+    if price > don_high and ema_fast > ema_slow and has_bull_impulse:
+        return {"side": "BUY", "entry": price, "atr": atr14,
+                "msg": f"BUY: EMA5>EMA20 & breakout Donchian({N}) with impulse"}
+
+    if price < don_low and ema_fast < ema_slow and has_bear_impulse:
         return {"side": "SELL", "entry": price, "atr": atr14,
-                "msg": f"SELL: EMA5<EMA20 & breakdown < Donchian({N})"}
+                "msg": f"SELL: EMA5<EMA20 & breakdown Donchian({N}) with impulse"}
 
     return None
 
@@ -292,7 +314,6 @@ def get_order_status(order_id=None, client_order_id=None):
     res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
     return res if isinstance(res, dict) else {}
 
-# --- robust helpers for fills ---
 def _extract_order_id(res: dict):
     if not isinstance(res, dict):
         return None
@@ -351,15 +372,52 @@ def _record_fill_from_status(market, side, st, order_id):
     else:
         scan_log.append(f"{ist_now()} | {market} | No fill yet | st={st}")
 
+def _effective_tp_pct():
+    # ensure TP clears round-trip fees plus a small buffer
+    min_tp = 2 * FEE_PCT_PER_SIDE + TP_BUFFER_PCT
+    return max(TP_PCT_BASE, min_tp)
+
 def monitor_exits(prices):
     global error_message
     to_remove = []
+    now_ts = int(time.time())
+
     for ex in exit_orders:
-        pair, side, qty, tp, sl, entry = ex.values()
+        pair, side, qty, tp, sl, entry, start_ts, be_armed = ex.values()
         price = prices.get(pair, {}).get("price")
         if not price: continue
 
-        if side == "BUY" and (price >= tp or price <= sl):
+        # Time stop
+        if now_ts - start_ts >= MAX_HOLD_SEC:
+            res = place_order(pair, "SELL" if side == "BUY" else "BUY", qty)
+            scan_log.append(f"{ist_now()} | {pair} | TIMEOUT EXIT {('SELL' if side=='BUY' else 'BUY')} {qty} @ {price} | {res}")
+            order_id = _extract_order_id(res)
+            if order_id:
+                st = _wait_for_fill(order_id)
+                _record_fill_from_status(pair, "SELL" if side == "BUY" else "BUY", st, order_id)
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+            pair_cooldown_until[pair] = now_ts + TRADE_COOLDOWN_SEC
+            continue
+
+        # Break-even activation & trailing
+        move = (price - entry) if side == "BUY" else (entry - price)
+        if move >= BE_TRIGGER_PCT * entry:
+            if not be_armed:
+                # move SL to breakeven
+                ex["sl"] = entry
+                ex["be_armed"] = True
+                scan_log.append(f"{ist_now()} | {pair} | BE armed; SL -> {entry}")
+            else:
+                # trail SL behind current price
+                gap = TRAIL_GAP_PCT * entry
+                if side == "BUY":
+                    ex["sl"] = max(ex["sl"], price - gap)
+                else:
+                    ex["sl"] = min(ex["sl"], price + gap)
+
+        # Hard exits (TP/SL)
+        if side == "BUY" and (price >= tp or price <= ex["sl"]):
             res = place_order(pair, "SELL", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
             order_id = _extract_order_id(res)
@@ -368,9 +426,9 @@ def monitor_exits(prices):
                 _record_fill_from_status(pair, "SELL", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
-            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+            pair_cooldown_until[pair] = now_ts + TRADE_COOLDOWN_SEC
 
-        elif side == "SELL" and (price <= tp or price >= sl):
+        elif side == "SELL" and (price <= tp or price >= ex["sl"]):
             res = place_order(pair, "BUY", qty)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
             order_id = _extract_order_id(res)
@@ -379,7 +437,7 @@ def monitor_exits(prices):
                 _record_fill_from_status(pair, "BUY", st, order_id)
             if "error" in res: error_message = res["error"]
             to_remove.append(ex)
-            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+            pair_cooldown_until[pair] = now_ts + TRADE_COOLDOWN_SEC
 
     for ex in to_remove: exit_orders.remove(ex)
 
@@ -406,14 +464,14 @@ def scan_loop():
 
             price = prices[pair]["price"]
             tick_logs[pair].append((now, price))
-            if len(tick_logs[pair]) > 3000:  # keep last ~30k seconds (a few hours)
+            if len(tick_logs[pair]) > 3000:
                 tick_logs[pair] = tick_logs[pair][-3000:]
 
             aggregate_candles(pair, interval)
             last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
 
             if last_candle:
-                # Respect cooldown & pending exits
+                # Cooldown / pending exits
                 if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
                     scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
                 else:
@@ -425,13 +483,16 @@ def scan_loop():
 
                         usdt_bal = balances.get("USDT", 0.0)
 
-                        # ---- fixed-target fast scalp (+0.2% TP) ----
+                        # Fee-aware TP% (ensure net-positive after costs)
+                        tp_pct = _effective_tp_pct()
+
+                        # SL sizing (≥ base SL_PCT, ≥ 0.5*atr%, ≥ floor)
                         atr_pct = (atr / entry) if (atr and entry > 0) else 0.0
                         risk_unit_pct = max(SL_PCT, 0.5 * atr_pct, MIN_RISK_PCT)
                         risk_unit = entry * risk_unit_pct
 
-                        tp_up  = round(entry * (1.0 + TP_PCT), 6)
-                        tp_dn  = round(entry * (1.0 - TP_PCT), 6)
+                        tp_up  = round(entry * (1.0 + tp_pct), 6)
+                        tp_dn  = round(entry * (1.0 - tp_pct), 6)
 
                         if signal["side"] == "BUY":
                             sl = round(entry - risk_unit, 6)
@@ -439,7 +500,7 @@ def scan_loop():
                             risk_per_unit = max(entry - sl, 1e-9)
                             risk_amt = RISK_PCT_PER_TRADE * usdt_bal
                             qty_risk = risk_amt / risk_per_unit
-                            qty_cap = (0.3 * usdt_bal) / entry
+                            qty_cap = (0.25 * usdt_bal) / entry   # tighten cap to 25% to reduce exposure
                             qty = min(qty_risk, qty_cap)
                         else:
                             sl = round(entry + risk_unit, 6)
@@ -457,6 +518,7 @@ def scan_loop():
                             scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
                         else:
                             res = place_order(pair, signal["side"], qty)
+
                             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SL {sl} | TP {tp} | {res}")
                             trade_log.append({
                                 "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
@@ -464,10 +526,11 @@ def scan_loop():
                             })
                             exit_orders.append({
                                 "pair": pair, "side": signal["side"], "qty": qty,
-                                "tp": tp, "sl": sl, "entry": entry
+                                "tp": tp, "sl": sl, "entry": entry,
+                                "start_ts": int(time.time()), "be_armed": False
                             })
 
-                            # Confirm fill -> update persistent P&L
+                            # Confirm fill -> update P&L
                             order_id = _extract_order_id(res)
                             if order_id:
                                 st = _wait_for_fill(order_id)
@@ -479,7 +542,7 @@ def scan_loop():
                         scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
         status["msg"], status["last"] = "Running", ist_now()
-        status_epoch = int(time.time())  # heartbeat for watchdog
+        status_epoch = int(time.time())
         time.sleep(5)
 
     status["msg"] = "Idle"
@@ -518,7 +581,7 @@ def get_status():
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
-        "status_epoch": status_epoch,  # for frontend watchdog
+        "status_epoch": status_epoch,
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
