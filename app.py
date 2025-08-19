@@ -43,21 +43,46 @@ PAIR_RULES = {
 
 # -------------------- Maker / HFT settings --------------------
 MODE = "maker"                 # quoting engine (spread capture, inventory control)
-CANDLE_INTERVAL = 10           # 10s candles for trend context
+
+# fast, tight management to avoid stale quotes
+CANDLE_INTERVAL = 10           # 10s bars for trend/vol gates
 POLL_SEC = 1.0                 # quote loop cadence
-QUOTE_TTL_SEC = 12             # replace quotes after this age
-DRIFT_REQUOTE_PCT = 0.0008     # reprice if last moves > 0.08%
-FEE_PCT_PER_SIDE = 0.0010      # set to your actual fee tier
-TP_BUFFER_PCT = 0.0003         # profit buffer above fees
+QUOTE_TTL_SEC = 4              # replace quotes quickly
+DRIFT_REQUOTE_PCT = 0.0003     # 0.03% drift => reprice
+
+# fees + required edge
+FEE_PCT_PER_SIDE = 0.0010      # set to your actual maker fee tier (0.10% default)
+TP_BUFFER_PCT = 0.0006         # buffer above round-trip fees (0.06%)
 SPREAD_OFFSET_PCT = None       # if None, auto = (2*fee+buffer)/2 per side
+
+# ATR / slope gating to avoid getting picked off in fast moves
+ATR_WINDOW = 18                # ~3 minutes of 10s bars
+ATR_SPREAD_MULT = 1.5          # half-spread bumps with ATR
+MAX_ATR_PCT = 0.0020           # if ATR% > 0.20%, pause new bids (danger zone)
+MAX_SLOPE_PCT = 0.0020         # if |EMA5-EMA20|/last > 0.20%, only quote away from trend
+
 EMA_FAST, EMA_SLOW = 5, 20
 
-MAX_PER_PAIR_USDT = 50.0       # per-pair cap
-QUOTE_USDT = 20.0              # per-quote notional
-INVENTORY_USDT_CAP = 200.0     # total gross inventory cap
-INVENTORY_REDUCE_BIAS = 1.6    # skew size to reduce inventory
-ORPHAN_MAX_SEC = 240           # last-resort flatten for stuck inventory
-KEEPALIVE_SEC = 240            # HTTPS self-ping to keep Render awake
+# sizing & inventory control
+MAX_PER_PAIR_USDT = 40.0       # per-pair cap
+QUOTE_USDT = 12.0              # per-quote notional
+INVENTORY_USDT_CAP = 120.0     # total gross inventory cap
+INVENTORY_REDUCE_BIAS = 2.5    # stronger bias to unwind inventory
+
+# anti-sudden-drop protections
+FAST_MOVE_PCT = 0.0015         # 0.15% move within window -> cancel & freeze
+FAST_MOVE_WINDOW_SEC = 5
+FREEZE_SEC_AFTER_FAST_MOVE = 6
+
+KILL_SWITCH_PCT = 0.0030       # 0.3% below latest BUY fill entry -> market-reduce
+KILL_SWITCH_SELL_FRAC = 0.6    # sell 60% of recent-filled size
+KILL_SWITCH_COOLDOWN_SEC = 20  # cooldown to avoid repeated triggers
+
+# last-resort inventory reducer (market)
+ORPHAN_MAX_SEC = 900           # long timeout to avoid taker outs in chop
+
+# keep Render awake
+KEEPALIVE_SEC = 240
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
@@ -76,7 +101,11 @@ error_message = ""
 
 # active quotes {pair: {"bid": {...}, "ask": {...}}}
 active_quotes = {p: {"bid": None, "ask": None} for p in PAIRS}
-inventory_timer = {}  # pair -> ts when long inventory began
+inventory_timer = {}           # pair -> ts when long inventory began
+last_price_state = {p: {"last": None, "ts": 0} for p in PAIRS}
+pair_freeze_until = {p: 0 for p in PAIRS}
+kill_cooldown_until = {p: 0 for p in PAIRS}
+last_buy_fill = {p: {"entry": None, "qty": 0.0, "ts": 0} for p in PAIRS}
 
 # -------------------- Persistent P&L (FIFO) --------------------
 PROFIT_STATE_FILE = "profit_state.json"
@@ -265,6 +294,20 @@ def _ema(vals, n):
         ema = v * k + ema * (1 - k)
     return ema
 
+def _atr_and_pct(pair, last, window=ATR_WINDOW):
+    cs = candle_logs.get(pair) or []
+    if len(cs) <= window:
+        return None, None
+    trs = []
+    prev_close = cs[-window-1]["close"]
+    for c in cs[-window:]:
+        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
+        trs.append(tr)
+        prev_close = c["close"]
+    atr = sum(trs)/len(trs) if trs else None
+    atr_pct = (atr/last) if (atr and last > 0) else None
+    return atr, atr_pct
+
 # -------------------- Exchange calls --------------------
 def place_order(pair, side, qty):
     payload = {
@@ -313,7 +356,7 @@ def _fnum(x, d=0.0):
         return d
 
 def _record_fill_from_status(market, side, st, order_id):
-    if not isinstance(st, dict): return
+    if not isinstance(st, dict): return 0.0, 0.0
     total_q  = _fnum(st.get("total_quantity", st.get("quantity", st.get("orig_qty", 0))))
     remain_q = _fnum(st.get("remaining_quantity", st.get("remaining_qty", st.get("leaves_qty", 0))))
     exec_q   = _fnum(st.get("executed_quantity", st.get("filled_qty", st.get("executedQty", 0))))
@@ -327,14 +370,17 @@ def _record_fill_from_status(market, side, st, order_id):
         except:
             ts_ms = int(time.time() * 1000)
         apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
+    return filled, avg_px
 
 # -------------------- Maker quoting helpers --------------------
-def _effective_half_spread_pct():
+def _effective_half_spread_pct(adapt_with_atr_pct=None):
     base = (2 * FEE_PCT_PER_SIDE + TP_BUFFER_PCT) / 2.0
+    if adapt_with_atr_pct:
+        base = max(base, adapt_with_atr_pct * ATR_SPREAD_MULT)
     return max(base, (SPREAD_OFFSET_PCT or 0.0))
 
-def _quote_prices(last):
-    off = _effective_half_spread_pct()
+def _quote_prices(last, atr_pct=None):
+    off = _effective_half_spread_pct(atr_pct)
     bid = round(last * (1.0 - off), 6)
     ask = round(last * (1.0 + off), 6)
     return bid, ask
@@ -373,6 +419,10 @@ def _cancel_quote(pair, side_key):
         scan_log.append(f"{ist_now()} | {pair} | cancel {side_key} quote {oid}")
     active_quotes[pair][side_key] = None
 
+def cancel_all_quotes(pair):
+    _cancel_quote(pair, "bid")
+    _cancel_quote(pair, "ask")
+
 def _place_quote(pair, side_word, price, qty):
     # side_word: "BUY" or "SELL"
     res = place_limit_order(pair, side_word, qty, price)
@@ -382,10 +432,11 @@ def _place_quote(pair, side_word, price, qty):
     scan_log.append(f"{ist_now()} | {pair} | quote {side_word} {qty} @ {price} | id={oid} | res={res}")
     return oid
 
-def _check_quote_fill(pair, side_key):
+def _check_quote_fill(pair, side_key, last_price):
     """
     side_key: 'bid' or 'ask'
     Translates to order side 'BUY' (bid) or 'SELL' (ask) for P&L accounting.
+    Also updates last_buy_fill for kill-switch after BUY fills.
     """
     q = active_quotes.get(pair, {}).get(side_key)
     if not q or not q.get("id"):
@@ -393,16 +444,19 @@ def _check_quote_fill(pair, side_key):
 
     st = get_order_status(order_id=q["id"])
 
-    # determine fill status robustly
     rem = _fnum(st.get("remaining_quantity", st.get("remaining_qty", st.get("leaves_qty", 0))))
     status_txt = (st.get("status") or "").lower()
     filled = (rem == 0) or ("filled" in status_txt and "part" not in status_txt)
 
     if filled:
         order_side = "BUY" if side_key == "bid" else "SELL"
-        _record_fill_from_status(pair, order_side, st, q["id"])
+        filled_qty, avg_px = _record_fill_from_status(pair, order_side, st, q["id"])
         active_quotes[pair][side_key] = None
-        scan_log.append(f"{ist_now()} | {pair} | FILL {order_side} | st={st}")
+        scan_log.append(f"{ist_now()} | {pair} | FILL {order_side} {filled_qty} @ {avg_px} | st={st}")
+
+        # Track the latest BUY fill for kill-switch
+        if order_side == "BUY" and filled_qty > 0 and avg_px > 0:
+            last_buy_fill[pair] = {"entry": float(avg_px), "qty": float(filled_qty), "ts": int(time.time())}
         return True
     return False
 
@@ -449,14 +503,14 @@ def scan_loop():
             last_keepalive = now_real
 
         prices = fetch_all_prices()
-        now = int(time.time())
+        now_ts = int(time.time())
         balances = get_wallet_balances()
 
         # ticks & candles
         for pair in PAIRS:
             if pair in prices:
                 px = prices[pair]["price"]
-                tick_logs[pair].append((now, px))
+                tick_logs[pair].append((now_ts, px))
                 if len(tick_logs[pair]) > 4000:
                     tick_logs[pair] = tick_logs[pair][-4000:]
                 aggregate_candles(pair, CANDLE_INTERVAL)
@@ -466,37 +520,74 @@ def scan_loop():
         if gross_usdt > INVENTORY_USDT_CAP:
             scan_log.append(f"{ist_now()} | RISK | Gross inventory {round(gross_usdt,2)} > cap {INVENTORY_USDT_CAP} — pause new bids")
 
-        # quotes per pair
+        # per-pair logic
         for pair in PAIRS:
             if pair not in prices:
                 continue
 
             last = prices[pair]["price"]
-            bid_px, ask_px = _quote_prices(last)
 
+            # -------- Fast-move detection & freeze --------
+            prev = last_price_state[pair]["last"]
+            pts  = last_price_state[pair]["ts"]
+            last_price_state[pair] = {"last": last, "ts": now_ts}
+
+            if prev and (now_ts - pts) <= FAST_MOVE_WINDOW_SEC:
+                move_pct = abs(last - prev) / max(prev, 1e-9)
+                if move_pct >= FAST_MOVE_PCT:
+                    cancel_all_quotes(pair)
+                    pair_freeze_until[pair] = now_ts + FREEZE_SEC_AFTER_FAST_MOVE
+                    scan_log.append(f"{ist_now()} | {pair} | FAST MOVE {round(move_pct*100,3)}% — freeze until {pair_freeze_until[pair]}")
+                    # skip quoting this tick
+                    continue
+
+            if now_ts < pair_freeze_until[pair]:
+                # while frozen, still check fills (in case partials were resting)
+                for side_key in ("bid", "ask"):
+                    _check_quote_fill(pair, side_key, last)
+                continue
+
+            # -------- Indicators / gates --------
             closes = [c["close"] for c in (candle_logs.get(pair) or [])[:-1]]
             ema_fast = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_FAST) if len(closes) >= EMA_SLOW else None
             ema_slow = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_SLOW) if len(closes) >= EMA_SLOW else None
             bullish = (ema_fast is not None and ema_slow is not None and ema_fast >= ema_slow)
+            slope_pct = None
+            if ema_fast is not None and ema_slow is not None and last > 0:
+                slope_pct = abs(ema_fast - ema_slow) / last
+
+            atr_abs, atr_pct = _atr_and_pct(pair, last, ATR_WINDOW)
+
+            bid_px, ask_px = _quote_prices(last, atr_pct)
 
             usdt = balances.get("USDT", 0.0)
             coin = pair[:-4]
             coin_bal = balances.get(coin, 0.0)
             net_units = _net_inventory_units(pair)
 
+            # inventory & trend bias
             reduce_bias_bid = INVENTORY_REDUCE_BIAS if net_units < 0 else 1.0
             reduce_bias_ask = INVENTORY_REDUCE_BIAS if net_units > 0 else 1.0
             trend_bias_bid = 1.2 if bullish else 0.9
             trend_bias_ask = 1.2 if not bullish else 0.9
 
-            qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY", reduce_bias_bid * trend_bias_bid)
-            qty_ask = _qty_for_pair(pair, ask_px, usdt, coin_bal, "SELL", reduce_bias_ask * trend_bias_ask)
-
+            # determine allowed sides
+            allow_bid, allow_ask = True, True
             if gross_usdt > INVENTORY_USDT_CAP:
-                qty_bid = 0.0
+                allow_bid = False
+            if atr_pct is not None and atr_pct > MAX_ATR_PCT:
+                # turbulence: stand aside on bids
+                allow_bid = False
+            if slope_pct is not None and slope_pct > MAX_SLOPE_PCT:
+                # steep trend: quote only away from direction
+                if bullish:
+                    allow_ask = False  # avoid offering into squeeze; prefer to buy dips (still risky)
+                    allow_bid = True
+                else:
+                    allow_bid = False
+                    allow_ask = True
 
             # cancel stale/moved quotes
-            now_ts = now
             for side_key, q in list(active_quotes[pair].items()):
                 if not q:
                     continue
@@ -506,9 +597,36 @@ def scan_loop():
                 if age >= QUOTE_TTL_SEC or drift >= DRIFT_REQUOTE_PCT:
                     _cancel_quote(pair, side_key)
 
-            # check fills
+            # check fills (also updates last_buy_fill on BUY)
             for side_key in ("bid", "ask"):
-                _check_quote_fill(pair, side_key)
+                _check_quote_fill(pair, side_key, last)
+
+            # -------- Inventory kill-switch after BUY fill --------
+            lb = last_buy_fill.get(pair, {})
+            if lb and lb.get("entry") and now_ts >= kill_cooldown_until[pair]:
+                entry = float(lb["entry"]); filled_qty = float(lb["qty"])
+                if last <= entry * (1.0 - KILL_SWITCH_PCT):
+                    qty_to_sell = filled_qty * KILL_SWITCH_SELL_FRAC
+                    qty_to_sell = min(qty_to_sell, coin_bal)
+                    rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
+                    qty_to_sell = max(qty_to_sell, rule["min_qty"])
+                    qty_to_sell = round(qty_to_sell, rule["precision"])
+                    if qty_to_sell > 0:
+                        # cancel current bids to avoid re-catching the knife
+                        _cancel_quote(pair, "bid")
+                        res = place_order(pair, "SELL", qty_to_sell)
+                        oid = _extract_order_id(res)
+                        if oid:
+                            st = get_order_status(order_id=oid)
+                            _record_fill_from_status(pair, "SELL", st, oid)
+                        scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH: SOLD {qty_to_sell} due to {round(100*(entry-last)/entry,3)}% drop | res={res}")
+                        kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
+                        # reduce remembered fill qty
+                        last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
+
+            # sizing for quotes
+            qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY", reduce_bias_bid * trend_bias_bid) if allow_bid else 0.0
+            qty_ask = _qty_for_pair(pair, ask_px, usdt, coin_bal, "SELL", reduce_bias_ask * trend_bias_ask) if allow_ask else 0.0
 
             # place quotes if empty
             if qty_bid > 0 and not active_quotes[pair]["bid"]:
