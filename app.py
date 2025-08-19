@@ -5,15 +5,23 @@ import hmac
 import hashlib
 import requests
 import json
+import traceback
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
 from collections import deque
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+# Trust Render's proxy headers so Flask knows it's behind HTTPS
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+
+# If you host at a different domain later, set APP_BASE_URL in Render env
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://coin-4k37.onrender.com")
 
 API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET").encode()
+API_SECRET_RAW = os.environ.get("API_SECRET", "")
+API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API_SECRET_RAW
 BASE_URL = "https://api.coindcx.com"
 
 PAIRS = [
@@ -21,6 +29,7 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
+# You can refine these with live market details; we also fetch precision on boot
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0005},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -35,27 +44,30 @@ PAIR_RULES = {
 }
 
 # ======= MODE =======
-MODE = "maker"        # "maker" (HFT quoting). Keep function names; we just switch the loop behavior.
+MODE = "maker"        # "maker" (HFT-style quoting)
 
 # ======= HFT / Maker Tunables =======
-CANDLE_INTERVAL = 10            # build 10s candles for light trend context
-POLL_SEC = 1.0                  # quote management cadence (lower = more reactive)
+CANDLE_INTERVAL = 10            # 10s candles for light trend context
+POLL_SEC = 1.0                  # quote management cadence
 QUOTE_TTL_SEC = 12              # replace quotes after this age
-DRIFT_REQUOTE_PCT = 0.0008      # reprice if last moves > 0.08% away from our quote
-FEE_PCT_PER_SIDE = 0.0010       # 0.10% taker/maker fee assumption (adjust to your tier)
+DRIFT_REQUOTE_PCT = 0.0008      # reprice if last moves > 0.08% from our quote
+FEE_PCT_PER_SIDE = 0.0010       # 0.10% fee assumption (set to your actual tier)
 TP_BUFFER_PCT = 0.0003          # profit buffer above round-trip fees
-SPREAD_OFFSET_PCT = None        # if None, auto = (2*FEE + TP_BUFFER)/2 (per side)
+SPREAD_OFFSET_PCT = None        # if None, auto = (2*FEE + TP_BUFFER)/2 per side
 EMA_FAST = 5
 EMA_SLOW = 20
 
 # Inventory & sizing
-MAX_PER_PAIR_USDT = 50.0        # hard cap per pair in USDT (safety)
-QUOTE_USDT = 20.0               # size per single quote in USDT (before precision/min filters)
-INVENTORY_USDT_CAP = 200.0      # total gross inventory cap across pairs (safety)
-INVENTORY_REDUCE_BIAS = 1.6     # size multiplier on quote side that reduces inventory
+MAX_PER_PAIR_USDT = 50.0        # hard cap per pair in USDT
+QUOTE_USDT = 20.0               # size per quote in USDT (pre-precision/min filters)
+INVENTORY_USDT_CAP = 200.0      # total gross inventory cap across pairs
+INVENTORY_REDUCE_BIAS = 1.6     # multiplier on quote side that reduces inventory
 
 # Time stop for orphan inventory (no SL/TP; last resort flatten if stuck too long)
 ORPHAN_MAX_SEC = 240
+
+# Self-keepalive ping cadence (prevents Render sleep)
+KEEPALIVE_SEC = 240
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -76,7 +88,7 @@ profit_state = {
     "cumulative_pnl": 0.0,    # USDT
     "daily": {},
     "inventory": {},          # market -> [[qty, avg_price], ...]
-    "processed_orders": []    # order ids we have already applied
+    "processed_orders": []    # order ids applied
 }
 
 def load_profit_state():
@@ -104,7 +116,6 @@ def save_profit_state():
     except:
         pass
 
-from collections import deque
 def _get_inventory_deque(market):
     inv = profit_state["inventory"].get(market, [])
     dq = deque()
@@ -154,21 +165,56 @@ def apply_fill_update(market, side, price, qty, ts_ms, order_id):
     profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
     save_profit_state()
 
-# ===== HTTP helpers =====
+# ===== HTTP helpers & protocol-safe client =====
 def hmac_signature(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+def _log_http_issue(prefix, r):
+    try:
+        ct = r.headers.get("content-type", "")
+        body = r.text[:240] if hasattr(r, "text") else ""
+        scan_log.append(f"{ist_now()} | {prefix} HTTP {r.status_code} | {body}")
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
 
 def _signed_post(url, body):
     payload = json.dumps(body, separators=(',', ':'))
     sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    headers = {
+        "X-AUTH-APIKEY": API_KEY or "",
+        "X-AUTH-SIGNATURE": sig,
+        "Content-Type": "application/json"
+    }
     try:
-        r = requests.post(url, headers=headers, data=payload, timeout=10)
-        if r.ok:
+        r = requests.post(url, headers=headers, data=payload, timeout=12)  # HTTPS endpoint
+        if not r.ok:
+            _log_http_issue(f"POST {url}", r)
+        if r.headers.get("content-type", "").startswith("application/json"):
             return r.json()
-    except:
+        return {}
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | POST fail {url} | {e.__class__.__name__}: {e}")
+        tb = traceback.format_exc().splitlines()[-1]
+        scan_log.append(tb)
+        return {}
+
+def _safe_get(url, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout)
+        if not r.ok:
+            _log_http_issue(f"GET {url}", r)
+        if r.headers.get("content-type", "").startswith("application/json"):
+            return r.json()
+        return r
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | GET fail {url} | {e.__class__.__name__}: {e}")
+        return {}
+
+def _keepalive_ping():
+    try:
+        requests.get(f"{APP_BASE_URL}/ping", timeout=5)
+    except Exception:
         pass
-    return {}
 
 def fetch_pair_precisions():
     try:
@@ -177,21 +223,23 @@ def fetch_pair_precisions():
             for item in r.json():
                 if item.get("pair") in PAIRS:
                     pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
-    except:
-        pass
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | markets_details fail: {e}")
 
 def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
     balances = {}
     try:
         r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
         if r.ok:
             for b in r.json():
                 balances[b['currency']] = float(b['balance'])
-    except:
-        pass
+        else:
+            _log_http_issue("balances", r)
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | balances fail: {e}")
     return balances
 
 def fetch_all_prices():
@@ -201,8 +249,10 @@ def fetch_all_prices():
             now = int(time.time())
             return {item["market"]: {"price": float(item["last_price"]), "ts": now}
                     for item in r.json() if item.get("market") in PAIRS}
-    except:
-        pass
+        else:
+            _log_http_issue("ticker", r)
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | ticker fail: {e}")
     return {}
 
 # ===== Candle builder for soft trend context =====
@@ -233,10 +283,8 @@ def _ema(vals, n):
     return ema
 
 # ====== Maker Quote Engine ======
-# Active quotes per pair: {"bid": {...}, "ask": {...}}
-active_quotes = {p: {"bid": None, "ask": None} for p in PAIRS}
-# Orphan inventory timer: market -> first_seen_ts (when nonzero net long started)
-inventory_timer = {}
+active_quotes = {p: {"bid": None, "ask": None} for p in PAIRS}  # {"id","px","qty","ts"}
+inventory_timer = {}  # market -> ts when long inventory first observed
 
 def place_order(pair, side, qty):
     payload = {
@@ -256,8 +304,8 @@ def place_limit_order(pair, side, qty, price):
         "price_per_unit": str(price),
         "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000)
-        # If supported by CoinDCX, add post-only:
-        # ,"time_in_force": "PO"  or "post_only": True
+        # If supported by CoinDCX, add post-only to avoid taker fills:
+        # "time_in_force": "PO"  OR  "post_only": True
     }
     return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
 
@@ -315,11 +363,8 @@ def _quote_prices(last):
     return bid, ask
 
 def _qty_for_pair(pair, price, usdt_avail, coin_avail, side, trend_skew):
-    # base size
     q = max(1e-12, QUOTE_USDT) / max(price, 1e-9)
-    # inventory skew: if this side reduces inventory, make it larger
     q *= trend_skew
-    # wallet caps
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
     q = min(q, MAX_PER_PAIR_USDT / max(price, 1e-9))
     if side == "BUY":
@@ -373,9 +418,8 @@ def _check_quote_fill(pair, side):
     return False
 
 def _manage_orphan_inventory(pair, now_ts, prices, balances):
-    # If we hold long inventory for too long, edge closer to market to exit (still limit), finally market out.
     q_units = _net_inventory_units(pair)
-    if q_units <= 0: 
+    if q_units <= 0:
         inventory_timer.pop(pair, None)
         return
     if pair not in inventory_timer:
@@ -383,8 +427,7 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
         return
     if now_ts - inventory_timer[pair] < ORPHAN_MAX_SEC:
         return
-    # Last resort: market-out some inventory to free risk (partial)
-    px = prices.get(pair, {}).get("price", 0.0)
+    # Last resort: market-out partial inventory
     coin = pair[:-4]
     coin_bal = balances.get(coin, 0.0)
     qty = min(0.3 * q_units, coin_bal)
@@ -400,12 +443,22 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
     scan_log.append(f"{ist_now()} | {pair} | ORPHAN TIMEOUT market SELL {qty} | res={res}")
     inventory_timer[pair] = now_ts  # reset timer for remaining
 
+# ======== Main Loop ========
+last_keepalive = 0
+
 def scan_loop():
-    global running, error_message, status_epoch
+    global running, error_message, status_epoch, last_keepalive
     scan_log.clear()
     last_tick_ts = {p: 0 for p in PAIRS}
+    running = True
 
     while running:
+        # keepalive ping to prevent Render sleep
+        now_real = time.time()
+        if now_real - last_keepalive >= KEEPALIVE_SEC:
+            _keepalive_ping()
+            last_keepalive = now_real
+
         prices = fetch_all_prices()
         now = int(time.time())
         balances = get_wallet_balances()
@@ -426,11 +479,10 @@ def scan_loop():
         gross_usdt = _gross_inventory_usdt(prices)
         if gross_usdt > INVENTORY_USDT_CAP:
             scan_log.append(f"{ist_now()} | RISK | Gross inventory {round(gross_usdt,2)} > cap {INVENTORY_USDT_CAP} — pausing new bids")
-            # We still allow asks to reduce inventory.
 
         # Quote management per pair
         for pair in PAIRS:
-            if pair not in prices: 
+            if pair not in prices:
                 continue
 
             last = prices[pair]["price"]
@@ -449,8 +501,8 @@ def scan_loop():
             net_units = _net_inventory_units(pair)
 
             # Decide sizes with inventory bias
-            reduce_bias_bid = INVENTORY_REDUCE_BIAS if net_units < 0 else 1.0  # if short (shouldn't be on spot), bias bid
-            reduce_bias_ask = INVENTORY_REDUCE_BIAS if net_units > 0 else 1.0  # if long, bias ask
+            reduce_bias_bid = INVENTORY_REDUCE_BIAS if net_units < 0 else 1.0  # (short on spot is unusual; kept for symmetry)
+            reduce_bias_ask = INVENTORY_REDUCE_BIAS if net_units > 0 else 1.0  # if long, bias ask to reduce
             trend_bias_bid = 1.2 if bullish else 0.9
             trend_bias_ask = 1.2 if not bullish else 0.9
 
@@ -463,7 +515,7 @@ def scan_loop():
 
             # Manage existing quotes: cancel/refresh on TTL or drift
             for side, q in list(active_quotes[pair].items()):
-                if not q: 
+                if not q:
                     continue
                 age = now - int(q.get("ts", now))
                 px = q.get("px", last)
@@ -476,24 +528,24 @@ def scan_loop():
                 _check_quote_fill(pair, "BUY" if side == "bid" else "SELL")
 
             # Place/replace quotes if empty
-            # BUY quote (bid)
-            if qty_bid > 0:
-                if not active_quotes[pair]["bid"]:
-                    # ensure we don't cross: bid must be < last
-                    bpx = min(bid_px, round(last * (1 - 1e-6), 6))
-                    oid = _place_quote(pair, "BUY", bpx, qty_bid)
+            if qty_bid > 0 and not active_quotes[pair]["bid"]:
+                bpx = min(bid_px, round(last * (1 - 1e-6), 6))  # ensure not crossing
+                _place_quote(pair, "BUY", bpx, qty_bid)
 
-            # SELL quote (ask) — only if we actually have coin inventory to sell
             if qty_ask > 0 and coin_bal >= PAIR_RULES.get(pair, {"min_qty": 0.0})["min_qty"]:
                 if not active_quotes[pair]["ask"]:
-                    apx = max(ask_px, round(last * (1 + 1e-6), 6))
-                    oid = _place_quote(pair, "SELL", apx, qty_ask)
+                    apx = max(ask_px, round(last * (1 + 1e-6), 6))  # ensure not crossing
+                    _place_quote(pair, "SELL", apx, qty_ask)
 
-            # Orphan inventory protection (no SL, but don't hold forever)
+            # Orphan inventory protection
             _manage_orphan_inventory(pair, now, prices, balances)
 
         status["msg"], status["last"] = "Running", ist_now()
         status_epoch = int(time.time())
+
+        # Loop heartbeat (helps detect if loop is alive in logs)
+        print(f"[{ist_now()}] Loop active — quoting…")
+
         time.sleep(POLL_SEC)
 
     status["msg"] = "Idle"
@@ -501,18 +553,14 @@ def scan_loop():
 def compute_realized_pnl_today():
     return round(profit_state["daily"].get(ist_date(), 0.0), 6)
 
+# ===== Routes =====
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
 def start():
-    global running
-    if not running:
-        running = True
-        t = threading.Thread(target=scan_loop)
-        t.daemon = True
-        t.start()
+    _start_loop_once()
     return jsonify({"status": "started"})
 
 @app.route("/stop", methods=["POST"])
@@ -538,7 +586,6 @@ def get_status():
     profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
     cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
 
-    # expose active quotes for UI
     visible_quotes = {}
     for p in PAIRS:
         v = {}
@@ -567,9 +614,23 @@ def get_status():
     })
 
 @app.route("/ping")
-def ping(): return "pong"
+def ping(): 
+    return "pong"
+
+# ===== Dual autostart (boot + first request) =====
+def _start_loop_once():
+    global running
+    if not running:
+        running = True
+        t = threading.Thread(target=scan_loop, daemon=True)
+        t.start()
+
+@app.before_first_request
+def _kick_on_first_request():
+    _start_loop_once()
 
 if __name__ == "__main__":
     load_profit_state()
     fetch_pair_precisions()
+    _start_loop_once()  # start even before first web request
     app.run(host="0.0.0.0", port=10000)
