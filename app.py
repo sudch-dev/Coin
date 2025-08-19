@@ -45,15 +45,15 @@ PAIR_RULES = {
 MODE = "maker"                 # quoting engine (spread capture, inventory control)
 
 # fast, tight management to avoid stale quotes
-CANDLE_INTERVAL = 10           # 10s bars for trend/vol gates
+CANDLE_INTERVAL = 10           # 10s bars for trend/vol/SMC gates
 POLL_SEC = 1.0                 # quote loop cadence
 QUOTE_TTL_SEC = 4              # replace quotes quickly
 DRIFT_REQUOTE_PCT = 0.0003     # 0.03% drift => reprice
 
 # fees + required edge
-FEE_PCT_PER_SIDE = 0.0010      # set to your actual maker fee tier (0.10% default)
-TP_BUFFER_PCT = 0.0006         # buffer above round-trip fees (0.06%)
-SPREAD_OFFSET_PCT = None       # if None, auto = (2*fee+buffer)/2 per side
+FEE_PCT_PER_SIDE = 0.0010      # set your maker fee tier (0.10%)
+TP_BUFFER_PCT = 0.0006         # extra buffer > fees (0.06%)
+SPREAD_OFFSET_PCT = None       # if None, auto from fees; else fixed
 
 # ATR / slope gating to avoid getting picked off in fast moves
 ATR_WINDOW = 18                # ~3 minutes of 10s bars
@@ -79,10 +79,19 @@ KILL_SWITCH_SELL_FRAC = 0.6    # sell 60% of recent-filled size
 KILL_SWITCH_COOLDOWN_SEC = 20  # cooldown to avoid repeated triggers
 
 # last-resort inventory reducer (market)
-ORPHAN_MAX_SEC = 900           # long timeout to avoid taker outs in chop
+ORPHAN_MAX_SEC = 900
 
 # keep Render awake
 KEEPALIVE_SEC = 240
+
+# -------------------- SMC settings --------------------
+SMC_LOOKBACK = 60              # number of completed candles to scan swings/BOS
+SMC_LEFT = 2                   # swing pivot strength (left/right)
+SMC_RIGHT = 2
+SMC_DISPLACEMENT_MULT = 1.2    # BOS displacement must exceed (mult * ATR)
+FVG_LOOKBACK = 30              # scan last N completed candles for FVG
+FVG_MIN_FILL = 0.5             # require ≥50% fill before quoting into an FVG
+SMC_LOG = True                 # add SMC decisions into scan_log
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
@@ -307,6 +316,132 @@ def _atr_and_pct(pair, last, window=ATR_WINDOW):
     atr = sum(trs)/len(trs) if trs else None
     atr_pct = (atr/last) if (atr and last > 0) else None
     return atr, atr_pct
+
+# ----------- SMC helpers (swings, BOS, sweeps, FVG) -----------
+def _find_swings(cs, left=2, right=2):
+    """Return indices for swing highs and lows in completed candles."""
+    highs, lows = [], []
+    n = len(cs)
+    for i in range(left, n-right):
+        h = cs[i]["high"]
+        l = cs[i]["low"]
+        if all(h >= cs[i-k]["high"] for k in range(1, left+1)) and all(h >= cs[i+k]["high"] for k in range(1, right+1)):
+            highs.append(i)
+        if all(l <= cs[i-k]["low"] for k in range(1, left+1)) and all(l <= cs[i+k]["low"] for k in range(1, right+1)):
+            lows.append(i)
+    return highs, lows
+
+def _recent_bos(cs, highs, lows, atr, side="up", lookback=60, displacement_mult=1.2):
+    """
+    Detect recent Break of Structure:
+    - side="up": close > last swing high + displacement
+    - side="down": close < last swing low  - displacement
+    Returns (True/False, level_index, level_price)
+    """
+    if not cs or atr is None:
+        return False, None, None
+    start = max(0, len(cs)-lookback)
+    segment = cs[start:-1] if len(cs) > 1 else cs
+    if side == "up" and highs:
+        hidx = [i for i in highs if i >= start]
+        if not hidx: return False, None, None
+        last_high_i = hidx[-1]
+        key_level = cs[last_high_i]["high"]
+        for i in range(last_high_i+1, len(cs)-1):
+            if cs[i]["close"] > key_level + displacement_mult*atr:
+                return True, last_high_i, key_level
+    if side == "down" and lows:
+        lidx = [i for i in lows if i >= start]
+        if not lidx: return False, None, None
+        last_low_i = lidx[-1]
+        key_level = cs[last_low_i]["low"]
+        for i in range(last_low_i+1, len(cs)-1):
+            if cs[i]["close"] < key_level - displacement_mult*atr:
+                return True, last_low_i, key_level
+    return False, None, None
+
+def _recent_sweep(cs, highs, lows, lookback=60):
+    """
+    Liquidity sweep:
+    - Sell-side sweep (SSL): price takes out recent low (wick closes back within prior range)
+    - Buy-side sweep (BSL): price takes out recent high (wick closes back)
+    Returns one of: "SSL", "BSL", None
+    """
+    if len(cs) < 5:
+        return None
+    start = max(0, len(cs)-lookback-1)
+    prev = cs[start: -1]  # completed candles excluding last closed
+    last_closed = cs[-2]  # the most recent completed candle
+    if not prev:
+        return None
+    recent_low = min(c["low"] for c in prev[-10:])
+    recent_high = max(c["high"] for c in prev[-10:])
+
+    # SSL: low pierces below recent_low but closes back above it
+    if last_closed["low"] < recent_low and last_closed["close"] > recent_low:
+        return "SSL"
+    # BSL: high pierces above recent_high but closes back below it
+    if last_closed["high"] > recent_high and last_closed["close"] < recent_high:
+        return "BSL"
+    return None
+
+def _recent_fvg(cs, lookback=30):
+    """
+    Fair Value Gap (3-candle): bullish if L1 > H-1; bearish if H1 < L-1
+    Return dict {"type": "bull"/"bear", "gap": (low, high), "filled_pct": 0..1}
+    using last discovered FVG within lookback, else None.
+    """
+    n = len(cs)
+    start = max(0, n - lookback)
+    fvg = None
+    for i in range(start+2, n):  # need i-2, i-1, i
+        c0, c1, c2 = cs[i-2], cs[i-1], cs[i]
+        # bullish FVG: low(c2) > high(c0)
+        if c2["low"] > c0["high"]:
+            gap_low, gap_high = c0["high"], c2["low"]
+            # fill measure on subsequent candles (including c2 close onward)
+            post = cs[i:]
+            min_after = min([x["low"] for x in post]) if post else c2["low"]
+            filled = max(0.0, min(1.0, (gap_high - max(gap_low, min_after)) / max(1e-12, (gap_high-gap_low))))
+            fvg = {"type": "bull", "gap": (gap_low, gap_high), "filled_pct": filled}
+        # bearish FVG: high(c2) < low(c0)
+        if c2["high"] < c0["low"]:
+            gap_low, gap_high = c2["high"], c0["low"]
+            post = cs[i:]
+            max_after = max([x["high"] for x in post]) if post else c2["high"]
+            filled = max(0.0, min(1.0, (min(gap_high, max_after) - gap_low) / max(1e-12, (gap_high-gap_low))))
+            fvg = {"type": "bear", "gap": (gap_low, gap_high), "filled_pct": filled}
+    return fvg
+
+def _smc_bias(pair, last, atr):
+    """
+    Compute SMC context using completed candles:
+    - BOS up/down using swings + displacement
+    - recent liquidity sweep (SSL/BSL)
+    - last FVG and its filled percentage
+    Returns dict with 'bias' ('bull'/'bear'/None), 'sweep', 'fvg'
+    """
+    cs = candle_logs.get(pair) or []
+    if len(cs) < max(SMC_LOOKBACK, ATR_WINDOW) + 3:
+        return {"bias": None, "sweep": None, "fvg": None}
+
+    completed = cs[:-1] if len(cs) >= 2 else cs
+    highs, lows = _find_swings(completed[-SMC_LOOKBACK:], SMC_LEFT, SMC_RIGHT)
+    # adjust indices relative to completed window
+    offset = len(completed[-SMC_LOOKBACK:])
+    highs = [i + len(completed) - offset for i in highs]
+    lows  = [i + len(completed) - offset for i in lows]
+
+    bos_up, _, key_high = _recent_bos(completed, highs, lows, atr, side="up",
+                                      lookback=SMC_LOOKBACK, displacement_mult=SMC_DISPLACEMENT_MULT)
+    bos_dn, _, key_low  = _recent_bos(completed, highs, lows, atr, side="down",
+                                      lookback=SMC_LOOKBACK, displacement_mult=SMC_DISPLACEMENT_MULT)
+    bias = "bull" if (bos_up and not bos_dn) else "bear" if (bos_dn and not bos_up) else None
+
+    sweep = _recent_sweep(completed, highs, lows, lookback=SMC_LOOKBACK)
+    fvg   = _recent_fvg(completed, lookback=FVG_LOOKBACK)
+
+    return {"bias": bias, "sweep": sweep, "fvg": fvg}
 
 # -------------------- Exchange calls --------------------
 def place_order(pair, side, qty):
@@ -558,6 +693,13 @@ def scan_loop():
 
             atr_abs, atr_pct = _atr_and_pct(pair, last, ATR_WINDOW)
 
+            # -------- SMC context --------
+            smc = _smc_bias(pair, last, atr_abs)
+            smc_bias = smc.get("bias")
+            smc_sweep = smc.get("sweep")
+            smc_fvg = smc.get("fvg")
+
+            # base quotes with adaptive spread
             bid_px, ask_px = _quote_prices(last, atr_pct)
 
             usdt = balances.get("USDT", 0.0)
@@ -571,21 +713,51 @@ def scan_loop():
             trend_bias_bid = 1.2 if bullish else 0.9
             trend_bias_ask = 1.2 if not bullish else 0.9
 
-            # determine allowed sides
+            # -------- Allowed sides (ATR/slope + SMC) --------
             allow_bid, allow_ask = True, True
             if gross_usdt > INVENTORY_USDT_CAP:
                 allow_bid = False
             if atr_pct is not None and atr_pct > MAX_ATR_PCT:
-                # turbulence: stand aside on bids
-                allow_bid = False
+                allow_bid = False  # turbulence: avoid catching knives
+
             if slope_pct is not None and slope_pct > MAX_SLOPE_PCT:
                 # steep trend: quote only away from direction
                 if bullish:
-                    allow_ask = False  # avoid offering into squeeze; prefer to buy dips (still risky)
+                    allow_ask = False
                     allow_bid = True
                 else:
                     allow_bid = False
                     allow_ask = True
+
+            # SMC bias: prefer side with structure (BOS) and react to sweeps
+            if smc_bias == "bull":
+                allow_ask = min(allow_ask, True)
+                allow_bid = True
+            elif smc_bias == "bear":
+                allow_bid = min(allow_bid, True)
+                allow_ask = True
+
+            # Liquidity sweeps: SSL -> favor BUY (mean reversion); BSL -> favor SELL
+            if smc_sweep == "SSL":
+                allow_ask = False  # avoid offering into recovery; let it revert then sell later
+                allow_bid = True
+            elif smc_sweep == "BSL":
+                allow_bid = False
+                allow_ask = True
+
+            # FVG filter: avoid quoting INTO an unfilled adverse FVG
+            # - If bullish FVG and filled < 50%, prefer buys, avoid sells into the gap
+            # - If bearish FVG and filled < 50%, prefer sells, avoid buys into the gap
+            if smc_fvg and smc_fvg.get("filled_pct", 1.0) < FVG_MIN_FILL:
+                if smc_fvg.get("type") == "bull":
+                    allow_ask = False
+                    allow_bid = allow_bid and True
+                elif smc_fvg.get("type") == "bear":
+                    allow_bid = False
+                    allow_ask = allow_ask and True
+
+            if SMC_LOG:
+                scan_log.append(f"{ist_now()} | {pair} | SMC bias={smc_bias} sweep={smc_sweep} fvg={smc_fvg}")
 
             # cancel stale/moved quotes
             for side_key, q in list(active_quotes[pair].items()):
@@ -612,7 +784,6 @@ def scan_loop():
                     qty_to_sell = max(qty_to_sell, rule["min_qty"])
                     qty_to_sell = round(qty_to_sell, rule["precision"])
                     if qty_to_sell > 0:
-                        # cancel current bids to avoid re-catching the knife
                         _cancel_quote(pair, "bid")
                         res = place_order(pair, "SELL", qty_to_sell)
                         oid = _extract_order_id(res)
@@ -621,7 +792,6 @@ def scan_loop():
                             _record_fill_from_status(pair, "SELL", st, oid)
                         scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH: SOLD {qty_to_sell} due to {round(100*(entry-last)/entry,3)}% drop | res={res}")
                         kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
-                        # reduce remembered fill qty
                         last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
 
             # sizing for quotes
