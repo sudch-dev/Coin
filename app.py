@@ -364,33 +364,45 @@ def _gross_inventory_usdt(prices):
         total += q * px
     return total
 
-def _cancel_quote(pair, side):
-    q = active_quotes[pair][side]
+def _cancel_quote(pair, side_key):
+    q = active_quotes.get(pair, {}).get(side_key)
     if not q: return
     oid = q.get("id")
     if oid:
         cancel_order(order_id=oid)
-        scan_log.append(f"{ist_now()} | {pair} | cancel {side} quote {oid}")
-    active_quotes[pair][side] = None
+        scan_log.append(f"{ist_now()} | {pair} | cancel {side_key} quote {oid}")
+    active_quotes[pair][side_key] = None
 
-def _place_quote(pair, side, price, qty):
-    res = place_limit_order(pair, side, qty, price)
+def _place_quote(pair, side_word, price, qty):
+    # side_word: "BUY" or "SELL"
+    res = place_limit_order(pair, side_word, qty, price)
     oid = _extract_order_id(res)
-    active_quotes[pair][side] = {"id": oid, "px": price, "qty": qty, "ts": int(time.time())}
-    scan_log.append(f"{ist_now()} | {pair} | quote {side} {qty} @ {price} | id={oid} | res={res}")
+    side_key = "bid" if side_word == "BUY" else "ask"
+    active_quotes[pair][side_key] = {"id": oid, "px": price, "qty": qty, "ts": int(time.time())}
+    scan_log.append(f"{ist_now()} | {pair} | quote {side_word} {qty} @ {price} | id={oid} | res={res}")
     return oid
 
-def _check_quote_fill(pair, side):
-    q = active_quotes[pair][side]
-    if not q or not q.get("id"): return False
+def _check_quote_fill(pair, side_key):
+    """
+    side_key: 'bid' or 'ask'
+    Translates to order side 'BUY' (bid) or 'SELL' (ask) for P&L accounting.
+    """
+    q = active_quotes.get(pair, {}).get(side_key)
+    if not q or not q.get("id"):
+        return False
+
     st = get_order_status(order_id=q["id"])
+
+    # determine fill status robustly
     rem = _fnum(st.get("remaining_quantity", st.get("remaining_qty", st.get("leaves_qty", 0))))
     status_txt = (st.get("status") or "").lower()
     filled = (rem == 0) or ("filled" in status_txt and "part" not in status_txt)
+
     if filled:
-        _record_fill_from_status(pair, side, st, q["id"])
-        active_quotes[pair][side] = None
-        scan_log.append(f"{ist_now()} | {pair} | FILL {side} | st={st}")
+        order_side = "BUY" if side_key == "bid" else "SELL"
+        _record_fill_from_status(pair, order_side, st, q["id"])
+        active_quotes[pair][side_key] = None
+        scan_log.append(f"{ist_now()} | {pair} | FILL {order_side} | st={st}")
         return True
     return False
 
@@ -485,18 +497,18 @@ def scan_loop():
 
             # cancel stale/moved quotes
             now_ts = now
-            for side, q in list(active_quotes[pair].items()):
+            for side_key, q in list(active_quotes[pair].items()):
                 if not q:
                     continue
                 age = now_ts - int(q.get("ts", now_ts))
                 px = q.get("px", last)
                 drift = abs(last - px) / max(px, 1e-9)
                 if age >= QUOTE_TTL_SEC or drift >= DRIFT_REQUOTE_PCT:
-                    _cancel_quote(pair, side)
+                    _cancel_quote(pair, side_key)
 
             # check fills
-            for side in ("bid", "ask"):
-                _check_quote_fill(pair, "BUY" if side == "bid" else "SELL")
+            for side_key in ("bid", "ask"):
+                _check_quote_fill(pair, side_key)
 
             # place quotes if empty
             if qty_bid > 0 and not active_quotes[pair]["bid"]:
