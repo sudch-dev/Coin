@@ -6,6 +6,7 @@ import hashlib
 import requests
 import json
 import traceback
+import re
 from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
@@ -44,9 +45,24 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.01}
 }
 
-# Populated from markets_details
+# Populated from markets_details & error learning
 # PAIR_META[pair] = {"qty_step","qty_min","qty_prec","px_tick","px_prec","min_price","max_price"}
 PAIR_META = {p: {} for p in PAIRS}
+
+# Seed px_prec from your error logs (helps before first learn)
+SEED_PX_PREC = {
+    "BTCUSDT": 1,
+    "LTCUSDT": 2,
+    "SOLUSDT": 2,
+    "BNBUSDT": 3,
+    "AEROUSDT": 3,
+    "ADAUSDT": 4,
+    "DOGEUSDT": 5
+}
+for _p, _n in SEED_PX_PREC.items():
+    if _p in PAIR_META:
+        PAIR_META[_p]["px_prec"] = _n
+        PAIR_META[_p]["px_tick"] = 10 ** (-_n)
 
 # -------------------- Engine settings (maker / spread capture) --------------------
 CANDLE_INTERVAL = 10
@@ -226,7 +242,6 @@ def _keepalive_ping():
 # -------------------- Balance & meta --------------------
 def get_wallet_balances():
     """
-    FIXED: this function exists and is signed correctly.
     Returns dict like {"USDT": 123.45, "BTC": 0.01, ...}
     """
     body = {"timestamp": int(time.time() * 1000)}
@@ -280,20 +295,25 @@ def fetch_pair_precisions():
 
         qty_prec = _safe_int(item.get("base_currency_precision"),
                              default=PAIR_RULES.get(m, {}).get("precision", 6))
-        px_prec  = _safe_int(item.get("target_currency_precision"), default=6)
+        px_prec  = _safe_int(item.get("target_currency_precision"), default=None)
 
         if qty_step is None: qty_step = 10 ** (-qty_prec)
-        if px_tick is None:  px_tick  = 10 ** (-px_prec)
+        if px_prec is not None:
+            px_tick = 10 ** (-px_prec)
+        elif px_tick is None:
+            px_prec = 6
+            px_tick = 10 ** (-px_prec)
 
-        PAIR_META[m] = {
+        meta = PAIR_META.setdefault(m, {})
+        meta.update({
             "qty_step": qty_step,
             "qty_min": qty_min,
             "qty_prec": qty_prec,
             "px_tick": px_tick,
-            "px_prec": px_prec,
+            "px_prec": px_prec if px_prec is not None else meta.get("px_prec", 6),
             "min_price": px_min,
             "max_price": px_max
-        }
+        })
 
 # -------------------- Precision helpers --------------------
 def _q_dec(step):
@@ -332,26 +352,73 @@ def quantize_qty(pair, qty, side=None, balance=None):
     return float(q)
 
 def quantize_price(pair, price, side=None):
+    """
+    Floor to tick derived from px_prec or px_tick; clamp to min/max if given.
+    Never rounds UP.
+    """
     meta = PAIR_META.get(pair, {})
-    px_tick = meta.get("px_tick", 10 ** (-meta.get("px_prec", 6)))
-    px_prec = meta.get("px_prec", 6)
-    px_min  = meta.get("min_price", None)
-    px_max  = meta.get("max_price", None)
+
+    px_prec = meta.get("px_prec", None)
+    if px_prec is not None:
+        tick = Decimal('1').scaleb(-int(px_prec))
+    else:
+        px_tick = meta.get("px_tick", 10 ** (-meta.get("px_prec", 6)))
+        tick = Decimal(str(px_tick))
 
     p = Decimal(str(max(0.0, price)))
-    tick = _q_dec(px_tick)
     if tick > 0:
-        p = (p // tick) * tick  # floor to grid
+        p = (p // tick) * tick  # grid floor
 
+    px_min = meta.get("min_price", None)
+    px_max = meta.get("max_price", None)
     if px_min is not None: p = max(p, Decimal(str(px_min)))
     if px_max is not None: p = min(p, Decimal(str(px_max)))
 
-    fmt = Decimal("1e-" + str(px_prec)) if px_prec > 0 else Decimal("1")
+    fmt = (Decimal('1').scaleb(-int(px_prec))) if px_prec is not None else tick
     try:
         p = p.quantize(fmt, rounding=ROUND_DOWN)
     except:
         pass
     return float(p)
+
+# -------------------- Learn precision from error & retry --------------------
+PRECISION_ERR_RE = re.compile(r'precision\s+should\s+be\s+(\d+)', re.IGNORECASE)
+
+def _learn_quote_precision_from_error(pair: str, message: str) -> bool:
+    """
+    Parse 'USDT precision should be N' and update PAIR_META for this pair.
+    Returns True if updated.
+    """
+    if not message:
+        return False
+    m = PRECISION_ERR_RE.search(str(message))
+    if not m:
+        return False
+    n = int(m.group(1))
+    meta = PAIR_META.setdefault(pair, {})
+    meta['px_prec'] = n
+    meta['px_tick'] = 10 ** (-n)
+    scan_log.append(f"{ist_now()} | {pair} | learned quote px_prec={n} from error; will re-quantize and retry")
+    return True
+
+def _post_order_with_retry(url: str, pair: str, payload_builder, side: str, qty: float, price: float | None, is_limit: bool):
+    """
+    payload_builder(side, qty, price) -> dict
+    Post once; if 'precision should be N' returned, learn N, re-quantize and retry once.
+    """
+    payload = payload_builder(side, qty, price)
+    res = _signed_post(url, payload) or {}
+    if isinstance(res, dict) and str(res.get('status')).lower() == 'error':
+        msg = res.get('message', '')
+        if _learn_quote_precision_from_error(pair, msg):
+            q = quantize_qty(pair, qty, side=side)
+            p = price
+            if is_limit and price is not None:
+                p = quantize_price(pair, price, side=side)
+            payload = payload_builder(side, q, p)
+            res2 = _signed_post(url, payload) or {}
+            return res2
+    return res
 
 # -------------------- Market data / indicators --------------------
 def fetch_all_prices():
@@ -406,24 +473,61 @@ def _atr_and_pct(pair, last, window=ATR_WINDOW):
     atr_pct = (atr/last) if (atr and last > 0) else None
     return atr, atr_pct
 
-# -------------------- Exchange calls (names unchanged) --------------------
-def place_order(pair, side, qty):
-    qty = quantize_qty(pair, qty, side=side)  # ensure precision even for market
-    payload = {
-        "market": pair, "side": side.lower(), "order_type": "market_order",
-        "total_quantity": str(qty), "timestamp": int(time.time() * 1000)
-    }
-    return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+# -------------------- SMC gate (BOS + premium/discount) --------------------
+def _swing_highs_lows(candles, lookback=10):
+    if len(candles) < lookback + 2:
+        return None, None
+    completed = candles[:-1]
+    recent = completed[-lookback:]
+    high = max(c['high'] for c in recent)
+    low  = min(c['low']  for c in recent)
+    return high, low
 
+def smc_gate(pair, last_price, lookback=10):
+    """
+    Minimal SMC:
+    - BOS if last completed close > recent swing high (bull) or < swing low (bear)
+    - Gate: in bull, only buy in discount (< mid); in bear, only sell in premium (> mid)
+    """
+    cs = candle_logs.get(pair) or []
+    if len(cs) < lookback + 2:
+        return True, True, 'neutral'
+    completed = cs[:-1]
+    last_close = completed[-1]['close']
+    swing_hi, swing_lo = _swing_highs_lows(cs, lookback)
+    if swing_hi is None:
+        return True, True, 'neutral'
+    mid = (swing_hi + swing_lo) / 2.0
+    bull = last_close > swing_hi
+    bear = last_close < swing_lo
+    if bull:
+        return (last_price <= mid), False, 'bull'
+    if bear:
+        return False, (last_price >= mid), 'bear'
+    return True, True, 'neutral'
+
+# -------------------- Exchange calls (names unchanged) --------------------
 def place_limit_order(pair, side, qty, price):
-    qty   = quantize_qty(pair, qty, side=side)
-    price = quantize_price(pair, price, side=side)
-    payload = {
-        "market": pair, "side": side.lower(), "order_type": "limit_order",
-        "price_per_unit": str(price), "total_quantity": str(qty),
-        "timestamp": int(time.time() * 1000)
-    }
-    return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+    def _builder(s, q, p):
+        q = quantize_qty(pair, q, side=s)
+        p = quantize_price(pair, p, side=s)
+        return {
+            "market": pair, "side": s.lower(), "order_type": "limit_order",
+            "price_per_unit": str(p), "total_quantity": str(q),
+            "timestamp": int(time.time() * 1000)
+        }
+    url = f"{BASE_URL}/exchange/v1/orders/create"
+    return _post_order_with_retry(url, pair, _builder, side, qty, price, is_limit=True)
+
+def place_order(pair, side, qty):
+    def _builder(s, q, _):
+        q = quantize_qty(pair, q, side=s)
+        return {
+            "market": pair, "side": s.lower(), "order_type": "market_order",
+            "total_quantity": str(q), "timestamp": int(time.time() * 1000)
+        }
+    url = f"{BASE_URL}/exchange/v1/orders/create"
+    return _post_order_with_retry(url, pair, _builder, side, qty, None, is_limit=False)
 
 def cancel_order(order_id=None, client_order_id=None):
     body = {"timestamp": int(time.time() * 1000)}
@@ -578,7 +682,6 @@ def scan_loop():
     running = True
 
     while running:
-        # keep Render awake
         now_real = time.time()
         if now_real - last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
@@ -619,6 +722,7 @@ def scan_loop():
                 for side_key in ("bid", "ask"): _check_quote_fill(pair, side_key, last)
                 continue
 
+            # indicators
             closes = [c["close"] for c in (candle_logs.get(pair) or [])[:-1]]
             ema_fast = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_FAST) if len(closes) >= EMA_SLOW else None
             ema_slow = _ema(closes[-(EMA_SLOW+EMA_FAST):] + [last], EMA_SLOW) if len(closes) >= EMA_SLOW else None
@@ -649,6 +753,13 @@ def scan_loop():
             if slope_pct is not None and slope_pct > MAX_SLOPE_PCT:
                 if bullish: allow_ask = False
                 else:       allow_bid = False
+
+            # --- SMC filter (final gate) ---
+            smc_bid, smc_ask, smc_regime = smc_gate(pair, last, lookback=10)
+            allow_bid = allow_bid and smc_bid
+            allow_ask = allow_ask and smc_ask
+            if smc_regime != 'neutral':
+                scan_log.append(f"{ist_now()} | {pair} | SMC {smc_regime.upper()} | allow_bid={smc_bid} allow_ask={smc_ask}")
 
             # cancel stale quotes
             for side_key, q in list(active_quotes[pair].items()):
@@ -785,7 +896,7 @@ if os.environ.get("AUTOSTART", "1") == "1":
 
 if __name__ == "__main__":
     load_profit_state()
-    fetch_pair_precisions()      # ← loads tick/step/min/precision
+    fetch_pair_precisions()      # loads tick/step/min/precision
     _start_loop_once()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
