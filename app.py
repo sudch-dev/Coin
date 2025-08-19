@@ -11,20 +11,18 @@ from datetime import datetime, timedelta
 from pytz import timezone
 from collections import deque
 from decimal import Decimal, ROUND_DOWN, getcontext
-import math
 
-# Higher precision math for quantization
+# High precision math for quantization
 getcontext().prec = 28
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
-
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://coin-4k37.onrender.com")
 
 # -------------------- API / Markets --------------------
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("API_KEY") or ""
 API_SECRET_RAW = os.environ.get("API_SECRET", "")
-API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API_SECRET_RAW
+API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else (API_SECRET_RAW or b"")
 BASE_URL = "https://api.coindcx.com"
 
 PAIRS = [
@@ -32,7 +30,7 @@ PAIRS = [
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
 ]
 
-# Local emergency fallbacks (will be overridden by markets_details)
+# Local fallbacks (overridden by markets_details when available)
 PAIR_RULES = {
     "BTCUSDT": {"precision": 6, "min_qty": 0.0005},
     "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
@@ -46,15 +44,11 @@ PAIR_RULES = {
     "BNBUSDT": {"precision": 4, "min_qty": 0.01}
 }
 
-# Precision/meta fetched from exchange:
-# PAIR_META[pair] = {
-#   "qty_step", "qty_min", "qty_prec",
-#   "px_tick", "px_prec", "min_price", "max_price"
-# }
+# Populated from markets_details
+# PAIR_META[pair] = {"qty_step","qty_min","qty_prec","px_tick","px_prec","min_price","max_price"}
 PAIR_META = {p: {} for p in PAIRS}
 
-# -------------------- Maker / HFT settings (same as before) --------------------
-MODE = "maker"
+# -------------------- Engine settings (maker / spread capture) --------------------
 CANDLE_INTERVAL = 10
 POLL_SEC = 1.0
 QUOTE_TTL_SEC = 4
@@ -68,7 +62,6 @@ ATR_WINDOW = 18
 ATR_SPREAD_MULT = 1.5
 MAX_ATR_PCT = 0.0020
 MAX_SLOPE_PCT = 0.0020
-
 EMA_FAST, EMA_SLOW = 5, 20
 
 MAX_PER_PAIR_USDT = 40.0
@@ -112,9 +105,9 @@ last_buy_fill = {p: {"entry": None, "qty": 0.0, "ts": 0} for p in PAIRS}
 # -------------------- Persistent P&L (FIFO) --------------------
 PROFIT_STATE_FILE = "profit_state.json"
 profit_state = {
-    "cumulative_pnl": 0.0,
+    "cumulative_pnl": 0.0,  # USDT
     "daily": {},
-    "inventory": {},
+    "inventory": {},        # market -> [[qty, price], ...]
     "processed_orders": []
 }
 
@@ -170,7 +163,6 @@ def apply_fill_update(market, side, price, qty, ts_ms, order_id):
 
     inv = _get_inventory_deque(market)
     realized = 0.0
-
     if side.lower() == "buy":
         inv.append([qty, price])
     else:
@@ -193,8 +185,8 @@ def apply_fill_update(market, side, price, qty, ts_ms, order_id):
     profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
     save_profit_state()
 
-# -------------------- HTTP helpers --------------------
-def hmac_signature(payload):
+# -------------------- HTTP + signing helpers --------------------
+def hmac_signature(payload: str) -> str:
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
 def _log_http_issue(prefix, r):
@@ -204,10 +196,15 @@ def _log_http_issue(prefix, r):
     except Exception as e:
         scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
 
-def _signed_post(url, body):
-    payload = json.dumps(body, separators=(',', ':'))
+def _signed_post(url, body_dict):
+    """
+    CoinDCX private endpoints accept JSON body with:
+      headers: X-AUTH-APIKEY / X-AUTH-SIGNATURE
+      signature = HMAC_SHA256(API_SECRET, json.dumps(body))
+    """
+    payload = json.dumps(body_dict, separators=(',', ':'))
     sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
     try:
         r = requests.post(url, headers=headers, data=payload, timeout=12)
         if not r.ok:
@@ -226,53 +223,22 @@ def _keepalive_ping():
     except Exception:
         pass
 
-# -------------------- Precision meta fetch & quantizers --------------------
-def fetch_pair_precisions():
+# -------------------- Balance & meta --------------------
+def get_wallet_balances():
     """
-    Populate PAIR_META from CoinDCX markets_details.
-    Falls back to PAIR_RULES if any field missing.
+    FIXED: this function exists and is signed correctly.
+    Returns dict like {"USDT": 123.45, "BTC": 0.01, ...}
     """
+    body = {"timestamp": int(time.time() * 1000)}
+    res = _signed_post(f"{BASE_URL}/exchange/v1/users/balances", body)
+    balances = {}
     try:
-        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=12)
-        if not r.ok:
-            _log_http_issue("markets_details", r)
-            return
-        data = r.json()
+        if isinstance(res, list):
+            for b in res:
+                balances[b["currency"]] = float(b.get("balance", 0.0))
     except Exception as e:
-        scan_log.append(f"{ist_now()} | markets_details fail: {e}")
-        return
-
-    for item in data:
-        m = item.get("pair") or item.get("market") or item.get("coindcx_name")
-        if m not in PAIRS:
-            continue
-
-        # Try to extract common fields; many exchanges expose some variation
-        qty_min = _safe_float(item.get("min_quantity"), default=PAIR_RULES.get(m, {}).get("min_qty", 0.0))
-        qty_step = _safe_float(item.get("step_size"), default=None)
-        px_tick = _safe_float(item.get("tick_size"), default=None)
-        px_min  = _safe_float(item.get("min_price"), default=None)
-        px_max  = _safe_float(item.get("max_price"), default=None)
-
-        # Precisions (base for qty, target for price usually)
-        qty_prec = _safe_int(item.get("base_currency_precision"), default=PAIR_RULES.get(m, {}).get("precision", 6))
-        px_prec  = _safe_int(item.get("target_currency_precision"), default=6)
-
-        # If step/tick absent, derive from precision (1e-precision)
-        if qty_step is None:
-            qty_step = 10 ** (-qty_prec)
-        if px_tick is None:
-            px_tick = 10 ** (-px_prec)
-
-        PAIR_META[m] = {
-            "qty_step": qty_step,
-            "qty_min": qty_min,
-            "qty_prec": qty_prec,
-            "px_tick": px_tick,
-            "px_prec": px_prec,
-            "min_price": px_min,
-            "max_price": px_max
-        }
+        scan_log.append(f"{ist_now()} | balances parse fail: {e}")
+    return balances
 
 def _safe_float(x, default=None):
     try:
@@ -288,18 +254,52 @@ def _safe_int(x, default=None):
     except:
         return default
 
+def fetch_pair_precisions():
+    """
+    Populate PAIR_META with tick/step/min/precision using markets_details.
+    Falls back to PAIR_RULES if fields are missing.
+    """
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=12)
+        if not r.ok:
+            _log_http_issue("markets_details", r); return
+        data = r.json()
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | markets_details fail: {e}")
+        return
+
+    for item in data:
+        m = item.get("pair") or item.get("market") or item.get("coindcx_name")
+        if m not in PAIRS:
+            continue
+        qty_min = _safe_float(item.get("min_quantity"), default=PAIR_RULES.get(m, {}).get("min_qty", 0.0))
+        qty_step = _safe_float(item.get("step_size"), default=None)
+        px_tick = _safe_float(item.get("tick_size"), default=None)
+        px_min  = _safe_float(item.get("min_price"), default=None)
+        px_max  = _safe_float(item.get("max_price"), default=None)
+
+        qty_prec = _safe_int(item.get("base_currency_precision"),
+                             default=PAIR_RULES.get(m, {}).get("precision", 6))
+        px_prec  = _safe_int(item.get("target_currency_precision"), default=6)
+
+        if qty_step is None: qty_step = 10 ** (-qty_prec)
+        if px_tick is None:  px_tick  = 10 ** (-px_prec)
+
+        PAIR_META[m] = {
+            "qty_step": qty_step,
+            "qty_min": qty_min,
+            "qty_prec": qty_prec,
+            "px_tick": px_tick,
+            "px_prec": px_prec,
+            "min_price": px_min,
+            "max_price": px_max
+        }
+
+# -------------------- Precision helpers --------------------
 def _q_dec(step):
-    """
-    Return a Decimal quantum ("step") suitable for quantize().
-    e.g. step=0.001 -> Decimal('0.001')
-    """
     return Decimal(str(step)).normalize()
 
 def quantize_qty(pair, qty, side=None, balance=None):
-    """
-    Floor quantity to step and precision; enforce min qty; cap by balance for SELL.
-    Never rounds up (avoid "precision over max" / "min qty" rejections).
-    """
     meta = PAIR_META.get(pair, {})
     rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
 
@@ -310,23 +310,20 @@ def quantize_qty(pair, qty, side=None, balance=None):
     q = Decimal(str(max(0.0, qty)))
     step_dec = _q_dec(step)
     if step_dec > 0:
-        q = (q // step_dec) * step_dec  # ROUND_DOWN to step grid
-    # SELL cannot exceed balance (floored to step)
+        q = (q // step_dec) * step_dec  # floor to grid
+
     if side == "SELL" and balance is not None:
         bal = Decimal(str(max(0.0, balance)))
         if step_dec > 0:
             bal = (bal // step_dec) * step_dec
         q = min(q, bal)
 
-    # Enforce min qty
     if q < Decimal(str(min_q)):
-        # try to bump up to min_q if BUY and we have balance; else stays 0
-        if side == "BUY" and balance is not None:
+        if side == "BUY":
             q = Decimal(str(min_q))
         else:
             q = Decimal("0")
 
-    # Final precision clamp (ROUND_DOWN)
     fmt = Decimal("1e-" + str(prec)) if prec > 0 else Decimal("1")
     try:
         q = q.quantize(fmt, rounding=ROUND_DOWN)
@@ -335,10 +332,6 @@ def quantize_qty(pair, qty, side=None, balance=None):
     return float(q)
 
 def quantize_price(pair, price, side=None):
-    """
-    Floor price to tick/precision and clamp inside min/max if exchange provides it.
-    Never rounds up across the grid; for bids, ensure we don't cross the spread.
-    """
     meta = PAIR_META.get(pair, {})
     px_tick = meta.get("px_tick", 10 ** (-meta.get("px_prec", 6)))
     px_prec = meta.get("px_prec", 6)
@@ -348,13 +341,10 @@ def quantize_price(pair, price, side=None):
     p = Decimal(str(max(0.0, price)))
     tick = _q_dec(px_tick)
     if tick > 0:
-        p = (p // tick) * tick  # ROUND_DOWN to tick grid
+        p = (p // tick) * tick  # floor to grid
 
-    # Clamp to price bounds if any
-    if px_min is not None:
-        p = max(p, Decimal(str(px_min)))
-    if px_max is not None:
-        p = min(p, Decimal(str(px_max)))
+    if px_min is not None: p = max(p, Decimal(str(px_min)))
+    if px_max is not None: p = min(p, Decimal(str(px_max)))
 
     fmt = Decimal("1e-" + str(px_prec)) if px_prec > 0 else Decimal("1")
     try:
@@ -379,28 +369,24 @@ def fetch_all_prices():
 
 def aggregate_candles(pair, interval=CANDLE_INTERVAL):
     ticks = tick_logs[pair]
-    if not ticks:
-        return
+    if not ticks: return
     candles, candle, last_window = [], None, None
     for ts, price in sorted(ticks, key=lambda x: x[0]):
         wstart = ts - (ts % interval)
         if last_window != wstart:
-            if candle:
-                candles.append(candle)
+            if candle: candles.append(candle)
             candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
             last_window = wstart
         else:
             candle["high"] = max(candle["high"], price)
-            candle["low"] = min(candle["low"], price)
+            candle["low"]  = min(candle["low"], price)
             candle["close"] = price
             candle["volume"] += 1
-    if candle:
-        candles.append(candle)
+    if candle: candles.append(candle)
     candle_logs[pair] = candles[-240:]
 
 def _ema(vals, n):
-    if len(vals) < n:
-        return None
+    if len(vals) < n: return None
     k = 2 / (n + 1)
     ema = sum(vals[:n]) / n
     for v in vals[n:]:
@@ -409,8 +395,7 @@ def _ema(vals, n):
 
 def _atr_and_pct(pair, last, window=ATR_WINDOW):
     cs = candle_logs.get(pair) or []
-    if len(cs) <= window:
-        return None, None
+    if len(cs) <= window: return None, None
     trs = []
     prev_close = cs[-window-1]["close"]
     for c in cs[-window:]:
@@ -423,7 +408,7 @@ def _atr_and_pct(pair, last, window=ATR_WINDOW):
 
 # -------------------- Exchange calls (names unchanged) --------------------
 def place_order(pair, side, qty):
-    qty = quantize_qty(pair, qty, side=side)  # ensure precision for market too
+    qty = quantize_qty(pair, qty, side=side)  # ensure precision even for market
     payload = {
         "market": pair, "side": side.lower(), "order_type": "market_order",
         "total_quantity": str(qty), "timestamp": int(time.time() * 1000)
@@ -431,13 +416,12 @@ def place_order(pair, side, qty):
     return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
 
 def place_limit_order(pair, side, qty, price):
-    qty = quantize_qty(pair, qty, side=side)
+    qty   = quantize_qty(pair, qty, side=side)
     price = quantize_price(pair, price, side=side)
     payload = {
         "market": pair, "side": side.lower(), "order_type": "limit_order",
         "price_per_unit": str(price), "total_quantity": str(qty),
         "timestamp": int(time.time() * 1000)
-        # add post-only here if CoinDCX supports it
     }
     return _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
 
@@ -455,8 +439,7 @@ def get_order_status(order_id=None, client_order_id=None):
     return res if isinstance(res, dict) else {}
 
 def _extract_order_id(res: dict):
-    if not isinstance(res, dict):
-        return None
+    if not isinstance(res, dict): return None
     try:
         if isinstance(res.get("orders"), list) and res["orders"]:
             o = res["orders"][0]
@@ -466,10 +449,8 @@ def _extract_order_id(res: dict):
     return str(res.get("id") or res.get("order_id") or res.get("client_order_id") or res.get("orderId") or "") or None
 
 def _fnum(x, d=0.0):
-    try:
-        return float(x)
-    except:
-        return d
+    try: return float(x)
+    except: return d
 
 def _record_fill_from_status(market, side, st, order_id):
     if not isinstance(st, dict): return 0.0, 0.0
@@ -479,10 +460,10 @@ def _record_fill_from_status(market, side, st, order_id):
     filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
     avg_px   = _fnum(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
     if filled > 0 and avg_px > 0:
-        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time() * 1000)
+        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time()*1000)
         try:
             ts_ms = int(ts_field)
-            if ts_ms < 10 ** 12: ts_ms *= 1000
+            if ts_ms < 10**12: ts_ms *= 1000
         except:
             ts_ms = int(time.time() * 1000)
         apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
@@ -491,32 +472,25 @@ def _record_fill_from_status(market, side, st, order_id):
 # -------------------- Maker quoting helpers --------------------
 def _effective_half_spread_pct(adapt_with_atr_pct=None):
     base = (2 * FEE_PCT_PER_SIDE + TP_BUFFER_PCT) / 2.0
-    if adapt_with_atr_pct:
-        base = max(base, adapt_with_atr_pct * ATR_SPREAD_MULT)
+    if adapt_with_atr_pct: base = max(base, adapt_with_atr_pct * ATR_SPREAD_MULT)
     return max(base, (SPREAD_OFFSET_PCT or 0.0))
 
 def _quote_prices(last, atr_pct=None):
     off = _effective_half_spread_pct(atr_pct)
-    bid = round(last * (1.0 - off), 8)  # rough, will be quantized by tick later
+    bid = round(last * (1.0 - off), 8)
     ask = round(last * (1.0 + off), 8)
     return bid, ask
 
 def _qty_for_pair(pair, price, usdt_avail, coin_avail, side, trend_skew):
-    # base size from notional, then quantize safely
     raw_q = max(1e-12, QUOTE_USDT) / max(price, 1e-9)
     raw_q *= trend_skew
-
-    # cap by global per-pair notional
     raw_q = min(raw_q, MAX_PER_PAIR_USDT / max(price, 1e-9))
-
-    # cap by balances
     if side == "BUY":
         raw_q = min(raw_q, usdt_avail / max(price, 1e-9))
         q = quantize_qty(pair, raw_q, side="BUY", balance=usdt_avail / max(price, 1e-9))
     else:
         raw_q = min(raw_q, coin_avail)
         q = quantize_qty(pair, raw_q, side="SELL", balance=coin_avail)
-
     return q
 
 def _net_inventory_units(pair):
@@ -541,13 +515,11 @@ def _cancel_quote(pair, side_key):
     active_quotes[pair][side_key] = None
 
 def cancel_all_quotes(pair):
-    _cancel_quote(pair, "bid")
-    _cancel_quote(pair, "ask")
+    _cancel_quote(pair, "bid"); _cancel_quote(pair, "ask")
 
 def _place_quote(pair, side_word, price, qty):
-    # Quantize both
     price = quantize_price(pair, price, side=side_word)
-    qty = quantize_qty(pair, qty, side=side_word)
+    qty   = quantize_qty(pair, qty, side=side_word)
     if qty <= 0:
         scan_log.append(f"{ist_now()} | {pair} | skip quote {side_word}: qty<=0 after quantize")
         return None
@@ -560,21 +532,16 @@ def _place_quote(pair, side_word, price, qty):
 
 def _check_quote_fill(pair, side_key, last_price):
     q = active_quotes.get(pair, {}).get(side_key)
-    if not q or not q.get("id"):
-        return False
-
+    if not q or not q.get("id"): return False
     st = get_order_status(order_id=q["id"])
-
     rem = _fnum(st.get("remaining_quantity", st.get("remaining_qty", st.get("leaves_qty", 0))))
     status_txt = (st.get("status") or "").lower()
     filled = (rem == 0) or ("filled" in status_txt and "part" not in status_txt)
-
     if filled:
         order_side = "BUY" if side_key == "bid" else "SELL"
         filled_qty, avg_px = _record_fill_from_status(pair, order_side, st, q["id"])
         active_quotes[pair][side_key] = None
         scan_log.append(f"{ist_now()} | {pair} | FILL {order_side} {filled_qty} @ {avg_px} | st={st}")
-
         if order_side == "BUY" and filled_qty > 0 and avg_px > 0:
             last_buy_fill[pair] = {"entry": float(avg_px), "qty": float(filled_qty), "ts": int(time.time())}
         return True
@@ -583,11 +550,9 @@ def _check_quote_fill(pair, side_key, last_price):
 def _manage_orphan_inventory(pair, now_ts, prices, balances):
     q_units = _net_inventory_units(pair)
     if q_units <= 0:
-        inventory_timer.pop(pair, None)
-        return
+        inventory_timer.pop(pair, None); return
     if pair not in inventory_timer:
-        inventory_timer[pair] = now_ts
-        return
+        inventory_timer[pair] = now_ts; return
     if now_ts - inventory_timer[pair] < ORPHAN_MAX_SEC:
         return
     coin = pair[:-4]
@@ -613,6 +578,7 @@ def scan_loop():
     running = True
 
     while running:
+        # keep Render awake
         now_real = time.time()
         if now_real - last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
@@ -622,6 +588,7 @@ def scan_loop():
         now_ts = int(time.time())
         balances = get_wallet_balances()
 
+        # build candles
         for pair in PAIRS:
             if pair in prices:
                 px = prices[pair]["price"]
@@ -635,26 +602,21 @@ def scan_loop():
             scan_log.append(f"{ist_now()} | RISK | Gross inventory {round(gross_usdt,2)} > cap {INVENTORY_USDT_CAP} — pause new bids")
 
         for pair in PAIRS:
-            if pair not in prices:
-                continue
-
+            if pair not in prices: continue
             last = prices[pair]["price"]
 
-            # Fast move cancel/freeze
-            prev = last_price_state[pair]["last"]
-            pts  = last_price_state[pair]["ts"]
+            # fast-move freeze
+            prev = last_price_state[pair]["last"]; pts = last_price_state[pair]["ts"]
             last_price_state[pair] = {"last": last, "ts": now_ts}
             if prev and (now_ts - pts) <= FAST_MOVE_WINDOW_SEC:
                 move_pct = abs(last - prev) / max(prev, 1e-9)
                 if move_pct >= FAST_MOVE_PCT:
                     cancel_all_quotes(pair)
                     pair_freeze_until[pair] = now_ts + FREEZE_SEC_AFTER_FAST_MOVE
-                    scan_log.append(f"{ist_now()} | {pair} | FAST MOVE {round(move_pct*100,3)}% — freeze until {pair_freeze_until[pair]}")
+                    scan_log.append(f"{ist_now()} | {pair} | FAST MOVE {round(move_pct*100,3)}% — freeze")
                     continue
-
             if now_ts < pair_freeze_until[pair]:
-                for side_key in ("bid", "ask"):
-                    _check_quote_fill(pair, side_key, last)
+                for side_key in ("bid", "ask"): _check_quote_fill(pair, side_key, last)
                 continue
 
             closes = [c["close"] for c in (candle_logs.get(pair) or [])[:-1]]
@@ -668,11 +630,8 @@ def scan_loop():
             atr_abs, atr_pct = _atr_and_pct(pair, last, ATR_WINDOW)
 
             bid_px, ask_px = _quote_prices(last, atr_pct)
-            # Final tick-quantize the quotes (non-cross, then quantize)
-            bid_px = min(bid_px, last * (1 - 1e-6))
-            ask_px = max(ask_px, last * (1 + 1e-6))
-            bid_px = quantize_price(pair, bid_px, side="BUY")
-            ask_px = quantize_price(pair, ask_px, side="SELL")
+            bid_px = quantize_price(pair, min(bid_px, last * (1 - 1e-6)), side="BUY")
+            ask_px = quantize_price(pair, max(ask_px, last * (1 + 1e-6)), side="SELL")
 
             usdt = balances.get("USDT", 0.0)
             coin = pair[:-4]
@@ -685,39 +644,31 @@ def scan_loop():
             trend_bias_ask = 1.2 if not bullish else 0.9
 
             allow_bid, allow_ask = True, True
-            if gross_usdt > INVENTORY_USDT_CAP:
-                allow_bid = False
-            if atr_pct is not None and atr_pct > MAX_ATR_PCT:
-                allow_bid = False
+            if gross_usdt > INVENTORY_USDT_CAP: allow_bid = False
+            if atr_pct is not None and atr_pct > MAX_ATR_PCT: allow_bid = False
             if slope_pct is not None and slope_pct > MAX_SLOPE_PCT:
-                if bullish:
-                    allow_ask = False
-                    allow_bid = True
-                else:
-                    allow_bid = False
-                    allow_ask = True
+                if bullish: allow_ask = False
+                else:       allow_bid = False
 
-            # Cancel stale/moved quotes
+            # cancel stale quotes
             for side_key, q in list(active_quotes[pair].items()):
-                if not q:
-                    continue
+                if not q: continue
                 age = now_ts - int(q.get("ts", now_ts))
-                px = q.get("px", last)
+                px  = q.get("px", last)
                 drift = abs(last - px) / max(px, 1e-9)
                 if age >= QUOTE_TTL_SEC or drift >= DRIFT_REQUOTE_PCT:
                     _cancel_quote(pair, side_key)
 
-            # Check fills
+            # check fills
             for side_key in ("bid", "ask"):
                 _check_quote_fill(pair, side_key, last)
 
-            # Kill-switch (after BUY fills)
+            # kill-switch after BUY fill
             lb = last_buy_fill.get(pair, {})
             if lb and lb.get("entry") and now_ts >= kill_cooldown_until[pair]:
                 entry = float(lb["entry"]); filled_qty = float(lb["qty"])
                 if last <= entry * (1.0 - KILL_SWITCH_PCT):
-                    qty_to_sell = filled_qty * KILL_SWITCH_SELL_FRAC
-                    qty_to_sell = min(qty_to_sell, coin_bal)
+                    qty_to_sell = min(filled_qty * KILL_SWITCH_SELL_FRAC, coin_bal)
                     qty_to_sell = quantize_qty(pair, qty_to_sell, side="SELL", balance=coin_bal)
                     if qty_to_sell > 0:
                         _cancel_quote(pair, "bid")
@@ -726,16 +677,15 @@ def scan_loop():
                         if oid:
                             st = get_order_status(order_id=oid)
                             _record_fill_from_status(pair, "SELL", st, oid)
-                        scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH: SOLD {qty_to_sell} due to {round(100*(entry-last)/entry,3)}% drop | res={res}")
+                        scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH: SOLD {qty_to_sell}")
                         kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
                         last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
 
-            # Size quotes with precision-aware qty
-            qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY", reduce_bias_bid * trend_bias_bid) if allow_bid else 0.0
+            # size and place quotes
+            qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY",  reduce_bias_bid * trend_bias_bid) if allow_bid else 0.0
             qty_ask = _qty_for_pair(pair, ask_px, usdt, coin_bal, "SELL", reduce_bias_ask * trend_bias_ask) if allow_ask else 0.0
-
             if qty_bid > 0 and not active_quotes[pair]["bid"]:
-                _place_quote(pair, "BUY", bid_px, qty_bid)
+                _place_quote(pair, "BUY",  bid_px, qty_bid)
             if qty_ask > 0 and coin_bal > 0 and not active_quotes[pair]["ask"]:
                 _place_quote(pair, "SELL", ask_px, qty_ask)
 
@@ -790,8 +740,7 @@ def get_status():
             q = active_quotes[p][side]
             if q:
                 v[side] = {"id": q.get("id"), "px": q.get("px"), "qty": q.get("qty"), "ts": q.get("ts")}
-        if v:
-            visible_quotes[p] = v
+        if v: visible_quotes[p] = v
 
     return jsonify({
         "status": status["msg"],
@@ -814,7 +763,7 @@ def get_status():
 def ping():
     return "pong"
 
-# -------------------- Safe autostart --------------------
+# -------------------- Autostart --------------------
 _autostart_lock = threading.Lock()
 def _start_loop_once():
     global running
@@ -836,7 +785,7 @@ if os.environ.get("AUTOSTART", "1") == "1":
 
 if __name__ == "__main__":
     load_profit_state()
-    fetch_pair_precisions()  # <== pulls tick/step/min/precisions
+    fetch_pair_precisions()      # ← loads tick/step/min/precision
     _start_loop_once()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
