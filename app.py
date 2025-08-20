@@ -33,7 +33,7 @@ PAIR_RULES = {
     "ETHUSDT":  {"price_precision": 2, "qty_precision": 6, "min_qty": 0.0001, "min_notional": 0.0},
     "XRPUSDT":  {"price_precision": 4, "qty_precision": 4, "min_qty": 0.1,    "min_notional": 0.0},
     "SHIBUSDT": {"price_precision": 8, "qty_precision": 4, "min_qty": 10000,  "min_notional": 0.0},
-    "DOGEUSDT": {"price_precision": 5, "qty_precision": 4, "min_qty": 0.01,   "min_notional": 0.0},
+    "DOGEUSDT": {"price_precision": 5, "qty_precision": 4, "min_qty": 0.001,   "min_notional": 0.0},
     "SOLUSDT":  {"price_precision": 2, "qty_precision": 4, "min_qty": 0.01,   "min_notional": 0.0},
     "AEROUSDT": {"price_precision": 3, "qty_precision": 2, "min_qty": 0.01,   "min_notional": 0.0},
     "ADAUSDT":  {"price_precision": 4, "qty_precision": 2, "min_qty": 0.1,    "min_notional": 0.0},
