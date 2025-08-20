@@ -29,7 +29,7 @@ PAIRS = [
 
 # Local fallbacks; overwritten by live fetch at boot and periodically thereafter
 PAIR_RULES = {
-    "BTCUSDT": {"price_precision": 1, "qty_precision": 6, "min_qty": 0.0005, "min_notional": 0.0},
+    "BTCUSDT": {"price_precision": 4, "qty_precision": 3, "min_qty": 0.001, "min_notional": 0.0},
     "ETHUSDT": {"price_precision": 2, "qty_precision": 6, "min_qty": 0.0001, "min_notional": 0.0},
     "XRPUSDT": {"price_precision": 4, "qty_precision": 1, "min_qty": 1.0,    "min_notional": 0.0},
     "SHIBUSDT": {"price_precision": 8, "qty_precision": 0, "min_qty": 10000, "min_notional": 0.0},
