@@ -1121,17 +1121,21 @@ def get_status():
         "keepalive": keepalive_info,   # <<< new
     })
 
-@app.route("/ping")
+@app.route("/ping", methods=["GET", "HEAD"])
 def ping():
     token = os.environ.get("KEEPALIVE_TOKEN", "")
-    provided = (request.args.get("t") or request.headers.get("X-Keepalive-Token") or "")
+    provided = (request.args.get("t") or
+                request.headers.get("X-Keepalive-Token") or "")
     if token and provided != token:
-        # log denial to verify monitors with wrong token
-        print(f"[{ist_now()}] /ping forbidden (bad token)")
+        print(f"[{ist_now()}] /ping forbidden (bad token) method={request.method}")
         return "forbidden", 403
-    # log ok ping so you can see it in Render logs
-    print(f"[{ist_now()}] /ping pong")
-    return "pong"
+
+    # Log, but avoid printing body for HEAD
+    print(f"[{ist_now()}] /ping ok method={request.method}")
+    if request.method == "HEAD":
+        # Return 200 with no body for uptime monitors
+        return ("", 200)
+    return ("pong", 200)
 
 # -------------------- Safe autostart --------------------
 _autostart_lock = threading.Lock()
