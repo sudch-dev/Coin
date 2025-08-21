@@ -33,7 +33,7 @@ PAIR_RULES = {
     "ETHUSDT":  {"price_precision": 2, "qty_precision": 6, "min_qty": 0.0001, "min_notional": 0.0},
     "XRPUSDT":  {"price_precision": 4, "qty_precision": 4, "min_qty": 0.1,    "min_notional": 0.0},
     "SHIBUSDT": {"price_precision": 8, "qty_precision": 4, "min_qty": 10000,  "min_notional": 0.0},
-    "DOGEUSDT": {"price_precision": 5, "qty_precision": 4, "min_qty": 0.001,   "min_notional": 0.0},
+    "DOGEUSDT": {"price_precision": 5, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
     "SOLUSDT":  {"price_precision": 2, "qty_precision": 4, "min_qty": 0.01,   "min_notional": 0.0},
     "AEROUSDT": {"price_precision": 3, "qty_precision": 2, "min_qty": 0.01,   "min_notional": 0.0},
     "ADAUSDT":  {"price_precision": 4, "qty_precision": 2, "min_qty": 0.1,    "min_notional": 0.0},
@@ -46,8 +46,9 @@ MODE = "maker"
 
 CANDLE_INTERVAL = 10
 POLL_SEC = 1.0
-QUOTE_TTL_SEC = 4
-DRIFT_REQUOTE_PCT = 0.0003
+# Safer defaults (reduced cancel spam)
+QUOTE_TTL_SEC = 10          # was 4
+DRIFT_REQUOTE_PCT = 0.0006  # was 0.0003
 
 FEE_PCT_PER_SIDE = 0.0010
 TP_BUFFER_PCT = 0.0006
@@ -70,11 +71,16 @@ FAST_MOVE_WINDOW_SEC = 5
 FREEZE_SEC_AFTER_FAST_MOVE = 6
 
 KILL_SWITCH_PCT = 0.0030
-KILL_SWITCH_SELL_FRAC = 0.6
+KILL_SWITCH_SELL_FRAC = 0.4  # was 0.6
 KILL_SWITCH_COOLDOWN_SEC = 20
 
 ORPHAN_MAX_SEC = 900
 KEEPALIVE_SEC = 240
+
+# --- New knobs for stickier quotes & rate-limited requotes
+MIN_QUOTE_LIFETIME_SEC = 8
+DRIFT_REQUOTE_ATR_MULT = 0.6
+MAX_REQUOTE_PER_MIN = 10
 
 # -------------------- SMC settings --------------------
 SMC_LOOKBACK = 60
@@ -87,6 +93,11 @@ SMC_LOG = True
 
 # SMC confirmation-only mode: require an explicit structure signal to quote
 SMC_CONFIRM_ONLY = True
+
+# --- Kill-switch refinements
+KILL_SWITCH_CONFIRM_SEC = 3            # sustained breach
+KILL_SWITCH_REQUIRE_SMC = True         # require bearish structure to dump
+KILL_SWITCH_LIMIT_OFFSET = 0.0005      # sell with a small-through limit, not market
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
@@ -109,6 +120,10 @@ last_price_state = {p: {"last": None, "ts": 0} for p in PAIRS}
 pair_freeze_until = {p: 0 for p in PAIRS}
 kill_cooldown_until = {p: 0 for p in PAIRS}
 last_buy_fill = {p: {"entry": None, "qty": 0.0, "ts": 0} for p in PAIRS}
+
+# new: per-pair requote counters & kill-breach timers
+requote_counter = {p: {"t": 0, "n": 0} for p in PAIRS}
+kill_breach_since = {p: 0 for p in PAIRS}
 
 # rules refresh cadence
 _last_rules_refresh = 0
@@ -520,16 +535,8 @@ def _smc_confirms(side, smc):
     """
     Returns True ONLY if there's explicit structure confirmation
     for the given side.
-
-    BUY is confirmed by any of:
-      - bias == 'bull'  (BOS up)
-      - sweep == 'SSL'  (sell-side liquidity sweep)
-      - bull FVG with at least FVG_MIN_FILL filled
-
-    SELL is confirmed by any of:
-      - bias == 'bear'  (BOS down)
-      - sweep == 'BSL'  (buy-side liquidity sweep)
-      - bear FVG with at least FVG_MIN_FILL filled
+    BUY: bias=='bull' or sweep=='SSL' or bull FVG (>= fill threshold)
+    SELL: bias=='bear' or sweep=='BSL' or bear FVG (>= fill threshold)
     """
     s = side.upper()
     bias  = smc.get("bias")
@@ -745,6 +752,16 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
         return
     if now_ts - inventory_timer[pair] < ORPHAN_MAX_SEC:
         return
+
+    # New: require bearish SMC confirmation before forced liquidation
+    last_px = prices.get(pair, {}).get("price", 0.0)
+    atr_abs, _ = _atr_and_pct(pair, last_px, ATR_WINDOW)
+    smc_here = _smc_bias(pair, last_px, atr_abs)
+    if not _smc_confirms("SELL", smc_here):
+        scan_log.append(f"{ist_now()} | {pair} | ORPHAN hold — no bearish structure")
+        inventory_timer[pair] = now_ts
+        return
+
     coin = pair[:-4]
     coin_bal = balances.get(coin, 0.0)
     qty = min(0.3 * q_units, coin_bal)
@@ -753,12 +770,14 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
         scan_log.append(f"{ist_now()} | {pair} | ORPHAN skip — qty<{_min_qty(pair)}")
         inventory_timer[pair] = now_ts
         return
-    res = place_order(pair, "SELL", qty, price_hint=prices.get(pair, {}).get("price", 0.0), balances=balances)
+
+    limit_px = fmt_price(pair, last_px * 0.999)  # patient limit slightly through
+    res = place_limit_order(pair, "SELL", qty, limit_px, balances=balances)
     oid = _extract_order_id(res)
     if oid:
         st = get_order_status(order_id=oid)
         _record_fill_from_status(pair, "SELL", st, oid)
-    scan_log.append(f"{ist_now()} | {pair} | ORPHAN TIMEOUT market SELL {qty} | res={res}")
+    scan_log.append(f"{ist_now()} | {pair} | ORPHAN LIMIT SELL {qty} @ {limit_px} | res={res}")
     inventory_timer[pair] = now_ts
 
 # -------------------- Main loop (autostart-safe) --------------------
@@ -879,39 +898,67 @@ def scan_loop():
                     f"| allow_bid={allow_bid} allow_ask={allow_ask}"
                 )
 
-            # cancel stale/moved quotes
+            # ------- Stickier cancel/re-quote logic (ATR-aware + rate-limited) -------
             for side_key, q in list(active_quotes[pair].items()):
                 if not q:
                     continue
                 age = now_ts - int(q.get("ts", now_ts))
                 px = q.get("px", last)
                 drift = abs(last - px) / max(px, 1e-9)
-                if age >= QUOTE_TTL_SEC or drift >= DRIFT_REQUOTE_PCT:
+
+                # reset per-minute counter
+                if now_ts - requote_counter[pair]["t"] >= 60:
+                    requote_counter[pair] = {"t": now_ts, "n": 0}
+
+                # ATR-aware dynamic drift threshold
+                dynamic_drift = DRIFT_REQUOTE_PCT
+                if atr_pct is not None:
+                    dynamic_drift = max(DRIFT_REQUOTE_PCT, atr_pct * DRIFT_REQUOTE_ATR_MULT)
+
+                # protect young quotes unless drift is clearly large
+                if age < MIN_QUOTE_LIFETIME_SEC and drift < 2 * dynamic_drift:
+                    continue
+
+                # decide cancel: (age big OR drift big) AND under rate limit
+                if (age >= max(MIN_QUOTE_LIFETIME_SEC, QUOTE_TTL_SEC) or drift >= dynamic_drift) \
+                   and requote_counter[pair]["n"] < MAX_REQUOTE_PER_MIN:
                     _cancel_quote(pair, side_key)
+                    requote_counter[pair]["n"] += 1
 
             # check fills
             for side_key in ("bid", "ask"):
                 _check_quote_fill(pair, side_key, last)
 
-            # -------- Inventory kill-switch after BUY fill (bypasses SMC) --------
+            # -------- Inventory kill-switch after BUY fill (safer: sustained+SMC+limit) --------
             lb = last_buy_fill.get(pair, {})
             if lb and lb.get("entry") and now_ts >= kill_cooldown_until[pair]:
                 entry = float(lb["entry"]); filled_qty = float(lb["qty"])
-                if last <= entry * (1.0 - KILL_SWITCH_PCT):
-                    qty_to_sell = min(filled_qty * KILL_SWITCH_SELL_FRAC, coin_bal)
-                    qty_to_sell = fmt_qty(pair, qty_to_sell)
-                    if qty_to_sell >= _min_qty(pair):
-                        _cancel_quote(pair, "bid")
-                        res = place_order(pair, "SELL", qty_to_sell, price_hint=last, balances=balances)
-                        oid = _extract_order_id(res)
-                        if oid:
-                            st = get_order_status(order_id=oid)
-                            _record_fill_from_status(pair, "SELL", st, oid)
-                        scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH: SOLD {qty_to_sell} due to {round(100*(entry-last)/entry,3)}% drop | res={res}")
-                        kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
-                        last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
-                    else:
-                        scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH skip — qty<{_min_qty(pair)}")
+                breach = (last <= entry * (1.0 - KILL_SWITCH_PCT))
+
+                if breach:
+                    if kill_breach_since.get(pair, 0) == 0:
+                        kill_breach_since[pair] = now_ts
+                    sustained = (now_ts - kill_breach_since[pair]) >= KILL_SWITCH_CONFIRM_SEC
+                    smc_ok = True
+                    if KILL_SWITCH_REQUIRE_SMC:
+                        smc_ok = (_smc_confirms("SELL", smc) is True)
+
+                    if sustained and smc_ok:
+                        qty_to_sell = min(filled_qty * KILL_SWITCH_SELL_FRAC, coin_bal)
+                        qty_to_sell = fmt_qty(pair, qty_to_sell)
+                        if qty_to_sell >= _min_qty(pair):
+                            _cancel_quote(pair, "bid")
+                            limit_px = fmt_price(pair, last * (1.0 - KILL_SWITCH_LIMIT_OFFSET))
+                            res = place_limit_order(pair, "SELL", qty_to_sell, limit_px, balances=balances)
+                            oid = _extract_order_id(res)
+                            if oid:
+                                st = get_order_status(order_id=oid)
+                                _record_fill_from_status(pair, "SELL", st, oid)
+                            scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH LIMIT: {qty_to_sell} @ {limit_px} | res={res}")
+                            kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
+                            last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
+                else:
+                    kill_breach_since[pair] = 0
 
             # sizing for quotes (only if allowed post-SMC confirmation)
             qty_bid = _qty_for_pair(pair, bid_px, usdt, coin_bal, "BUY", reduce_bias_bid * trend_bias_bid) if allow_bid else 0.0
