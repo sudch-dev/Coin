@@ -1,254 +1,181 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>CoinDCX Auto-Trader Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8" />
+  <title>EMA+MACD Bot — Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    :root {
-      --bg: #0f1220;
-      --card: #171a2b;
-      --ink: #e8ebff;
-      --muted: #9aa3c7;
-      --good: #3ddc97;
-      --bad: #ff6b6b;
-      --warn: #ffd166;
-      --accent: #7aa2ff;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
-    h1 { margin: 0 0 12px; font-size: 22px; font-weight: 700; }
-    .sub { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-    .card { background: var(--card); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; box-shadow: 0 10px 24px rgba(0,0,0,0.25); }
-    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .btn { appearance: none; border: 1px solid rgba(255,255,255,0.12); background: transparent; color: var(--ink); padding: 8px 14px; border-radius: 10px; cursor: pointer; font-weight: 600; }
-    .btn:hover { border-color: rgba(255,255,255,0.28); }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; }
-    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; font-size: 14px; }
-    .k { color: var(--muted); }
-    .v.mono { font-family: var(--mono); }
-    .good { color: var(--good); }
-    .bad  { color: var(--bad); }
-    .warn { color: var(--warn); }
-    pre, code { font-family: var(--mono); font-size: 12px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; }
-    pre.scroll { max-height: 260px; overflow: auto; background: rgba(0,0,0,0.25); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.05); }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; overflow: hidden; }
-    th, td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-    th { text-align: left; color: var(--muted); font-weight: 600; background: rgba(255,255,255,0.03); }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.15); }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; background:#0b0f14; color:#e6edf3;}
+    h1,h2,h3 { margin: 0 0 8px; }
+    .row { display:flex; flex-wrap: wrap; gap:16px; }
+    .card { background:#111826; border:1px solid #1f2a3a; border-radius:10px; padding:14px; flex:1 1 340px; min-width:320px; }
+    .kpis { display:grid; grid-template-columns: repeat(4, minmax(120px,1fr)); gap:10px; }
+    .kpi { background:#0e1521; border:1px solid #1f2a3a; border-radius:8px; padding:10px; }
+    .kpi .v { font-size: 18px; font-weight: 700; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid #1e2635; padding:8px; text-align:left; font-size: 13px; }
+    th { color:#93a4b9; font-weight:600; }
+    .ok { color:#00d084; }
+    .bad { color:#ff6b6b; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .btn { background:#1a2635; border:1px solid #2a3a52; color:#e6edf3; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    .btn:hover { background:#223246; }
+    small { color:#8ca0b8; }
+    pre { white-space: pre-wrap; word-break: break-word; font-size:12px; line-height:1.35; }
   </style>
 </head>
 <body>
-  <h1>CoinDCX Auto-Trader</h1>
-  <div class="sub" id="subtitle">Loading…</div>
+  <h1>EMA+MACD Bot <small class="mono" id="statustxt"></small></h1>
 
-  <div class="row" style="margin-bottom:16px;">
-    <button class="btn primary" onclick="startBot()">▶ Start</button>
-    <button class="btn" onclick="stopBot()">■ Stop</button>
-    <button class="btn" onclick="refreshStatus()">⟳ Refresh</button>
-  </div>
+  <div class="row" style="margin-top:12px;">
+    <div class="card">
+      <h3>Controls</h3>
+      <div style="display:flex; gap:10px; margin-top:8px;">
+        <button class="btn" onclick="start()">Start</button>
+        <button class="btn" onclick="stop()">Stop</button>
+        <button class="btn" onclick="refresh()">Refresh</button>
+      </div>
+      <div style="margin-top:10px;">
+        <small>Last update: <span id="last"></span></small>
+      </div>
+    </div>
 
-  <div class="grid">
-    <!-- Keepalive -->
     <div class="card">
       <h3>Keepalive</h3>
-      <div class="kv">
-        <div class="k">External Ping</div> <div class="v mono" id="ka_enabled">—</div>
-        <div class="k">Last Ping (age)</div> <div class="v mono" id="ka_last">—</div>
-        <div class="k">Next Due</div> <div class="v mono" id="ka_next">—</div>
-        <div class="k">Interval</div> <div class="v mono" id="ka_interval">—</div>
-        <div class="k">Base URL</div> <div class="v mono" id="ka_base">—</div>
-        <div class="k">Live Check</div> <div class="v mono" id="ka_live">—</div>
-      </div>
-      <div id="ka_status" style="margin-top:10px;"></div>
-    </div>
-
-    <!-- P&L -->
-    <div class="card">
-      <h3>P&amp;L</h3>
-      <div class="kv">
-        <div class="k">Today</div>       <div class="v mono" id="pnl_today">—</div>
-        <div class="k">Yesterday</div>   <div class="v mono" id="pnl_yday">—</div>
-        <div class="k">Cumulative</div>  <div class="v mono" id="pnl_cum">—</div>
+      <div class="mono" id="keepalive"></div>
+      <div style="margin-top:6px;">
+        <small>Ping URL: <span class="mono" id="pingurl"></span></small>
       </div>
     </div>
 
-    <!-- Balances -->
     <div class="card">
-      <h3>Balances</h3>
-      <div class="kv" style="margin-bottom:10px;">
-        <div class="k">USDT (total)</div>  <div class="v mono" id="usdt_total">—</div>
-        <div class="k">USDT (free)</div>   <div class="v mono good" id="usdt_free">—</div>
-        <div class="k">USDT (locked)</div> <div class="v mono warn" id="usdt_locked">—</div>
+      <h3>Balances & PnL</h3>
+      <div class="kpis" style="margin-top:8px;">
+        <div class="kpi"><div>USDT</div><div class="v mono" id="usdt">-</div></div>
+        <div class="kpi"><div>Today P&L</div><div class="v mono" id="pnl_today">-</div></div>
+        <div class="kpi"><div>Yesterday</div><div class="v mono" id="pnl_yday">-</div></div>
+        <div class="kpi"><div>Cumulative</div><div class="v mono" id="pnl_cum">-</div></div>
       </div>
-      <div style="font-size:13px;color:var(--muted);margin:6px 0 4px;">Coins (wallet totals)</div>
-      <pre class="scroll" id="coins_json">—</pre>
-      <div style="font-size:13px;color:var(--muted);margin:6px 0 4px;">Locked Coins (open SELL quotes)</div>
-      <pre class="scroll" id="locked_coins_json">—</pre>
-    </div>
-
-    <!-- Active Quotes -->
-    <div class="card">
-      <h3>Active Quotes</h3>
-      <div id="quotes_wrap">
-        <pre class="scroll" id="quotes_json">—</pre>
-      </div>
-    </div>
-
-    <!-- Recent Trades -->
-    <div class="card">
-      <h3>Recent Trades</h3>
-      <pre class="scroll" id="trades_json">—</pre>
-    </div>
-
-    <!-- Scan Log -->
-    <div class="card">
-      <h3>Scan Log</h3>
-      <pre class="scroll" id="scans_pre">—</pre>
-    </div>
-
-    <!-- Error -->
-    <div class="card">
-      <h3>Error</h3>
-      <pre class="scroll bad" id="error_pre"></pre>
     </div>
   </div>
 
-  <script>
-    // === Configure your token here (rotate if needed) ===
-    const KEEPALIVE_TOKEN = "8afb63376cedf672b54a3d4782bc5405";
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Coin Balances</h3>
+      <table id="coins_tbl">
+        <thead><tr><th>Coin</th><th>Balance</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Open TP Orders</h3>
+      <table id="tp_tbl">
+        <thead><tr><th>Pair</th><th>Qty</th><th>Limit Px</th><th>Since</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
 
-    const fmt = (n) => {
-      if (n === null || n === undefined || Number.isNaN(n)) return "—";
-      const num = Number(n);
-      if (!Number.isFinite(num)) return String(n);
-      return num.toLocaleString(undefined, { maximumFractionDigits: 8 });
-    };
-    const fmtSec = (s) => (s === null || s === undefined) ? "—" : `${s}s`;
-    const ago = (secs) => secs !== null && secs !== undefined ? `${secs}s ago` : "—";
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Recent Trades</h3>
+      <table id="trades_tbl">
+        <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Realized</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Scan Log</h3>
+      <pre id="scanlog" class="mono" style="max-height:420px; overflow:auto;">loading…</pre>
+    </div>
+  </div>
 
-    async function startBot(){ try { await fetch('/start',{method:'POST'});} catch(_){} refreshStatus(); }
-    async function stopBot(){ try { await fetch('/stop',{method:'POST'});} catch(_){} refreshStatus(); }
+  <div class="row" style="margin-top:16px;">
+    <div class="card">
+      <h3>Errors</h3>
+      <pre id="errors" class="mono">-</pre>
+    </div>
+  </div>
 
-    function setSubtitle(data) {
-      const s = data?.status ?? "—";
-      const t = data?.last ?? "—";
-      const id = data?.status_epoch ?? "";
-      document.getElementById('subtitle').textContent = `Status: ${s} • Last tick: ${t} • Epoch: ${id}`;
-    }
+<script>
+async function api(path, opts={}) {
+  const r = await fetch(path, {cache:'no-store', ...opts});
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+function fmt(n, d=6){ if(n===null||n===undefined) return '-'; const f=Number(n); if(isNaN(f)) return n; return f.toFixed(d); }
 
-    function renderKeepalive(data, liveOk, liveMsg) {
-      const ka = data.keepalive || {};
-      const enabled = !!ka.enabled;
-      const age = ka.last_ping_age_sec ?? null;
+async function refresh(){
+  try{
+    const s = await api('/status');
+    document.getElementById('statustxt').textContent = `(${s.status} • ${s.last})`;
+    document.getElementById('last').textContent = s.last || '-';
+    document.getElementById('usdt').textContent = fmt(s.usdt, 2);
+    document.getElementById('pnl_today').textContent = fmt(s.profit_today, 4);
+    document.getElementById('pnl_yday').textContent = fmt(s.profit_yesterday, 4);
+    document.getElementById('pnl_cum').textContent = fmt(s.pnl_cumulative, 4);
 
-      document.getElementById('ka_enabled').textContent = enabled ? "Enabled" : "Disabled";
-      document.getElementById('ka_enabled').className = 'v mono ' + (enabled ? 'good' : 'bad');
+    // keepalive
+    const ka = s.keepalive || {};
+    const pingurl = ka.token_present ? (ka.app_base_url + '/ping?t=' + '****') : (ka.app_base_url + '/ping');
+    document.getElementById('pingurl').textContent = pingurl;
+    document.getElementById('keepalive').innerHTML =
+      `token_present: <b>${ka.token_present}</b><br>`+
+      `interval_sec: <b>${ka.interval_sec ?? '-'}</b><br>`+
+      `self_daemon: <b>${ka.self_daemon}</b><br>`+
+      `last_ping_age_sec: <b>${ka.last_ping_age_sec ?? '-'}</b><br>`+
+      `next_due_sec: <b>${ka.next_due_sec ?? '-'}</b>`;
 
-      document.getElementById('ka_last').textContent = ago(age);
-      document.getElementById('ka_next').textContent = fmtSec(ka.next_due_sec);
-      document.getElementById('ka_interval').textContent = fmtSec(ka.interval_sec);
-      document.getElementById('ka_base').textContent = ka.app_base_url || '—';
+    // coins
+    const tbodyC = document.querySelector('#coins_tbl tbody');
+    tbodyC.innerHTML = '';
+    Object.entries(s.coins || {}).forEach(([coin,bal])=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML = `<td>${coin}</td><td class="mono">${fmt(bal,8)}</td>`;
+      tbodyC.appendChild(tr);
+    });
 
-      // Live check result
-      document.getElementById('ka_live').textContent = liveMsg || (liveOk ? 'pong' : '—');
+    // TP orders
+    const tbodyT = document.querySelector('#tp_tbl tbody');
+    tbodyT.innerHTML = '';
+    Object.entries(s.tp_orders || {}).forEach(([pair,info])=>{
+      const since = info.ts ? new Date(info.ts*1000).toLocaleTimeString() : '-';
+      const tr=document.createElement('tr');
+      tr.innerHTML = `<td>${pair}</td><td class="mono">${fmt(info.qty,8)}</td><td class="mono">${fmt(info.px,8)}</td><td class="mono">${since}</td>`;
+      tbodyT.appendChild(tr);
+    });
 
-      const healthy = enabled && liveOk && age !== null && age < (ka.interval_sec || 999999) + 30;
-      const box = document.getElementById('ka_status');
-      box.innerHTML = healthy
-        ? '<span class="pill" style="border-color:rgba(61,220,151,0.35); color:#3ddc97;">✅ Keepalive OK</span>'
-        : '<span class="pill" style="border-color:rgba(255,107,107,0.35); color:#ff6b6b;">⚠️ Keepalive stale or failing</span>';
-    }
+    // trades
+    const tbt = document.querySelector('#trades_tbl tbody');
+    tbt.innerHTML='';
+    (s.trades||[]).forEach(t=>{
+      const pnlClass = (t.realized>=0) ? 'ok' : 'bad';
+      const tr=document.createElement('tr');
+      tr.innerHTML =
+        `<td class="mono">${t.time}</td>`+
+        `<td>${t.pair}</td>`+
+        `<td>${t.side}</td>`+
+        `<td class="mono">${fmt(t.qty,8)}</td>`+
+        `<td class="mono">${fmt(t.price,8)}</td>`+
+        `<td class="mono ${pnlClass}">${fmt(t.realized,6)}</td>`;
+      tbt.appendChild(tr);
+    });
 
-    function renderBalances(data) {
-      document.getElementById('usdt_total').textContent  = fmt(data.usdt);
-      document.getElementById('usdt_free').textContent   = fmt(data.usdt_free);
-      document.getElementById('usdt_locked').textContent = fmt(data.usdt_locked);
-      document.getElementById('coins_json').textContent = JSON.stringify(data.coins || {}, null, 2);
-      document.getElementById('locked_coins_json').textContent = JSON.stringify(data.locked_coin || {}, null, 2);
-    }
+    // scan logs
+    document.getElementById('scanlog').textContent = (s.scans||[]).join('\n') || '-';
 
-    function renderPnL(data) {
-      document.getElementById('pnl_today').textContent = fmt(data.profit_today);
-      document.getElementById('pnl_yday').textContent  = fmt(data.profit_yesterday);
-      document.getElementById('pnl_cum').textContent   = fmt(data.pnl_cumulative);
-      document.getElementById('pnl_today').className = 'v mono ' + (data.profit_today >= 0 ? 'good' : 'bad');
-    }
+    // errors
+    document.getElementById('errors').textContent = s.error || '-';
+  } catch(e){
+    document.getElementById('errors').textContent = String(e);
+  }
+}
 
-    function renderQuotes(data) {
-      document.getElementById('quotes_json').textContent = JSON.stringify(data.quotes || {}, null, 2);
-    }
+async function start(){ try{ await api('/start', {method:'POST'}); refresh(); }catch(e){ alert(e); } }
+async function stop(){ try{ await api('/stop',  {method:'POST'}); refresh(); }catch(e){ alert(e); } }
 
-    function renderTrades(data) {
-      const trades = data.trades || [];
-      document.getElementById('trades_json').textContent = trades.length
-        ? JSON.stringify(trades, null, 2)
-        : "No trades yet.";
-    }
-
-    function renderScans(data) {
-      document.getElementById('scans_pre').textContent = (data.scans || []).join("\n");
-    }
-
-    function renderError(data) {
-      const e = data.error;
-      document.getElementById('error_pre').textContent = e ? String(e) : "";
-    }
-
-    async function livePing() {
-      // Actively ping the protected endpoint with your token
-      try {
-        const url = `/ping?t=${encodeURIComponent(KEEPALIVE_TOKEN)}`;
-        const res = await fetch(url, { cache: 'no-store' });
-        const txt = await res.text();
-        if (res.ok && (txt || '').trim().toLowerCase() === 'pong') {
-          return { ok: true, msg: 'pong' };
-        }
-        return { ok: false, msg: `HTTP ${res.status}: ${txt}` };
-      } catch (err) {
-        return { ok: false, msg: String(err?.message || err) };
-      }
-    }
-
-    async function refreshStatus() {
-      // Run ping and status in parallel for snappy UI
-      const [pingRes, statusRes] = await Promise.allSettled([
-        livePing(),
-        fetch('/status', { cache: 'no-store' }).then(r => r.json())
-      ]);
-
-      const liveOk  = pingRes.status === 'fulfilled' && pingRes.value.ok;
-      const liveMsg = pingRes.status === 'fulfilled' ? pingRes.value.msg : String(pingRes.reason);
-
-      if (statusRes.status === 'fulfilled') {
-        const data = statusRes.value;
-        setSubtitle(data);
-        renderKeepalive(data, liveOk, liveMsg);
-        renderPnL(data);
-        renderBalances(data);
-        renderQuotes(data);
-        renderTrades(data);
-        renderScans(data);
-        renderError(data);
-      } else {
-        document.getElementById('error_pre').textContent = String(statusRes.reason);
-        // Show at least the live check outcome
-        document.getElementById('ka_live').textContent = liveMsg || (liveOk ? 'pong' : '—');
-      }
-    }
-
-    // Initial load + periodic refreshes
-    refreshStatus();
-    // Refresh app status every 5s; ping every 5 minutes on a separate timer
-    setInterval(refreshStatus, 5000);
-    setInterval(async () => { 
-      const res = await livePing();
-      // Update only the live field quickly without waiting for /status
-      const el = document.getElementById('ka_live');
-      if (el) el.textContent = res.ok ? 'pong' : res.msg;
-    }, 5 * 60 * 1000);
-  </script>
+refresh();
+setInterval(refresh, 2000);
+</script>
 </body>
 </html>
