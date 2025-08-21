@@ -1088,6 +1088,18 @@ def get_status():
         if v:
             visible_quotes[p] = v
 
+    # ---- keepalive status for UI ----
+    now_real = time.time()
+    last_age = now_real - (last_keepalive or 0)
+    keepalive_info = {
+        "enabled": bool(KEEPALIVE_TOKEN),               # true if token set on server
+        "interval_sec": KEEPALIVE_SEC,
+        "last_ping_epoch": int(last_keepalive or 0),
+        "last_ping_age_sec": (max(0, int(last_age)) if last_keepalive else None),
+        "next_due_sec": (max(0, int(KEEPALIVE_SEC - last_age)) if last_keepalive else None),
+        "app_base_url": APP_BASE_URL,
+    }
+
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
@@ -1105,7 +1117,8 @@ def get_status():
         "coins": coins,
         "trades": trade_log[-10:][::-1],
         "scans": scan_log[-60:][::-1],
-        "error": error_message
+        "error": error_message,
+        "keepalive": keepalive_info,   # <<< new
     })
 
 @app.route("/ping")
@@ -1113,7 +1126,11 @@ def ping():
     token = os.environ.get("KEEPALIVE_TOKEN", "")
     provided = (request.args.get("t") or request.headers.get("X-Keepalive-Token") or "")
     if token and provided != token:
+        # log denial to verify monitors with wrong token
+        print(f"[{ist_now()}] /ping forbidden (bad token)")
         return "forbidden", 403
+    # log ok ping so you can see it in Render logs
+    print(f"[{ist_now()}] /ping pong")
     return "pong"
 
 # -------------------- Safe autostart --------------------
