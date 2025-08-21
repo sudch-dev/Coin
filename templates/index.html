@@ -17,32 +17,13 @@
       --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0; padding: 24px;
-      background: var(--bg); color: var(--ink);
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji","Segoe UI Emoji";
-    }
+    body { margin: 0; padding: 24px; background: var(--bg); color: var(--ink); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; }
     h1 { margin: 0 0 12px; font-size: 22px; font-weight: 700; }
     .sub { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid rgba(255,255,255,0.06);
-      border-radius: 12px;
-      padding: 16px;
-      box-shadow: 0 10px 24px rgba(0,0,0,0.25);
-    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .card { background: var(--card); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; box-shadow: 0 10px 24px rgba(0,0,0,0.25); }
     .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .btn {
-      appearance: none; border: 1px solid rgba(255,255,255,0.12);
-      background: transparent; color: var(--ink);
-      padding: 8px 14px; border-radius: 10px; cursor: pointer;
-      font-weight: 600;
-    }
+    .btn { appearance: none; border: 1px solid rgba(255,255,255,0.12); background: transparent; color: var(--ink); padding: 8px 14px; border-radius: 10px; cursor: pointer; font-weight: 600; }
     .btn:hover { border-color: rgba(255,255,255,0.28); }
     .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; }
     .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; font-size: 14px; }
@@ -51,27 +32,12 @@
     .good { color: var(--good); }
     .bad  { color: var(--bad); }
     .warn { color: var(--warn); }
-    pre, code {
-      font-family: var(--mono);
-      font-size: 12px; line-height: 1.35;
-      white-space: pre-wrap; word-break: break-word;
-    }
-    pre.scroll {
-      max-height: 260px; overflow: auto; background: rgba(0,0,0,0.25);
-      border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.05);
-    }
-    table {
-      width: 100%; border-collapse: collapse; font-size: 13px;
-      border: 1px solid rgba(255,255,255,0.05);
-      border-radius: 8px; overflow: hidden;
-    }
+    pre, code { font-family: var(--mono); font-size: 12px; line-height: 1.35; white-space: pre-wrap; word-break: break-word; }
+    pre.scroll { max-height: 260px; overflow: auto; background: rgba(0,0,0,0.25); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.05); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; overflow: hidden; }
     th, td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
     th { text-align: left; color: var(--muted); font-weight: 600; background: rgba(255,255,255,0.03); }
-    td.mono { font-family: var(--mono); }
-    .pill {
-      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
-      border: 1px solid rgba(255,255,255,0.15);
-    }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; border: 1px solid rgba(255,255,255,0.15); }
   </style>
 </head>
 <body>
@@ -85,6 +51,19 @@
   </div>
 
   <div class="grid">
+    <!-- Keepalive -->
+    <div class="card">
+      <h3>Keepalive</h3>
+      <div class="kv">
+        <div class="k">External Ping</div> <div class="v mono" id="ka_enabled">—</div>
+        <div class="k">Last Ping (age)</div> <div class="v mono" id="ka_last">—</div>
+        <div class="k">Next Due</div> <div class="v mono" id="ka_next">—</div>
+        <div class="k">Interval</div> <div class="v mono" id="ka_interval">—</div>
+        <div class="k">Base URL</div> <div class="v mono" id="ka_base">—</div>
+      </div>
+      <div id="ka_status" style="margin-top:10px;"></div>
+    </div>
+
     <!-- P&L -->
     <div class="card">
       <h3>P&amp;L</h3>
@@ -141,54 +120,58 @@
       if (n === null || n === undefined || Number.isNaN(n)) return "—";
       const num = Number(n);
       if (!Number.isFinite(num)) return String(n);
-      // compact but readable
       return num.toLocaleString(undefined, { maximumFractionDigits: 8 });
     };
+    const fmtSec = (s) => (s === null || s === undefined) ? "—" : `${s}s`;
+    const ago = (secs) => secs !== null && secs !== undefined ? `${secs}s ago` : "—";
 
-    async function startBot() {
-      try { await fetch('/start', { method: 'POST' }); } catch (_) {}
-      refreshStatus();
-    }
-    async function stopBot() {
-      try { await fetch('/stop', { method: 'POST' }); } catch (_) {}
-      refreshStatus();
-    }
+    async function startBot(){ try { await fetch('/start',{method:'POST'});} catch(_){} refreshStatus(); }
+    async function stopBot(){ try { await fetch('/stop',{method:'POST'});} catch(_){} refreshStatus(); }
 
     function setSubtitle(data) {
       const s = data?.status ?? "—";
       const t = data?.last ?? "—";
       const id = data?.status_epoch ?? "";
-      document.getElementById('subtitle').textContent =
-        `Status: ${s} • Last tick: ${t} • Epoch: ${id}`;
+      document.getElementById('subtitle').textContent = `Status: ${s} • Last tick: ${t} • Epoch: ${id}`;
+    }
+
+    function renderKeepalive(data) {
+      const ka = data.keepalive || {};
+      const enabled = !!ka.enabled;
+      const age = ka.last_ping_age_sec ?? null;
+
+      document.getElementById('ka_enabled').textContent = enabled ? "Enabled" : "Disabled";
+      document.getElementById('ka_enabled').className = 'v mono ' + (enabled ? 'good' : 'bad');
+
+      document.getElementById('ka_last').textContent = ago(age);
+      document.getElementById('ka_next').textContent = fmtSec(ka.next_due_sec);
+      document.getElementById('ka_interval').textContent = fmtSec(ka.interval_sec);
+      document.getElementById('ka_base').textContent = ka.app_base_url || '—';
+
+      const healthy = enabled && age !== null && age < (ka.interval_sec || 999999) + 30; // small grace
+      const box = document.getElementById('ka_status');
+      box.innerHTML = healthy
+        ? '<span class="pill" style="border-color:rgba(61,220,151,0.35); color:#3ddc97;">✅ Keepalive OK</span>'
+        : '<span class="pill" style="border-color:rgba(255,107,107,0.35); color:#ff6b6b;">⚠️ Keepalive stale</span>';
     }
 
     function renderBalances(data) {
-      // USDT rows
       document.getElementById('usdt_total').textContent  = fmt(data.usdt);
       document.getElementById('usdt_free').textContent   = fmt(data.usdt_free);
       document.getElementById('usdt_locked').textContent = fmt(data.usdt_locked);
-
-      // Coins (totals)
-      const coins = data.coins || {};
-      document.getElementById('coins_json').textContent = JSON.stringify(coins, null, 2);
-
-      // Locked coins (from open SELL quotes)
-      const lockedCoins = data.locked_coin || {};
-      document.getElementById('locked_coins_json').textContent = JSON.stringify(lockedCoins, null, 2);
+      document.getElementById('coins_json').textContent = JSON.stringify(data.coins || {}, null, 2);
+      document.getElementById('locked_coins_json').textContent = JSON.stringify(data.locked_coin || {}, null, 2);
     }
 
     function renderPnL(data) {
       document.getElementById('pnl_today').textContent = fmt(data.profit_today);
       document.getElementById('pnl_yday').textContent  = fmt(data.profit_yesterday);
       document.getElementById('pnl_cum').textContent   = fmt(data.pnl_cumulative);
-      // simple color hint for today
       document.getElementById('pnl_today').className = 'v mono ' + (data.profit_today >= 0 ? 'good' : 'bad');
     }
 
     function renderQuotes(data) {
-      const quotes = data.quotes || {};
-      // simple JSON view for now
-      document.getElementById('quotes_json').textContent = JSON.stringify(quotes, null, 2);
+      document.getElementById('quotes_json').textContent = JSON.stringify(data.quotes || {}, null, 2);
     }
 
     function renderTrades(data) {
@@ -199,8 +182,7 @@
     }
 
     function renderScans(data) {
-      const scans = data.scans || [];
-      document.getElementById('scans_pre').textContent = scans.join("\n");
+      document.getElementById('scans_pre').textContent = (data.scans || []).join("\n");
     }
 
     function renderError(data) {
@@ -212,8 +194,8 @@
       try {
         const res = await fetch('/status', { cache: 'no-store' });
         const data = await res.json();
-
         setSubtitle(data);
+        renderKeepalive(data);
         renderPnL(data);
         renderBalances(data);
         renderQuotes(data);
@@ -225,7 +207,6 @@
       }
     }
 
-    // Auto-refresh every 5s
     refreshStatus();
     setInterval(refreshStatus, 5000);
   </script>
