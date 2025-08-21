@@ -1,206 +1,123 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>CoinDCX Auto Trader — OCO Monitor</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="UTF-8">
+  <title>CoinDCX Auto-Trader Dashboard</title>
   <style>
-    :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f8f9fa; --border:#e5e7eb; }
-    * { box-sizing: border-box; }
-    body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
-    h2,h3 { margin: 0 0 10px; }
-    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
-    button { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
-    button:hover { background:#fafafa; }
-    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:260px; overflow:auto; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
-    table { width:100%; border-collapse: collapse; }
-    th, td { border-bottom:1px solid var(--border); text-align:left; padding:8px 6px; font-size:13px; }
-    th { background:#fafafa; position: sticky; top:0; z-index:1; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .ok { color:#0a7f2e; }
-    .warn { color:#b45309; }
-    .bad { color:#b91c1c; }
-    .scroller { max-height: 300px; overflow:auto; border:1px solid var(--border); border-radius:10px; background:var(--card); }
+    body {
+      font-family: Arial, sans-serif;
+      background: #f5f5f5;
+      margin: 0; padding: 20px;
+    }
+    h1 {
+      text-align: center;
+      color: #333;
+    }
+    .controls {
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    button {
+      margin: 5px;
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+    .status-box {
+      background: #fff;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+    .status-box h2 {
+      margin-top: 0;
+    }
+    pre {
+      background: #eee;
+      padding: 10px;
+      border-radius: 6px;
+      overflow-x: auto;
+      max-height: 200px;
+    }
   </style>
 </head>
 <body>
-  <h2>CoinDCX Auto Trader <span class="pill" id="lblEpoch">—</span></h2>
+  <h1>CoinDCX Auto-Trader</h1>
 
-  <div class="row" style="margin-bottom:10px">
-    <button id="btnStart">Start</button>
-    <button id="btnStop">Stop</button>
-    <span>Status: <b id="lblStatus">Idle</b></span>
-    <span>Last: <span id="lblLast">—</span></span>
+  <div class="controls">
+    <button onclick="startBot()">▶ Start</button>
+    <button onclick="stopBot()">■ Stop</button>
+    <button onclick="refreshStatus()">⟳ Refresh</button>
   </div>
 
-  <div class="row" style="margin-bottom:16px">
-    <div class="card">
-      <div>USDT: <b id="lblUSDT">0.00</b></div>
-      <div>Today P&L (USDT): <b id="lblPNLT">0.00</b></div>
-      <div>Yesterday P&L (USDT): <b id="lblPNLY">0.00</b></div>
-      <div>Total P&L (USDT): <b id="lblPNLAll">0.00</b></div>
-      <div>Processed Orders: <span id="lblProcessed" class="mono">0</span></div>
-    </div>
+  <div class="status-box">
+    <h2>Status</h2>
+    <div id="status">Loading…</div>
   </div>
 
-  <h3>Open OCO Exits (exchange-side)</h3>
-  <div class="scroller">
-    <table id="ocoTable">
-      <thead>
-        <tr>
-          <th>Pair</th>
-          <th>Side</th>
-          <th class="mono">Qty</th>
-          <th class="mono">Entry</th>
-          <th class="mono">TP</th>
-          <th class="mono">SL</th>
-          <th class="mono">TP_ID</th>
-          <th class="mono">SL_ID</th>
-          <th>Age</th>
-          <th>BE</th>
-        </tr>
-      </thead>
-      <tbody id="ocoBody"><tr><td colspan="10">—</td></tr></tbody>
-    </table>
+  <div class="status-box">
+    <h2>Balances</h2>
+    <div id="balances"></div>
   </div>
 
-  <h3 style="margin-top:16px">Scans (latest 30)</h3>
-  <pre id="scanLog">—</pre>
+  <div class="status-box">
+    <h2>P&L</h2>
+    <div id="pnl"></div>
+  </div>
 
-  <h3>Trades (latest 10)</h3>
-  <pre id="tradeLog">—</pre>
+  <div class="status-box">
+    <h2>Active Quotes</h2>
+    <pre id="quotes"></pre>
+  </div>
+
+  <div class="status-box">
+    <h2>Recent Trades</h2>
+    <pre id="trades"></pre>
+  </div>
+
+  <div class="status-box">
+    <h2>Scan Log</h2>
+    <pre id="scans"></pre>
+  </div>
+
+  <div class="status-box" style="color: red;">
+    <h2>Error</h2>
+    <pre id="error"></pre>
+  </div>
 
   <script>
-    // ---- Start/Stop ----
-    document.getElementById('btnStart').onclick = async () => {
-      try { const r = await fetch('/start', { method:'POST' }); console.log('start', await r.json()); } catch(e){ console.warn(e); }
-    };
-    document.getElementById('btnStop').onclick = async () => {
-      try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
-    };
-
-    // ---- helpers ----
-    async function safeFetch(url, opts = {}, timeoutMs = 8000) {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    async function startBot() {
+      await fetch('/start', {method: 'POST'});
+      refreshStatus();
+    }
+    async function stopBot() {
+      await fetch('/stop', {method: 'POST'});
+      refreshStatus();
+    }
+    async function refreshStatus() {
       try {
-        const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
-        clearTimeout(t);
-        return res;
+        const res = await fetch('/status');
+        const data = await res.json();
+        document.getElementById('status').innerText =
+          `${data.status} (Last: ${data.last})`;
+        document.getElementById('balances').innerText =
+          `USDT: ${data.usdt}\nCoins: ` + JSON.stringify(data.coins, null, 2);
+        document.getElementById('pnl').innerText =
+          `Today: ${data.profit_today}\nYesterday: ${data.profit_yesterday}\nCumulative: ${data.pnl_cumulative}`;
+        document.getElementById('quotes').innerText =
+          JSON.stringify(data.quotes, null, 2);
+        document.getElementById('trades').innerText =
+          JSON.stringify(data.trades, null, 2);
+        document.getElementById('scans').innerText =
+          data.scans.join("\n");
+        document.getElementById('error').innerText = data.error || "";
       } catch (e) {
-        clearTimeout(t);
-        throw e;
+        document.getElementById('error').innerText = e.toString();
       }
     }
-    function fmt(n, d=2) { return Number(n ?? 0).toFixed(d); }
-    function ago(ts) {
-      if (!ts) return '—';
-      const sec = Math.max(0, Math.floor(Date.now()/1000 - Number(ts)));
-      if (sec < 60) return `${sec}s`;
-      const m = Math.floor(sec/60), s = sec%60;
-      return `${m}m ${s}s`;
-    }
-
-    // ---- renderers ----
-    function renderStatus(d) {
-      document.getElementById('lblStatus').textContent = d.status || '—';
-      document.getElementById('lblLast').textContent = d.last || '—';
-      document.getElementById('lblUSDT').textContent = fmt(d.usdt, 2);
-      document.getElementById('lblPNLT').textContent = fmt(d.profit_today, 2);
-      document.getElementById('lblPNLY').textContent = fmt(d.profit_yesterday, 2);
-      document.getElementById('lblPNLAll').textContent = fmt(d.pnl_cumulative, 2);
-      document.getElementById('lblProcessed').textContent = d.processed_orders ?? 0;
-      document.getElementById('lblEpoch').textContent = d.status_epoch ? `hb:${d.status_epoch}` : '—';
-
-      // logs
-      const scans = Array.isArray(d.scans) ? d.scans.join('\n') : '';
-      const trades = Array.isArray(d.trades) ? d.trades.map(t => {
-        try { return JSON.stringify(t); } catch { return String(t); }
-      }).join('\n') : '';
-      document.getElementById('scanLog').textContent = scans || '—';
-      document.getElementById('tradeLog').textContent = trades || '—';
-
-      // open OCOs
-      const body = document.getElementById('ocoBody');
-      body.innerHTML = '';
-      const rows = Array.isArray(d.open_exits) ? d.open_exits : [];
-      if (!rows.length) {
-        body.innerHTML = '<tr><td colspan="10">No open OCO exits</td></tr>';
-        return;
-      }
-      for (const ex of rows) {
-        const tr = document.createElement('tr');
-        const tds = [
-          ex.pair || '—',
-          ex.side || '—',
-          `<span class="mono">${fmt(ex.qty, 6)}</span>`,
-          `<span class="mono">${fmt(ex.entry, 6)}</span>`,
-          `<span class="mono ok">${fmt(ex.tp, 6)}</span>`,
-          `<span class="mono bad">${fmt(ex.sl, 6)}</span>`,
-          `<span class="mono">${ex.tp_id || '—'}</span>`,
-          `<span class="mono">${ex.sl_id || '—'}</span>`,
-          ago(ex.start_ts),
-          ex.be_armed ? '<span class="ok">Yes</span>' : '<span class="warn">No</span>'
-        ];
-        tr.innerHTML = tds.map(x => `<td>${x}</td>`).join('');
-        body.appendChild(tr);
-      }
-    }
-
-    // ---- watchdog + keepalive ----
-    (function () {
-      const PING_MS = 60 * 1000;
-      const CHECK_MS = 60 * 1000;
-      const STALE_SEC = 120;
-      const START_RETRY_MS = 10 * 1000;
-
-      async function keepAlive() { try { await safeFetch('/ping', {}, 4000); } catch(_){} }
-
-      async function startScanner() {
-        try {
-          const res = await safeFetch('/start', { method:'POST' }, 6000);
-          console.log('[auto-start]', await res.json());
-        } catch (e) {
-          console.warn('[auto-start] failed, retrying', e);
-          setTimeout(startScanner, START_RETRY_MS);
-        }
-      }
-
-      async function checkStatusAndAutostart() {
-        try {
-          const res = await safeFetch('/status', {}, 8000);
-          if (!res.ok) throw new Error('status not ok');
-          const data = await res.json();
-          renderStatus(data);
-
-          const nowSec = Math.floor(Date.now() / 1000);
-          const epoch = Number(data.status_epoch || 0);
-          const isIdle = (data.status || '').toLowerCase() !== 'running';
-          const isStale = epoch && (nowSec - epoch > STALE_SEC);
-
-          if (isIdle || isStale) startScanner();
-        } catch (e) {
-          console.warn('[watchdog] /status failed; nudging /start', e);
-          setTimeout(startScanner, START_RETRY_MS);
-        }
-      }
-
-      // first kicks
-      keepAlive();
-      checkStatusAndAutostart();
-      startScanner();
-
-      // repeaters
-      setInterval(keepAlive, PING_MS);
-      setInterval(checkStatusAndAutostart, CHECK_MS);
-
-      window.addEventListener('focus', () => {
-        keepAlive();
-        checkStatusAndAutostart();
-      });
-    })();
+    setInterval(refreshStatus, 5000); // auto-refresh every 5s
+    refreshStatus();
   </script>
 </body>
 </html>
