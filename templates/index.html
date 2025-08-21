@@ -60,6 +60,7 @@
         <div class="k">Next Due</div> <div class="v mono" id="ka_next">—</div>
         <div class="k">Interval</div> <div class="v mono" id="ka_interval">—</div>
         <div class="k">Base URL</div> <div class="v mono" id="ka_base">—</div>
+        <div class="k">Live Check</div> <div class="v mono" id="ka_live">—</div>
       </div>
       <div id="ka_status" style="margin-top:10px;"></div>
     </div>
@@ -116,6 +117,9 @@
   </div>
 
   <script>
+    // === Configure your token here (rotate if needed) ===
+    const KEEPALIVE_TOKEN = "8afb63376cedf672b54a3d4782bc5405";
+
     const fmt = (n) => {
       if (n === null || n === undefined || Number.isNaN(n)) return "—";
       const num = Number(n);
@@ -135,7 +139,7 @@
       document.getElementById('subtitle').textContent = `Status: ${s} • Last tick: ${t} • Epoch: ${id}`;
     }
 
-    function renderKeepalive(data) {
+    function renderKeepalive(data, liveOk, liveMsg) {
       const ka = data.keepalive || {};
       const enabled = !!ka.enabled;
       const age = ka.last_ping_age_sec ?? null;
@@ -148,11 +152,14 @@
       document.getElementById('ka_interval').textContent = fmtSec(ka.interval_sec);
       document.getElementById('ka_base').textContent = ka.app_base_url || '—';
 
-      const healthy = enabled && age !== null && age < (ka.interval_sec || 999999) + 30; // small grace
+      // Live check result
+      document.getElementById('ka_live').textContent = liveMsg || (liveOk ? 'pong' : '—');
+
+      const healthy = enabled && liveOk && age !== null && age < (ka.interval_sec || 999999) + 30;
       const box = document.getElementById('ka_status');
       box.innerHTML = healthy
         ? '<span class="pill" style="border-color:rgba(61,220,151,0.35); color:#3ddc97;">✅ Keepalive OK</span>'
-        : '<span class="pill" style="border-color:rgba(255,107,107,0.35); color:#ff6b6b;">⚠️ Keepalive stale</span>';
+        : '<span class="pill" style="border-color:rgba(255,107,107,0.35); color:#ff6b6b;">⚠️ Keepalive stale or failing</span>';
     }
 
     function renderBalances(data) {
@@ -190,25 +197,58 @@
       document.getElementById('error_pre').textContent = e ? String(e) : "";
     }
 
-    async function refreshStatus() {
+    async function livePing() {
+      // Actively ping the protected endpoint with your token
       try {
-        const res = await fetch('/status', { cache: 'no-store' });
-        const data = await res.json();
+        const url = `/ping?t=${encodeURIComponent(KEEPALIVE_TOKEN)}`;
+        const res = await fetch(url, { cache: 'no-store' });
+        const txt = await res.text();
+        if (res.ok && (txt || '').trim().toLowerCase() === 'pong') {
+          return { ok: true, msg: 'pong' };
+        }
+        return { ok: false, msg: `HTTP ${res.status}: ${txt}` };
+      } catch (err) {
+        return { ok: false, msg: String(err?.message || err) };
+      }
+    }
+
+    async function refreshStatus() {
+      // Run ping and status in parallel for snappy UI
+      const [pingRes, statusRes] = await Promise.allSettled([
+        livePing(),
+        fetch('/status', { cache: 'no-store' }).then(r => r.json())
+      ]);
+
+      const liveOk  = pingRes.status === 'fulfilled' && pingRes.value.ok;
+      const liveMsg = pingRes.status === 'fulfilled' ? pingRes.value.msg : String(pingRes.reason);
+
+      if (statusRes.status === 'fulfilled') {
+        const data = statusRes.value;
         setSubtitle(data);
-        renderKeepalive(data);
+        renderKeepalive(data, liveOk, liveMsg);
         renderPnL(data);
         renderBalances(data);
         renderQuotes(data);
         renderTrades(data);
         renderScans(data);
         renderError(data);
-      } catch (err) {
-        document.getElementById('error_pre').textContent = (err && err.message) ? err.message : String(err);
+      } else {
+        document.getElementById('error_pre').textContent = String(statusRes.reason);
+        // Show at least the live check outcome
+        document.getElementById('ka_live').textContent = liveMsg || (liveOk ? 'pong' : '—');
       }
     }
 
+    // Initial load + periodic refreshes
     refreshStatus();
+    // Refresh app status every 5s; ping every 5 minutes on a separate timer
     setInterval(refreshStatus, 5000);
+    setInterval(async () => { 
+      const res = await livePing();
+      // Update only the live field quickly without waiting for /status
+      const el = document.getElementById('ka_live');
+      if (el) el.textContent = res.ok ? 'pong' : res.msg;
+    }, 5 * 60 * 1000);
   </script>
 </body>
 </html>
