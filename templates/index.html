@@ -1,123 +1,233 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
+  <meta charset="UTF-8" />
   <title>CoinDCX Auto-Trader Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
+    :root {
+      --bg: #0f1220;
+      --card: #171a2b;
+      --ink: #e8ebff;
+      --muted: #9aa3c7;
+      --good: #3ddc97;
+      --bad: #ff6b6b;
+      --warn: #ffd166;
+      --accent: #7aa2ff;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
     body {
-      font-family: Arial, sans-serif;
-      background: #f5f5f5;
-      margin: 0; padding: 20px;
+      margin: 0; padding: 24px;
+      background: var(--bg); color: var(--ink);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji","Segoe UI Emoji";
     }
-    h1 {
-      text-align: center;
-      color: #333;
+    h1 { margin: 0 0 12px; font-size: 22px; font-weight: 700; }
+    .sub { color: var(--muted); margin-bottom: 24px; font-size: 13px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
     }
-    .controls {
-      text-align: center;
-      margin-bottom: 20px;
+    .card {
+      background: var(--card);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 10px 24px rgba(0,0,0,0.25);
     }
-    button {
-      margin: 5px;
-      padding: 10px 20px;
-      font-size: 16px;
-      cursor: pointer;
+    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .btn {
+      appearance: none; border: 1px solid rgba(255,255,255,0.12);
+      background: transparent; color: var(--ink);
+      padding: 8px 14px; border-radius: 10px; cursor: pointer;
+      font-weight: 600;
     }
-    .status-box {
-      background: #fff;
-      padding: 15px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    .btn:hover { border-color: rgba(255,255,255,0.28); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 10px; font-size: 14px; }
+    .k { color: var(--muted); }
+    .v.mono { font-family: var(--mono); }
+    .good { color: var(--good); }
+    .bad  { color: var(--bad); }
+    .warn { color: var(--warn); }
+    pre, code {
+      font-family: var(--mono);
+      font-size: 12px; line-height: 1.35;
+      white-space: pre-wrap; word-break: break-word;
     }
-    .status-box h2 {
-      margin-top: 0;
+    pre.scroll {
+      max-height: 260px; overflow: auto; background: rgba(0,0,0,0.25);
+      border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.05);
     }
-    pre {
-      background: #eee;
-      padding: 10px;
-      border-radius: 6px;
-      overflow-x: auto;
-      max-height: 200px;
+    table {
+      width: 100%; border-collapse: collapse; font-size: 13px;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 8px; overflow: hidden;
+    }
+    th, td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    th { text-align: left; color: var(--muted); font-weight: 600; background: rgba(255,255,255,0.03); }
+    td.mono { font-family: var(--mono); }
+    .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700;
+      border: 1px solid rgba(255,255,255,0.15);
     }
   </style>
 </head>
 <body>
   <h1>CoinDCX Auto-Trader</h1>
+  <div class="sub" id="subtitle">Loading…</div>
 
-  <div class="controls">
-    <button onclick="startBot()">▶ Start</button>
-    <button onclick="stopBot()">■ Stop</button>
-    <button onclick="refreshStatus()">⟳ Refresh</button>
+  <div class="row" style="margin-bottom:16px;">
+    <button class="btn primary" onclick="startBot()">▶ Start</button>
+    <button class="btn" onclick="stopBot()">■ Stop</button>
+    <button class="btn" onclick="refreshStatus()">⟳ Refresh</button>
   </div>
 
-  <div class="status-box">
-    <h2>Status</h2>
-    <div id="status">Loading…</div>
-  </div>
+  <div class="grid">
+    <!-- P&L -->
+    <div class="card">
+      <h3>P&amp;L</h3>
+      <div class="kv">
+        <div class="k">Today</div>       <div class="v mono" id="pnl_today">—</div>
+        <div class="k">Yesterday</div>   <div class="v mono" id="pnl_yday">—</div>
+        <div class="k">Cumulative</div>  <div class="v mono" id="pnl_cum">—</div>
+      </div>
+    </div>
 
-  <div class="status-box">
-    <h2>Balances</h2>
-    <div id="balances"></div>
-  </div>
+    <!-- Balances -->
+    <div class="card">
+      <h3>Balances</h3>
+      <div class="kv" style="margin-bottom:10px;">
+        <div class="k">USDT (total)</div>  <div class="v mono" id="usdt_total">—</div>
+        <div class="k">USDT (free)</div>   <div class="v mono good" id="usdt_free">—</div>
+        <div class="k">USDT (locked)</div> <div class="v mono warn" id="usdt_locked">—</div>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin:6px 0 4px;">Coins (wallet totals)</div>
+      <pre class="scroll" id="coins_json">—</pre>
+      <div style="font-size:13px;color:var(--muted);margin:6px 0 4px;">Locked Coins (open SELL quotes)</div>
+      <pre class="scroll" id="locked_coins_json">—</pre>
+    </div>
 
-  <div class="status-box">
-    <h2>P&L</h2>
-    <div id="pnl"></div>
-  </div>
+    <!-- Active Quotes -->
+    <div class="card">
+      <h3>Active Quotes</h3>
+      <div id="quotes_wrap">
+        <pre class="scroll" id="quotes_json">—</pre>
+      </div>
+    </div>
 
-  <div class="status-box">
-    <h2>Active Quotes</h2>
-    <pre id="quotes"></pre>
-  </div>
+    <!-- Recent Trades -->
+    <div class="card">
+      <h3>Recent Trades</h3>
+      <pre class="scroll" id="trades_json">—</pre>
+    </div>
 
-  <div class="status-box">
-    <h2>Recent Trades</h2>
-    <pre id="trades"></pre>
-  </div>
+    <!-- Scan Log -->
+    <div class="card">
+      <h3>Scan Log</h3>
+      <pre class="scroll" id="scans_pre">—</pre>
+    </div>
 
-  <div class="status-box">
-    <h2>Scan Log</h2>
-    <pre id="scans"></pre>
-  </div>
-
-  <div class="status-box" style="color: red;">
-    <h2>Error</h2>
-    <pre id="error"></pre>
+    <!-- Error -->
+    <div class="card">
+      <h3>Error</h3>
+      <pre class="scroll bad" id="error_pre"></pre>
+    </div>
   </div>
 
   <script>
+    const fmt = (n) => {
+      if (n === null || n === undefined || Number.isNaN(n)) return "—";
+      const num = Number(n);
+      if (!Number.isFinite(num)) return String(n);
+      // compact but readable
+      return num.toLocaleString(undefined, { maximumFractionDigits: 8 });
+    };
+
     async function startBot() {
-      await fetch('/start', {method: 'POST'});
+      try { await fetch('/start', { method: 'POST' }); } catch (_) {}
       refreshStatus();
     }
     async function stopBot() {
-      await fetch('/stop', {method: 'POST'});
+      try { await fetch('/stop', { method: 'POST' }); } catch (_) {}
       refreshStatus();
     }
+
+    function setSubtitle(data) {
+      const s = data?.status ?? "—";
+      const t = data?.last ?? "—";
+      const id = data?.status_epoch ?? "";
+      document.getElementById('subtitle').textContent =
+        `Status: ${s} • Last tick: ${t} • Epoch: ${id}`;
+    }
+
+    function renderBalances(data) {
+      // USDT rows
+      document.getElementById('usdt_total').textContent  = fmt(data.usdt);
+      document.getElementById('usdt_free').textContent   = fmt(data.usdt_free);
+      document.getElementById('usdt_locked').textContent = fmt(data.usdt_locked);
+
+      // Coins (totals)
+      const coins = data.coins || {};
+      document.getElementById('coins_json').textContent = JSON.stringify(coins, null, 2);
+
+      // Locked coins (from open SELL quotes)
+      const lockedCoins = data.locked_coin || {};
+      document.getElementById('locked_coins_json').textContent = JSON.stringify(lockedCoins, null, 2);
+    }
+
+    function renderPnL(data) {
+      document.getElementById('pnl_today').textContent = fmt(data.profit_today);
+      document.getElementById('pnl_yday').textContent  = fmt(data.profit_yesterday);
+      document.getElementById('pnl_cum').textContent   = fmt(data.pnl_cumulative);
+      // simple color hint for today
+      document.getElementById('pnl_today').className = 'v mono ' + (data.profit_today >= 0 ? 'good' : 'bad');
+    }
+
+    function renderQuotes(data) {
+      const quotes = data.quotes || {};
+      // simple JSON view for now
+      document.getElementById('quotes_json').textContent = JSON.stringify(quotes, null, 2);
+    }
+
+    function renderTrades(data) {
+      const trades = data.trades || [];
+      document.getElementById('trades_json').textContent = trades.length
+        ? JSON.stringify(trades, null, 2)
+        : "No trades yet.";
+    }
+
+    function renderScans(data) {
+      const scans = data.scans || [];
+      document.getElementById('scans_pre').textContent = scans.join("\n");
+    }
+
+    function renderError(data) {
+      const e = data.error;
+      document.getElementById('error_pre').textContent = e ? String(e) : "";
+    }
+
     async function refreshStatus() {
       try {
-        const res = await fetch('/status');
+        const res = await fetch('/status', { cache: 'no-store' });
         const data = await res.json();
-        document.getElementById('status').innerText =
-          `${data.status} (Last: ${data.last})`;
-        document.getElementById('balances').innerText =
-          `USDT: ${data.usdt}\nCoins: ` + JSON.stringify(data.coins, null, 2);
-        document.getElementById('pnl').innerText =
-          `Today: ${data.profit_today}\nYesterday: ${data.profit_yesterday}\nCumulative: ${data.pnl_cumulative}`;
-        document.getElementById('quotes').innerText =
-          JSON.stringify(data.quotes, null, 2);
-        document.getElementById('trades').innerText =
-          JSON.stringify(data.trades, null, 2);
-        document.getElementById('scans').innerText =
-          data.scans.join("\n");
-        document.getElementById('error').innerText = data.error || "";
-      } catch (e) {
-        document.getElementById('error').innerText = e.toString();
+
+        setSubtitle(data);
+        renderPnL(data);
+        renderBalances(data);
+        renderQuotes(data);
+        renderTrades(data);
+        renderScans(data);
+        renderError(data);
+      } catch (err) {
+        document.getElementById('error_pre').textContent = (err && err.message) ? err.message : String(err);
       }
     }
-    setInterval(refreshStatus, 5000); // auto-refresh every 5s
+
+    // Auto-refresh every 5s
     refreshStatus();
+    setInterval(refreshStatus, 5000);
   </script>
 </body>
 </html>
