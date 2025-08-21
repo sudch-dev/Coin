@@ -1,140 +1,188 @@
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Market Maker Dashboard</title>
-<style>
-  :root {
-    --bg:#0f141a; --panel:#18222b; --text:#e9eef4; --muted:#aab7c4; --accent:#66e0a3; --warn:#ffb86b; --bad:#ff6b6b;
-    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  }
-  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;}
-  .wrap { max-width: 980px; margin: 28px auto; padding: 0 16px;}
-  h1 { margin: 0 0 16px; font-size: 28px; }
-  .badge { display:inline-block; padding:8px 12px; margin:6px 8px 18px 0; border-radius:999px; background:#212b35; color:#cfe7ff; font-size:14px;}
-  .row { display:grid; grid-template-columns: 1fr; gap:18px; }
-  @media(min-width:900px){ .row { grid-template-columns: 1fr 1fr; } }
-  .card { background:var(--panel); border-radius:14px; padding:16px 16px; box-shadow: 0 0 0 1px rgba(255,255,255,.04) inset; }
-  .card h2 { margin: 2px 0 14px; font-size: 22px; }
-  .mono { font-family: var(--mono); white-space: pre-wrap; }
-  .table { width:100%; border-collapse: collapse; font-family: var(--mono); font-size: 14px;}
-  .table th, .table td { border-bottom: 1px solid rgba(255,255,255,.06); padding:10px 8px; text-align:left;}
-  .muted { color: var(--muted); }
-  .good { color: var(--accent); }
-  .bad { color: var(--bad); }
-  .btn { background:#263241; color:#eaf4ff; border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:10px 12px; cursor:pointer; }
-  .foot { text-align:center; color:#8ea1b3; margin:26px 0 12px; font-size:13px;}
-  .pill { display:inline-block; padding:3px 7px; border-radius:6px; background:#1f2a33; color:#a2bfd8; font-family:var(--mono); font-size:12px;}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Market Maker Dashboard</title>
+  <style>
+    :root { --bg:#0f141a; --panel:#18202a; --ink:#e6f1ff; --muted:#9fb3c8; --ok:#65d6ad; --warn:#ffb454; --bad:#ff6b6b; }
+    html,body { margin:0; background:var(--bg); color:var(--ink); font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial; }
+    .wrap { max-width:980px; margin:0 auto; padding:20px 16px 80px; }
+    h1 { font-size:28px; margin:6px 0 14px; }
+    .pill { display:inline-block; padding:8px 12px; border-radius:999px; background:#121821; color:var(--muted); margin:8px 8px 8px 0; font-size:14px; border:1px solid #223041; }
+    .grid { display:grid; grid-template-columns: 1fr; gap:18px; }
+    .card { background:var(--panel); border:1px solid #223041; border-radius:14px; padding:16px; }
+    .card h2 { margin:0 0 12px; font-size:22px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; }
+    .muted { color:var(--muted); }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding:10px 8px; border-bottom:1px solid #223041; text-align:left; }
+    th { color:#b3c7dc; font-weight:600; }
+    .footer { text-align:center; color:var(--muted); margin-top:24px; }
+    .btn { background:#223041; border:1px solid #2c3d52; color:#d2e6ff; padding:8px 12px; border-radius:10px; cursor:pointer; }
+    .ok { color:var(--ok); }
+    .bad{ color:var(--bad); }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Market Maker Dashboard</h1>
-  <div>
-    <span class="badge">TP: 0.5% · No SL</span>
-    <span id="autoBadge" class="badge">Auto-scan: every 60s</span>
-    <button id="runBtn" class="btn">Run Scan Now</button>
+  <div class="wrap">
+    <h1>Market Maker Dashboard</h1>
+    <div class="row">
+      <span class="pill">TP: 0.5% · No SL</span>
+      <span id="ka" class="pill">Auto-scan: loading…</span>
+      <button id="start" class="btn pill">Start</button>
+      <button id="stop" class="btn pill">Stop</button>
+      <span id="status" class="pill">Status: —</span>
+    </div>
+
+    <div class="card">
+      <h2>Signal Log</h2>
+      <div id="scan" class="mono muted">loading…</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Balances</h2>
+        <div id="bal" class="mono muted">loading…</div>
+      </div>
+
+      <div class="card">
+        <h2>Open TP Orders</h2>
+        <table>
+          <thead><tr><th>Pair</th><th>Qty</th><th>Limit Px</th><th>Since</th></tr></thead>
+          <tbody id="tp"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Recent Trades</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Realized</th></tr></thead>
+          <tbody id="trades"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>P&amp;L</h2>
+        <div id="pnl" class="mono"></div>
+      </div>
+
+      <div class="card">
+        <h2>Errors</h2>
+        <div id="err" class="mono muted">-</div>
+      </div>
+    </div>
+
+    <div class="footer">© 2025 MM Bot · Logs update live.</div>
   </div>
 
-  <div class="row">
-    <div class="card">
-      <h2>Signals & Decisions</h2>
-      <div id="log" class="mono" style="font-size:14px; line-height:1.45; overflow:auto; max-height:420px;">loading…</div>
-    </div>
+  <script>
+    const scanBox = document.getElementById('scan');
+    const balBox  = document.getElementById('bal');
+    const pnlBox  = document.getElementById('pnl');
+    const tpBody  = document.getElementById('tp');
+    const trBody  = document.getElementById('trades');
+    const errBox  = document.getElementById('err');
+    const kaPill  = document.getElementById('ka');
+    const statusP = document.getElementById('status');
 
-    <div class="card">
-      <h2>Balances</h2>
-      <div id="balances" class="muted">loading…</div>
-      <h2 style="margin-top:18px;">Open TP Orders</h2>
-      <table class="table" id="tpTable">
-        <thead><tr><th>Pair</th><th>Qty</th><th>Limit Px</th><th>Since</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
+    function tsToStr(ts){
+      if(!ts) return '-';
+      const d = new Date(ts*1000);
+      return d.toLocaleString();
+    }
 
-    <div class="card">
-      <h2>Recent Trades</h2>
-      <table class="table" id="trades">
-        <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Realized</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
+    async function fetchStatus(){
+      try{
+        const r = await fetch('/status', {cache:'no-store'});
+        const j = await r.json();
 
-    <div class="card">
-      <h2>P&amp;L</h2>
-      <div id="pnl" class="mono"></div>
-      <h2 style="margin-top:18px;">Keepalive</h2>
-      <div id="ka" class="mono"></div>
-      <h2 style="margin-top:18px;">Errors</h2>
-      <div id="err" class="mono muted">-</div>
-    </div>
-  </div>
+        statusP.textContent = `Status: ${j.status} · ${j.last || ''}`;
 
-  <div class="foot">© 2025 MM Bot · Logs update live every 10s.</div>
-</div>
+        // keepalive pill
+        const ka = j.keepalive || {};
+        const every = (ka.poll_sec ? `${ka.poll_sec}s` : '—');
+        const lastAge = (ka.last_ping_age_sec!=null) ? `${ka.last_ping_age_sec}s ago` : '—';
+        const nextDue = (ka.next_due_sec!=null) ? `${ka.next_due_sec}s` : '—';
+        kaPill.textContent = `Auto-scan: every ${every} · Keepalive ${ka.enabled ? 'ON' : 'OFF'} · last ${lastAge} · next ${nextDue}`;
 
-<script>
-let pollMs = 10000;   // 10s
-let timer = null;
+        // scan log
+        const lines = (j.scans || []).slice().reverse().join('\n');
+        scanBox.textContent = lines || '—';
 
-async function fetchStatus() {
-  try {
-    const r = await fetch('/status');
-    const j = await r.json();
+        // balances
+        const coins = j.coins || {};
+        let b = `USDT: ${Number(j.usdt||0).toFixed(8)}\n\n`;
+        Object.keys(coins).sort().forEach(k=>{
+          b += `${k.padEnd(4,' ')}: ${Number(coins[k]||0).toFixed(8)}\n`;
+        });
+        balBox.textContent = b;
 
-    // logs
-    const lines = (j.scans || []).map(s => s
-      .replace('→ BUY', '→ BUY').replace('→ SELL', '→ SELL'));
-    document.getElementById('log').textContent = (lines.length? lines.join('\n') : '—');
+        // pnl
+        pnlBox.textContent =
+          `Today: ${j.profit_today}\nYesterday: ${j.profit_yesterday}\nCumulative: ${j.pnl_cumulative}`;
 
-    // balances
-    const coins = j.coins || {};
-    const rows = Object.keys(coins).sort().map(k => `<tr><td>${k}</td><td>${(+coins[k]).toFixed(8)}</td></tr>`).join('');
-    document.getElementById('balances').innerHTML =
-      `<table class="table"><thead><tr><th>Coin</th><th>Qty</th></tr></thead><tbody>${rows}</tbody></table>
-       <div style="margin-top:8px" class="mono">USDT: ${(j.usdt||0).toFixed(6)}</div>`;
+        // TP table
+        tpBody.innerHTML = '';
+        const tps = j.tp_orders || {};
+        const fmt = (x, d=8)=> Number(x||0).toFixed(d);
+        Object.keys(tps).forEach(pair=>{
+          const o = tps[pair];
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${pair}</td>
+            <td>${fmt(o.qty)}</td>
+            <td>${o.px}</td>
+            <td>${tsToStr(o.ts)}</td>`;
+          tpBody.appendChild(tr);
+        });
+        if(Object.keys(tps).length===0){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td colspan="4" class="muted">No open TP orders.</td>`;
+          tpBody.appendChild(tr);
+        }
 
-    // open tp
-    const tp = j.open_tp || [];
-    document.querySelector('#tpTable tbody').innerHTML =
-      tp.map(x => `<tr><td>${x.pair}</td><td>${(+x.qty).toFixed(8)}</td><td>${x.limit_px}</td><td>${new Date(x.since_ts*1000).toLocaleTimeString()}</td></tr>`).join('');
+        // recent trades list (if you add to trade_log server-side)
+        trBody.innerHTML = '';
+        (j.trades||[]).forEach(t=>{
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${t.time||'-'}</td>
+            <td>${t.pair||'-'}</td>
+            <td>${t.side||'-'}</td>
+            <td>${t.qty||'-'}</td>
+            <td>${t.price||'-'}</td>
+            <td>${t.realized||'-'}</td>`;
+          trBody.appendChild(tr);
+        });
+        if((j.trades||[]).length===0){
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td colspan="6" class="muted">No recent trades.</td>`;
+          trBody.appendChild(tr);
+        }
 
-    // trades
-    const trows = (j.trades||[]).map(t =>
-      `<tr><td>${t.ts}</td><td>${t.pair}</td><td>${t.side}</td><td>${(+t.qty).toFixed(8)}</td><td>${t.price}</td><td>${t.realized??0}</td></tr>`).join('');
-    document.querySelector('#trades tbody').innerHTML = trows || '<tr><td colspan="6" class="muted">No recent trades.</td></tr>';
+        // errors
+        errBox.textContent = j.error || '-';
 
-    // pnl
-    document.getElementById('pnl').textContent =
-      `Today: ${j.profit_today}\nYesterday: ${j.profit_yesterday}\nCumulative: ${j.pnl_cumulative}`;
+      }catch(e){
+        errBox.textContent = 'UI fetch failed: ' + e;
+      }
+    }
 
-    // keepalive
-    const ka = j.keepalive || {};
-    document.getElementById('ka').textContent =
-      `External Ping: ${ka.enabled? 'Enabled':'Disabled'}\nLast Ping (age): ${ka.last_ping_age_sec ?? '-'}s\nNext Due: ${ka.next_due_sec ?? '-'}s\nInterval: ${ka.interval_sec || '-'}s\nBase URL\n${ka.app_base_url || '-'}`;
+    // buttons
+    document.getElementById('start').onclick = async ()=>{
+      try{ await fetch('/start', {method:'POST'}); }catch{}
+      fetchStatus();
+    };
+    document.getElementById('stop').onclick = async ()=>{
+      try{ await fetch('/stop', {method:'POST'}); }catch{}
+      fetchStatus();
+    };
 
-    // error
-    document.getElementById('err').textContent = j.error || '-';
-
-  } catch (e) {
-    document.getElementById('err').textContent = 'UI fetch error: ' + e;
-  }
-}
-
-async function runNow(){
-  // Touch /status forces loop info to appear; loop runs continuously.
-  await fetchStatus();
-}
-
-document.getElementById('runBtn').addEventListener('click', runNow);
-
-function startPolling(){
-  if(timer) clearInterval(timer);
-  timer = setInterval(fetchStatus, pollMs);
-}
-fetchStatus();
-startPolling();
-</script>
+    // poll
+    fetchStatus();
+    setInterval(fetchStatus, 2000);
+  </script>
 </body>
 </html>
