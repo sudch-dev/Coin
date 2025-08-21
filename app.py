@@ -59,7 +59,7 @@ MACD_SIGNAL     = 9
 BUY_USDT_FRAC   = 0.30        # buy 30% of free USDT when signal fires
 
 # exits
-TP_PCT          = 0.005       # +0.5% target
+TP_PCT          = 0.01      # +1% target
 NO_SL           = True        # explicit: no stop loss
 
 # rules refresh cadence
