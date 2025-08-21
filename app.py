@@ -25,7 +25,7 @@ BASE_URL = "https://api.coindcx.com"
 
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
+    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT"
 ]
 
 # Local fallbacks; overwritten by live fetch at boot and periodically thereafter
@@ -38,7 +38,6 @@ PAIR_RULES = {
     "SOLUSDT":  {"price_precision": 2, "qty_precision": 4, "min_qty": 0.01,   "min_notional": 0.0},
     "AEROUSDT": {"price_precision": 3, "qty_precision": 2, "min_qty": 0.01,   "min_notional": 0.0},
     "ADAUSDT":  {"price_precision": 4, "qty_precision": 2, "min_qty": 0.1,    "min_notional": 0.0},
-    "LTCUSDT":  {"price_precision": 2, "qty_precision": 3, "min_qty": 0.001,  "min_notional": 0.0},
     "BNBUSDT":  {"price_precision": 3, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
 }
 
