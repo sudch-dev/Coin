@@ -6,7 +6,7 @@ import hashlib
 import requests
 import json
 import traceback
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from datetime import datetime, timedelta
 from pytz import timezone
 from collections import deque
@@ -15,6 +15,7 @@ from collections import deque
 app = Flask(__name__)
 
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://coin-4k37.onrender.com")
+KEEPALIVE_TOKEN = os.environ.get("KEEPALIVE_TOKEN", "")
 
 # -------------------- API / Markets --------------------
 API_KEY = os.environ.get("API_KEY")
@@ -245,7 +246,15 @@ def _signed_post(url, body):
 
 def _keepalive_ping():
     try:
-        requests.get(f"{APP_BASE_URL}/ping", timeout=5)
+        if not APP_BASE_URL:
+            return
+        url = f"{APP_BASE_URL}/ping"
+        if KEEPALIVE_TOKEN:
+            url = f"{url}?t={KEEPALIVE_TOKEN}"
+            headers = {"X-Keepalive-Token": KEEPALIVE_TOKEN}
+        else:
+            headers = {}
+        requests.get(url, headers=headers, timeout=5)
     except Exception:
         pass
 
@@ -1101,6 +1110,10 @@ def get_status():
 
 @app.route("/ping")
 def ping():
+    token = os.environ.get("KEEPALIVE_TOKEN", "")
+    provided = (request.args.get("t") or request.headers.get("X-Keepalive-Token") or "")
+    if token and provided != token:
+        return "forbidden", 403
     return "pong"
 
 # -------------------- Safe autostart --------------------
