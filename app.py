@@ -46,7 +46,7 @@ MODE = "maker"
 
 CANDLE_INTERVAL = 10
 POLL_SEC = 1.0
-# Safer defaults (reduced cancel spam)
+# Safer defaults (reduce cancel spam)
 QUOTE_TTL_SEC = 10          # was 4
 DRIFT_REQUOTE_PCT = 0.0006  # was 0.0003
 
@@ -81,6 +81,9 @@ KEEPALIVE_SEC = 240
 MIN_QUOTE_LIFETIME_SEC = 8
 DRIFT_REQUOTE_ATR_MULT = 0.6
 MAX_REQUOTE_PER_MIN = 10
+
+# --- Buy headroom so rounded qty always fits fees/balance
+BUY_HEADROOM = 1.0005  # 5 bps safety
 
 # -------------------- SMC settings --------------------
 SMC_LOOKBACK = 60
@@ -323,6 +326,9 @@ def fmt_qty(pair, qty):
         q = float(f"{mq:.{qp}f}")
     return q
 
+def _qty_step(pair):
+    return 10 ** (-_qty_prec(pair))
+
 def meets_min_notional(pair, price, qty):
     mn = _min_notional(pair)
     return (price * qty) >= mn
@@ -357,10 +363,33 @@ def _learn_precision_from_error(pair, msg_lower):
         return True
     return False
 
+# --- Locked vs free balances (avoid oversubscription) ---
+def _locked_from_active_quotes():
+    locked_usdt = 0.0
+    locked_coin = {}
+    for pair, sides in active_quotes.items():
+        bid = sides.get("bid")
+        ask = sides.get("ask")
+        if bid and bid.get("qty") and bid.get("px"):
+            px = float(bid["px"]); q = float(bid["qty"])
+            locked_usdt += px * q * (1.0 + FEE_PCT_PER_SIDE + 1e-4)  # tiny cushion
+        if ask and ask.get("qty"):
+            coin = pair[:-4]
+            locked_coin[coin] = locked_coin.get(coin, 0.0) + float(ask["qty"])
+    return locked_usdt, locked_coin
+
+def _compute_free_balances(balances):
+    free = dict(balances or {})
+    locked_usdt, locked_coin = _locked_from_active_quotes()
+    free["USDT"] = max(0.0, float(free.get("USDT", 0.0)) - locked_usdt)
+    for coin, amt in locked_coin.items():
+        free[coin] = max(0.0, float(free.get(coin, 0.0)) - amt)
+    return free
+
 def normalize_qty_for_side(pair, side, price, qty, usdt_avail, coin_avail):
     """
-    Enforce, in order:
-      1) precision (qty), 2) min_qty, 3) wallet caps (fee-aware for BUY), 4) min_notional.
+    Enforce:
+      1) precision (qty), 2) min_qty, 3) wallet caps (fee-aware for BUY with headroom), 4) min_notional.
     Returns precision-safe qty or 0.0 to skip.
     """
     q = fmt_qty(pair, qty)
@@ -370,9 +399,15 @@ def normalize_qty_for_side(pair, side, price, qty, usdt_avail, coin_avail):
         q = fmt_qty(pair, mq)
 
     if side.upper() == "BUY":
-        max_buyable = _affordable_buy_qty(pair, price, usdt_avail)
+        # fee + headroom aware
+        denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
+        max_buyable = usdt_avail / denom
         if q > max_buyable:
             q = fmt_qty(pair, max_buyable)
+        # After rounding, ensure it *still* fits. Step down if needed.
+        step = _qty_step(pair)
+        while q >= mq and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
+            q = fmt_qty(pair, max(0.0, q - step))
     else:
         if q > coin_avail:
             q = fmt_qty(pair, coin_avail)
@@ -385,9 +420,13 @@ def normalize_qty_for_side(pair, side, price, qty, usdt_avail, coin_avail):
         needed_q = mn / max(price, 1e-9)
         q = fmt_qty(pair, max(q, needed_q))
         if side.upper() == "BUY":
-            max_buyable = _affordable_buy_qty(pair, price, usdt_avail)
+            denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
+            max_buyable = usdt_avail / denom
             if q > max_buyable:
                 q = fmt_qty(pair, max_buyable)
+            step = _qty_step(pair)
+            while q >= mq and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
+                q = fmt_qty(pair, max(0.0, q - step))
         else:
             if q > coin_avail:
                 q = fmt_qty(pair, coin_avail)
@@ -581,13 +620,18 @@ def place_order(pair, side, qty, price_hint=None, balances=None):
     return res
 
 def place_limit_order(pair, side, qty, price, balances=None):
+    """
+    Returns (res, q_used, p_used).
+    """
     p = fmt_price(pair, price)
     usdt_avail = (balances or {}).get("USDT", 0.0)
     coin_avail = (balances or {}).get(pair[:-4], 0.0)
+
     q = normalize_qty_for_side(pair, side, p, fmt_qty(pair, qty), usdt_avail, coin_avail)
     if q <= 0:
         scan_log.append(f"{ist_now()} | {pair} | SKIP limit {side} {p} — min/fees/wallet/notional fail")
-        return {}
+        return {}, 0.0, p
+
     payload = {
         "market": pair,
         "side": side.lower(),
@@ -598,6 +642,7 @@ def place_limit_order(pair, side, qty, price, balances=None):
     }
     scan_log.append(f"{ist_now()} | {pair} | PRE-ORDER {side} qty={payload['total_quantity']} @ {payload['price_per_unit']} "
                     f"(min_qty={_min_qty(pair)}, min_notional={_min_notional(pair)}, qp={_qty_prec(pair)})")
+
     res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
     msg = (res.get("message") or "").lower() if isinstance(res, dict) else ""
     if res and ("precision" in msg or "min" in msg):
@@ -609,7 +654,8 @@ def place_limit_order(pair, side, qty, price, balances=None):
             payload["total_quantity"] = f"{q2}"
             res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
             scan_log.append(f"{ist_now()} | {pair} | RETRY limit {side} qty={payload['total_quantity']} @ {payload['price_per_unit']} (learned_precision={learned})")
-    return res
+            p, q = p2, q2
+    return res, q, p
 
 def cancel_order(order_id=None, client_order_id=None):
     body = {"timestamp": int(time.time() * 1000)}
@@ -716,12 +762,13 @@ def cancel_all_quotes(pair):
     _cancel_quote(pair, "ask")
 
 def _place_quote(pair, side_word, price, qty, balances):
-    # SMC confirmation has already been checked in the loop.
-    res = place_limit_order(pair, side_word, qty, price, balances=balances)
+    # Place, then only record if order actually opened
+    res, q_used, p_used = place_limit_order(pair, side_word, qty, price, balances=balances)
     oid = _extract_order_id(res)
     side_key = "bid" if side_word == "BUY" else "ask"
-    active_quotes[pair][side_key] = {"id": oid, "px": price, "qty": qty, "ts": int(time.time())}
-    scan_log.append(f"{ist_now()} | {pair} | quote {side_word} {qty} @ {price} | id={oid} | res={res}")
+    if oid:
+        active_quotes[pair][side_key] = {"id": oid, "px": p_used, "qty": q_used, "ts": int(time.time())}
+    scan_log.append(f"{ist_now()} | {pair} | quote {side_word} {q_used} @ {p_used} | id={oid} | res={res}")
     return oid
 
 def _check_quote_fill(pair, side_key, last_price):
@@ -753,7 +800,7 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
     if now_ts - inventory_timer[pair] < ORPHAN_MAX_SEC:
         return
 
-    # New: require bearish SMC confirmation before forced liquidation
+    # Require bearish SMC confirmation before forced liquidation
     last_px = prices.get(pair, {}).get("price", 0.0)
     atr_abs, _ = _atr_and_pct(pair, last_px, ATR_WINDOW)
     smc_here = _smc_bias(pair, last_px, atr_abs)
@@ -772,12 +819,12 @@ def _manage_orphan_inventory(pair, now_ts, prices, balances):
         return
 
     limit_px = fmt_price(pair, last_px * 0.999)  # patient limit slightly through
-    res = place_limit_order(pair, "SELL", qty, limit_px, balances=balances)
+    res, q_used, p_used = place_limit_order(pair, "SELL", qty, limit_px, balances=balances)
     oid = _extract_order_id(res)
     if oid:
         st = get_order_status(order_id=oid)
         _record_fill_from_status(pair, "SELL", st, oid)
-    scan_log.append(f"{ist_now()} | {pair} | ORPHAN LIMIT SELL {qty} @ {limit_px} | res={res}")
+    scan_log.append(f"{ist_now()} | {pair} | ORPHAN LIMIT SELL {q_used} @ {p_used} | res={res}")
     inventory_timer[pair] = now_ts
 
 # -------------------- Main loop (autostart-safe) --------------------
@@ -803,6 +850,7 @@ def scan_loop():
 
         now_ts = int(time.time())
         balances = get_wallet_balances()
+        free_balances = _compute_free_balances(balances)
 
         # ticks & candles
         for pair in PAIRS:
@@ -863,9 +911,9 @@ def scan_loop():
             # base quotes with adaptive spread
             bid_px, ask_px = _quote_prices(pair, last, atr_pct)
 
-            usdt = balances.get("USDT", 0.0)
+            usdt = free_balances.get("USDT", 0.0)
             coin = pair[:-4]
-            coin_bal = balances.get(coin, 0.0)
+            coin_bal = free_balances.get(coin, 0.0)
             net_units = _net_inventory_units(pair)
 
             # inventory & EMA trend biases (used only for sizing; SMC decides whether to shoot)
@@ -949,14 +997,14 @@ def scan_loop():
                         if qty_to_sell >= _min_qty(pair):
                             _cancel_quote(pair, "bid")
                             limit_px = fmt_price(pair, last * (1.0 - KILL_SWITCH_LIMIT_OFFSET))
-                            res = place_limit_order(pair, "SELL", qty_to_sell, limit_px, balances=balances)
+                            res, q_used, p_used = place_limit_order(pair, "SELL", qty_to_sell, limit_px, balances=free_balances)
                             oid = _extract_order_id(res)
                             if oid:
                                 st = get_order_status(order_id=oid)
                                 _record_fill_from_status(pair, "SELL", st, oid)
-                            scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH LIMIT: {qty_to_sell} @ {limit_px} | res={res}")
+                            scan_log.append(f"{ist_now()} | {pair} | KILL-SWITCH LIMIT: {q_used} @ {p_used} | res={res}")
                             kill_cooldown_until[pair] = now_ts + KILL_SWITCH_COOLDOWN_SEC
-                            last_buy_fill[pair]["qty"] = max(0.0, filled_qty - qty_to_sell)
+                            last_buy_fill[pair]["qty"] = max(0.0, filled_qty - q_used)
                 else:
                     kill_breach_since[pair] = 0
 
@@ -967,14 +1015,14 @@ def scan_loop():
             # place quotes if empty (keep prices precision-safe and non-crossing)
             if qty_bid > 0 and not active_quotes[pair]["bid"]:
                 bpx = fmt_price(pair, min(bid_px, last * (1 - 1e-6)))
-                _place_quote(pair, "BUY", bpx, qty_bid, balances)
+                _place_quote(pair, "BUY", bpx, qty_bid, free_balances)
 
             if qty_ask > 0 and coin_bal >= _min_qty(pair):
                 if not active_quotes[pair]["ask"]:
                     apx = fmt_price(pair, max(ask_px, last * (1 + 1e-6)))
-                    _place_quote(pair, "SELL", apx, qty_ask, balances)
+                    _place_quote(pair, "SELL", apx, qty_ask, free_balances)
 
-            _manage_orphan_inventory(pair, now_ts, prices, balances)
+            _manage_orphan_inventory(pair, now_ts, prices, free_balances)
 
         status["msg"], status["last"] = "Running", ist_now()
         status_epoch = int(time.time())
@@ -1013,6 +1061,9 @@ def stop():
 @app.route("/status")
 def get_status():
     balances = get_wallet_balances()
+    usdt_total = balances.get("USDT", 0.0)
+    locked_usdt, locked_coin = _locked_from_active_quotes()
+    free_balances = _compute_free_balances(balances)
     coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
     profit_today = compute_realized_pnl_today()
     profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
@@ -1032,7 +1083,10 @@ def get_status():
         "status": status["msg"],
         "last": status["last"],
         "status_epoch": status_epoch,
-        "usdt": balances.get("USDT", 0.0),
+        "usdt": usdt_total,
+        "usdt_free": free_balances.get("USDT", 0.0),
+        "usdt_locked": locked_usdt,
+        "locked_coin": locked_coin,
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
         "pnl_cumulative": cumulative_pnl,
