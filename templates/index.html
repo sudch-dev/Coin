@@ -1,209 +1,140 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Market Maker Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    :root {
-      --bg: #0f1115;
-      --panel: #151922;
-      --text: #e6e6e6;
-      --muted: #9aa0a6;
-      --accent: #6ee7b7;
-      --accent2: #60a5fa;
-      --danger: #f87171;
-      --warn: #fbbf24;
-      --ok: #34d399;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
-      background: linear-gradient(180deg, #0f1115, #0b0d12 60%, #0f1115 100%);
-      color: var(--text);
-    }
-    header {
-      padding: 18px 20px; border-bottom: 1px solid #1f2430;
-      position: sticky; top: 0; backdrop-filter: blur(6px); background: rgba(15,17,21,0.7);
-      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-    }
-    header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
-    header .pill {
-      padding: 6px 10px; border-radius: 999px; background: #1b2030; color: var(--muted); font-size: 12px;
-      border: 1px solid #232838;
-    }
-    .wrap { padding: 20px; max-width: 1200px; margin: 0 auto; }
-    .grid {
-      display: grid; gap: 16px; grid-template-columns: 1.2fr 1fr;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid #1f2430; border-radius: 12px; overflow: hidden;
-      box-shadow: 0 10px 30px rgba(0,0,0,.25);
-    }
-    .card h2 {
-      margin: 0; padding: 14px 16px; border-bottom: 1px solid #1f2430; font-size: 14px; color: var(--muted);
-      letter-spacing: .4px; text-transform: uppercase;
-    }
-    .card .body { padding: 14px 16px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 10px 8px; border-bottom: 1px solid #232838; font-size: 14px; }
-    th { color: var(--muted); text-align: left; font-weight: 600; }
-    .mono { font-family: var(--mono); }
-    .btn {
-      appearance: none; border: 1px solid #273245; background: #1b2433; color: #cfe3ff;
-      padding: 10px 12px; border-radius: 10px; cursor: pointer; font-weight: 600;
-      transition: transform .04s ease, background .2s ease, border .2s ease;
-    }
-    .btn:hover { background: #1e2a3d; border-color: #31425b; }
-    .btn:active { transform: translateY(1px); }
-    .btn-accent { background: #18291f; color: #c8f6e3; border-color: #1f3a2c; }
-    .btn-accent:hover { background: #163122; }
-    .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .log {
-      height: 420px; overflow: auto; font-family: var(--mono); background: #0e121a; border-radius: 8px;
-      padding: 10px 12px; border: 1px solid #1f2430;
-    }
-    .log-line { padding: 4px 0; white-space: pre-wrap; word-break: break-word; }
-    .muted { color: var(--muted); }
-    .stat {
-      display: inline-block; padding: 8px 10px; border: 1px solid #232838; border-radius: 10px; background: #121723;
-      font-size: 13px; color: #cbd5e1; min-width: 140px;
-    }
-    footer { color: #6b7280; padding: 16px 20px; font-size: 12px; text-align: center; }
-    @media (max-width: 980px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Market Maker Dashboard</title>
+<style>
+  :root {
+    --bg:#0f141a; --panel:#18222b; --text:#e9eef4; --muted:#aab7c4; --accent:#66e0a3; --warn:#ffb86b; --bad:#ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;}
+  .wrap { max-width: 980px; margin: 28px auto; padding: 0 16px;}
+  h1 { margin: 0 0 16px; font-size: 28px; }
+  .badge { display:inline-block; padding:8px 12px; margin:6px 8px 18px 0; border-radius:999px; background:#212b35; color:#cfe7ff; font-size:14px;}
+  .row { display:grid; grid-template-columns: 1fr; gap:18px; }
+  @media(min-width:900px){ .row { grid-template-columns: 1fr 1fr; } }
+  .card { background:var(--panel); border-radius:14px; padding:16px 16px; box-shadow: 0 0 0 1px rgba(255,255,255,.04) inset; }
+  .card h2 { margin: 2px 0 14px; font-size: 22px; }
+  .mono { font-family: var(--mono); white-space: pre-wrap; }
+  .table { width:100%; border-collapse: collapse; font-family: var(--mono); font-size: 14px;}
+  .table th, .table td { border-bottom: 1px solid rgba(255,255,255,.06); padding:10px 8px; text-align:left;}
+  .muted { color: var(--muted); }
+  .good { color: var(--accent); }
+  .bad { color: var(--bad); }
+  .btn { background:#263241; color:#eaf4ff; border:1px solid rgba(255,255,255,.12); border-radius:10px; padding:10px 12px; cursor:pointer; }
+  .foot { text-align:center; color:#8ea1b3; margin:26px 0 12px; font-size:13px;}
+  .pill { display:inline-block; padding:3px 7px; border-radius:6px; background:#1f2a33; color:#a2bfd8; font-family:var(--mono); font-size:12px;}
+</style>
 </head>
 <body>
-  <header>
-    <h1>Market Maker Dashboard</h1>
-    <span class="pill">TP: 0.5% · No SL</span>
-    <span class="pill">Auto-scan: every 60s</span>
-  </header>
+<div class="wrap">
+  <h1>Market Maker Dashboard</h1>
+  <div>
+    <span class="badge">TP: 0.5% · No SL</span>
+    <span id="autoBadge" class="badge">Auto-scan: every 60s</span>
+    <button id="runBtn" class="btn">Run Scan Now</button>
+  </div>
 
-  <div class="wrap">
-    <div class="row" style="margin-bottom:14px;">
-      <button class="btn btn-accent" id="runScanBtn">▶ Run Scan Now</button>
-      <button class="btn" id="refreshBtn">⟳ Refresh</button>
-      <span class="stat" id="lastUpdated">Last update: —</span>
+  <div class="row">
+    <div class="card">
+      <h2>Signals & Decisions</h2>
+      <div id="log" class="mono" style="font-size:14px; line-height:1.45; overflow:auto; max-height:420px;">loading…</div>
     </div>
 
-    <div class="grid">
-      <div class="card">
-        <h2>Scan Log</h2>
-        <div class="body">
-          <div id="log" class="log">
-            <!-- lines go here -->
-          </div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Balances</h2>
-        <div class="body">
-          {% if balances and balances|length > 0 %}
-          <table>
-            <thead><tr><th>Asset</th><th>Balance</th></tr></thead>
-            <tbody>
-              {% for asset, amt in balances.items() %}
-              <tr>
-                <td class="mono">{{ asset }}</td>
-                <td class="mono">{{ '%.8f'|format(amt) }}</td>
-              </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-          {% else %}
-            <div class="muted">No balances yet. They’ll appear after the first successful fetch.</div>
-          {% endif %}
-        </div>
-      </div>
+    <div class="card">
+      <h2>Balances</h2>
+      <div id="balances" class="muted">loading…</div>
+      <h2 style="margin-top:18px;">Open TP Orders</h2>
+      <table class="table" id="tpTable">
+        <thead><tr><th>Pair</th><th>Qty</th><th>Limit Px</th><th>Since</th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
 
-    <div class="card" style="margin-top:16px;">
-      <h2>Open Trades</h2>
-      <div class="body">
-        {% if trades and trades|length > 0 %}
-        <table>
-          <thead>
-            <tr>
-              <th>Pair</th>
-              <th>Entry</th>
-              <th>Quantity</th>
-              <th>Since</th>
-            </tr>
-          </thead>
-          <tbody id="tradesBody">
-            {% for pair, t in trades.items() %}
-            <tr>
-              <td class="mono">{{ pair }}</td>
-              <td class="mono">{{ '%.8f'|format(t.entry if t.entry else t['entry']) }}</td>
-              <td class="mono">{{ '%.8f'|format(t.qty if t.qty else t['qty']) }}</td>
-              <td class="muted">active</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        {% else %}
-          <div class="muted">No open trades.</div>
-        {% endif %}
-      </div>
+    <div class="card">
+      <h2>Recent Trades</h2>
+      <table class="table" id="trades">
+        <thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Realized</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>P&amp;L</h2>
+      <div id="pnl" class="mono"></div>
+      <h2 style="margin-top:18px;">Keepalive</h2>
+      <div id="ka" class="mono"></div>
+      <h2 style="margin-top:18px;">Errors</h2>
+      <div id="err" class="mono muted">-</div>
     </div>
   </div>
 
-  <footer>
-    © <span id="yr"></span> MM Bot · Logs update live. Click “Run Scan Now” to force a cycle.
-  </footer>
+  <div class="foot">© 2025 MM Bot · Logs update live every 10s.</div>
+</div>
 
-  <script>
-    const logBox = document.getElementById('log');
-    const runScanBtn = document.getElementById('runScanBtn');
-    const refreshBtn = document.getElementById('refreshBtn');
-    const lastUpdated = document.getElementById('lastUpdated');
-    const yr = document.getElementById('yr');
-    yr.textContent = new Date().getFullYear();
+<script>
+let pollMs = 10000;   // 10s
+let timer = null;
 
-    function setLastUpdated() {
-      const d = new Date();
-      lastUpdated.textContent = 'Last update: ' + d.toLocaleString();
-    }
+async function fetchStatus() {
+  try {
+    const r = await fetch('/status');
+    const j = await r.json();
 
-    function renderLog(lines) {
-      if (!Array.isArray(lines)) return;
-      logBox.innerHTML = '';
-      // newest first (matches app.py appendleft)
-      lines.forEach(line => {
-        const div = document.createElement('div');
-        div.className = 'log-line';
-        div.textContent = line;
-        logBox.appendChild(div);
-      });
-      logBox.scrollTop = logBox.scrollHeight;
-    }
+    // logs
+    const lines = (j.scans || []).map(s => s
+      .replace('→ BUY', '→ BUY').replace('→ SELL', '→ SELL'));
+    document.getElementById('log').textContent = (lines.length? lines.join('\n') : '—');
 
-    async function fetchScan() {
-      try {
-        const res = await fetch('/scan', { method: 'GET' });
-        const data = await res.json();
-        renderLog(data.log || []);
-        setLastUpdated();
-      } catch (e) {
-        console.error(e);
-      }
-    }
+    // balances
+    const coins = j.coins || {};
+    const rows = Object.keys(coins).sort().map(k => `<tr><td>${k}</td><td>${(+coins[k]).toFixed(8)}</td></tr>`).join('');
+    document.getElementById('balances').innerHTML =
+      `<table class="table"><thead><tr><th>Coin</th><th>Qty</th></tr></thead><tbody>${rows}</tbody></table>
+       <div style="margin-top:8px" class="mono">USDT: ${(j.usdt||0).toFixed(6)}</div>`;
 
-    // Buttons
-    runScanBtn.addEventListener('click', fetchScan);
-    refreshBtn.addEventListener('click', fetchScan);
+    // open tp
+    const tp = j.open_tp || [];
+    document.querySelector('#tpTable tbody').innerHTML =
+      tp.map(x => `<tr><td>${x.pair}</td><td>${(+x.qty).toFixed(8)}</td><td>${x.limit_px}</td><td>${new Date(x.since_ts*1000).toLocaleTimeString()}</td></tr>`).join('');
 
-    // Initial load
-    fetchScan();
+    // trades
+    const trows = (j.trades||[]).map(t =>
+      `<tr><td>${t.ts}</td><td>${t.pair}</td><td>${t.side}</td><td>${(+t.qty).toFixed(8)}</td><td>${t.price}</td><td>${t.realized??0}</td></tr>`).join('');
+    document.querySelector('#trades tbody').innerHTML = trows || '<tr><td colspan="6" class="muted">No recent trades.</td></tr>';
 
-    // Auto-refresh every 10s to keep the log lively
-    setInterval(fetchScan, 10000);
-  </script>
+    // pnl
+    document.getElementById('pnl').textContent =
+      `Today: ${j.profit_today}\nYesterday: ${j.profit_yesterday}\nCumulative: ${j.pnl_cumulative}`;
+
+    // keepalive
+    const ka = j.keepalive || {};
+    document.getElementById('ka').textContent =
+      `External Ping: ${ka.enabled? 'Enabled':'Disabled'}\nLast Ping (age): ${ka.last_ping_age_sec ?? '-'}s\nNext Due: ${ka.next_due_sec ?? '-'}s\nInterval: ${ka.interval_sec || '-'}s\nBase URL\n${ka.app_base_url || '-'}`;
+
+    // error
+    document.getElementById('err').textContent = j.error || '-';
+
+  } catch (e) {
+    document.getElementById('err').textContent = 'UI fetch error: ' + e;
+  }
+}
+
+async function runNow(){
+  // Touch /status forces loop info to appear; loop runs continuously.
+  await fetchStatus();
+}
+
+document.getElementById('runBtn').addEventListener('click', runNow);
+
+function startPolling(){
+  if(timer) clearInterval(timer);
+  timer = setInterval(fetchStatus, pollMs);
+}
+fetchStatus();
+startPolling();
+</script>
 </body>
 </html>
