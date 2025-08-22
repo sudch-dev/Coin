@@ -1,129 +1,265 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>EMA+MACD Trader (5s) — Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="UTF-8" />
+  <title>Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; color: #111; }
-    h1 { margin: 0 0 6px; }
-    .muted { color:#666; font-size:14px;}
-    .row { display:flex; gap:16px; flex-wrap:wrap; }
-    .card { border:1px solid #ddd; border-radius:10px; padding:14px; background:#fff; flex:1; min-width:280px; }
-    .pill { display:inline-block; padding:4px 10px; border-radius:20px; background:#eef; margin-right:6px; font-size:12px; }
-    button { padding:8px 14px; border-radius:8px; border:1px solid #333; background:#111; color:#fff; cursor:pointer; }
-    button.secondary { background:#fff; color:#111; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { padding:8px; border-bottom:1px solid #eee; text-align:left; font-size:13px;}
-    pre { background:#0b1020; color:#d4ffea; padding:12px; border-radius:8px; overflow:auto; max-height:420px; }
-    .ok { color:#0a8f20; }
-    .warn { color:#b36b00; }
+    :root{
+      --bg:#000;
+      --fg-green:#16ff16;  /* primary green */
+      --fg-red:#ff3b3b;    /* primary red */
+      --fg-dim:#0aa00a;    /* dimmer green for body */
+      --card:#0b0b0b;
+      --border:#161616;
+      --muted:#0c580c;
+      --a1:#061006;
+      --a2:#0b1d0b;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;}
+    body{
+      margin:0; padding:18px;
+      background:var(--bg);
+      color:var(--fg-dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
+      line-height:1.35;
+    }
+    h1{
+      margin:0 0 16px 0;
+      color:var(--fg-red);
+      font-weight:800; letter-spacing:1px;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap:12px;
+    }
+    .card{
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:10px;
+      padding:14px;
+      box-shadow:0 0 0 1px rgba(255,59,59,0.03), 0 8px 30px rgba(0,0,0,0.35);
+    }
+    .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    button{
+      background:transparent; color:var(--fg-green);
+      border:1px solid var(--fg-green);
+      padding:8px 12px; border-radius:8px;
+      cursor:pointer; transition:.15s transform ease;
+    }
+    button:hover{transform:translateY(-1px); box-shadow:0 0 0 2px rgba(22,255,22,0.1) inset;}
+    .pill{
+      display:inline-block; padding:4px 8px; border-radius:999px;
+      border:1px solid var(--border); background:#020302; color:var(--fg-green);
+      font-size:12px; margin-left:6px;
+    }
+    .kv{display:grid; grid-template-columns: 160px 1fr; gap:6px 10px; align-items:baseline}
+    .kv .k{color:var(--fg-red)}
+    .kv .v{color:var(--fg-green)}
+    .neg{color:var(--fg-red)!important}
+    .pos{color:var(--fg-green)!important}
+
+    table{width:100%; border-collapse:collapse; margin-top:8px; font-size:13px}
+    th,td{border:1px solid var(--border); padding:6px 8px}
+    th{color:var(--fg-red); background:#070707; text-align:left}
+
+    /* log blocks */
+    pre, .log{
+      background:#020402; border:1px solid var(--border);
+      border-radius:8px; padding:10px; max-height:420px; overflow:auto;
+      font-size:12px; margin:8px 0 0 0;
+    }
+    .log-line{white-space:pre; display:block; padding:3px 6px; border-radius:4px}
+    .altA{background:rgba(22,255,22,0.05); color:var(--fg-green)}  /* green line */
+    .altB{background:rgba(255,59,59,0.06); color:var(--fg-red)}    /* red line */
+
+    .tiny{font-size:12px; color:var(--muted)}
+    .muted{opacity:.8}
+    .spacer{height:6px}
+    .badge{border:1px solid var(--border); padding:2px 6px; border-radius:6px; margin-left:6px}
+    a{color:var(--fg-green); text-decoration:none; border-bottom:1px dotted var(--fg-green)}
+    a:hover{opacity:.85}
+    .right{margin-left:auto}
   </style>
 </head>
 <body>
-  <h1>EMA+MACD Trader</h1>
-  <div class="muted">5s candles · TP ≥ 1% or Sell signal · No SL · Buy=30% USDT · Sell=full coin</div>
-  <div style="margin:10px 0;">
-    <span class="pill">EMA5 &gt; EMA10 + MACD bullish ⇒ BUY</span>
-    <span class="pill">EMA5 &lt; EMA10 + MACD bearish ⇒ SELL</span>
-    <span class="pill">MACD Convergence/Divergence logged</span>
-  </div>
+  <h1>Dashboard</h1>
 
-  <div style="margin:10px 0;">
-    <button id="startBtn">Start</button>
-    <button id="stopBtn" class="secondary">Stop Run</button>
-    <button id="refreshBtn" class="secondary">Refresh</button>
-  </div>
-
-  <div class="row">
-    <div class="card" style="max-width:360px">
-      <h3>Status</h3>
-      <div id="statusBox" class="muted">loading…</div>
-      <h3 style="margin-top:16px;">Balances</h3>
-      <div id="balBox" class="muted">loading…</div>
-      <h3 style="margin-top:16px;">Keepalive</h3>
-      <div id="keepBox" class="muted">loading…</div>
-    </div>
-
+  <div class="grid">
+    <!-- Controls -->
     <div class="card">
-      <h3>Open Positions</h3>
-      <table id="posTable">
-        <thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Time</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <h3 style="margin-top:16px;">P&amp;L</h3>
-      <div id="pnlBox" class="muted">loading…</div>
-      <h3 style="margin-top:16px;">Trades</h3>
-      <div id="tradesBox" class="muted">loading…</div>
+      <div class="row">
+        <button onclick="startBot()">Start</button>
+        <button onclick="stopBot()">Stop</button>
+        <button onclick="refreshNow()">Refresh</button>
+        <span class="badge tiny">auto 1s</span>
+        <span class="right pill tiny" id="lastRefresh">—</span>
+      </div>
+      <div class="spacer"></div>
+      <div class="kv">
+        <div class="k">Status</div><div class="v" id="status">—</div>
+        <div class="k">Last tick</div><div class="v" id="last">—</div>
+        <div class="k">USDT Balance</div><div class="v" id="usdt">—</div>
+        <div class="k">Balance age</div><div class="v" id="bal_age">—</div>
+        <div class="k">Profit today</div><div class="v" id="profit_today">—</div>
+        <div class="k">PnL cumulative</div><div class="v" id="pnl_cumulative">—</div>
+      </div>
     </div>
 
-    <div class="card" style="flex-basis:100%;">
-      <h3>Scan Log (signals, MACD C/D, gates)</h3>
-      <pre id="logBox">loading…</pre>
+    <!-- Positions -->
+    <div class="card">
+      <div class="row">
+        <div style="color:var(--fg-red); font-weight:700;">Open Positions</div>
+      </div>
+      <div id="positions"></div>
+    </div>
+
+    <!-- Trades -->
+    <div class="card">
+      <div class="row">
+        <div style="color:var(--fg-red); font-weight:700;">Recent Trades</div>
+        <span class="pill tiny">detailed</span>
+      </div>
+      <div id="trades" class="log"></div>
+    </div>
+
+    <!-- Scan log -->
+    <div class="card">
+      <div class="row">
+        <div style="color:var(--fg-red); font-weight:700;">Scan Log</div>
+        <span class="pill tiny">signals</span>
+      </div>
+      <div id="scans" class="log"></div>
+    </div>
+
+    <!-- Raw IO -->
+    <div class="card">
+      <div class="row">
+        <div style="color:var(--fg-red); font-weight:700;">Raw I/O</div>
+        <span class="pill tiny">requests &amp; responses</span>
+      </div>
+      <div id="io" class="log"></div>
     </div>
   </div>
 
   <script>
-    async function api(path, opts={}) {
-      const r = await fetch(path, opts);
-      return r.json ? r.json() : r.text();
+    const $$ = (id)=>document.getElementById(id);
+
+    async function apiJSON(url, method="GET"){
+      const res = await fetch(url, {method});
+      if(!res.ok) throw new Error(url+" -> "+res.status);
+      return res.json();
     }
 
-    async function loadStatus() {
-      const data = await api('/status');
-      // status
-      document.getElementById('statusBox').innerHTML =
-        `<div><b>${data.status}</b> · last: ${data.last}</div>`;
+    function niceNum(n){
+      if(n === null || n === undefined) return "—";
+      if(typeof n === "number"){
+        const abs = Math.abs(n);
+        if(abs>=100000) return n.toLocaleString(undefined,{maximumFractionDigits:2});
+        if(abs>=1) return n.toLocaleString(undefined,{maximumFractionDigits:4});
+        return n.toLocaleString(undefined,{maximumSignificantDigits:6});
+      }
+      return n;
+    }
 
-      // balances + PNL
-      document.getElementById('balBox').innerHTML =
-        `<div>USDT: <b>${(data.usdt||0).toFixed(6)}</b></div>`;
+    function colorizeNumber(el, value){
+      if(typeof value !== "number") { el.textContent = value; return; }
+      el.textContent = niceNum(value);
+      el.classList.remove("pos","neg");
+      if(value > 0) el.classList.add("pos");
+      else if(value < 0) el.classList.add("neg");
+    }
 
-      document.getElementById('pnlBox').innerHTML =
-        `<div>Today: <b class="${data.profit_today>=0?'ok':'warn'}">${(data.profit_today||0).toFixed(6)}</b></div>
-         <div>Cumulative: <b class="${data.pnl_cumulative>=0?'ok':'warn'}">${(data.pnl_cumulative||0).toFixed(6)}</b></div>`;
+    async function startBot(){ await apiJSON("/start","POST"); await loadAll(); }
+    async function stopBot(){ await apiJSON("/stop","POST"); await loadAll(); }
+
+    function refreshNow(){ loadAll(true); }
+
+    function renderPositions(positions){
+      const keys = Object.keys(positions||{});
+      if(keys.length===0){
+        $$("positions").innerHTML = '<div class="tiny">no open positions</div>';
+        return;
+      }
+      let html = '<table><thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Timestamp</th></tr></thead><tbody>';
+      for(const p of keys){
+        const v = positions[p];
+        html += `<tr>
+          <td>${p}</td>
+          <td>${niceNum(v.qty)}</td>
+          <td>${niceNum(v.entry)}</td>
+          <td>${v.ts}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      $$("positions").innerHTML = html;
+    }
+
+    function renderAltLog(containerId, lines){
+      const el = $$(containerId);
+      if(!lines || !lines.length){ el.innerHTML = '<div class="tiny">no data</div>'; return; }
+      // Alternate colors line-by-line: altA (green) / altB (red)
+      const frag = document.createDocumentFragment();
+      lines.forEach((ln, i)=>{
+        const div = document.createElement('div');
+        div.className = 'log-line ' + (i % 2 === 0 ? 'altA' : 'altB');
+        // emphasize BUY/SELL and Gates
+        div.innerHTML = ln
+          .replaceAll(' BUY ',' <b>BUY</b> ')
+          .replaceAll(' SELL ',' <b>SELL</b> ')
+          .replaceAll(' Gates: Buy=True',' <b>Gates: Buy=True</b>')
+          .replaceAll(' Gates: Sell=True',' <b>Gates: Sell=True</b>');
+        frag.appendChild(div);
+      });
+      el.innerHTML = '';
+      el.appendChild(frag);
+      // Auto-scroll to bottom
+      el.scrollTop = el.scrollHeight;
+    }
+
+    async function loadStatus(){
+      const data = await apiJSON("/status");
+      // top stats
+      $$("#status").textContent = data.status;
+      $$("#last").textContent = data.last;
+      $$("#bal_age").textContent = data.balances_age_sec != null ? (data.balances_age_sec + "s") : "—";
+      colorizeNumber($$("#usdt"), data.usdt);
+      colorizeNumber($$("#profit_today"), data.profit_today);
+      colorizeNumber($$("#pnl_cumulative"), data.pnl_cumulative);
 
       // positions
-      const posTbody = document.querySelector('#posTable tbody');
-      posTbody.innerHTML = '';
-      for (const [pair, v] of Object.entries(data.positions||{})) {
-        const tr = document.createElement('tr');
-        const dt = new Date((v.ts||0)*1000).toLocaleString();
-        tr.innerHTML = `<td>${pair}</td><td>${v.qty}</td><td>${v.entry}</td><td>${dt}</td>`;
-        posTbody.appendChild(tr);
-      }
-
-      // trades
-      const trades = (data.trades||[]).map(x=>x).join('\n');
-      document.getElementById('tradesBox').textContent = trades || '—';
+      renderPositions(data.positions);
 
       // logs
-      const logs = (data.scans||[]).join('\n');
-      document.getElementById('logBox').textContent = logs || '—';
-
-      // keepalive box
-      const k = data.keepalive || {};
-      document.getElementById('keepBox').innerHTML =
-        `<div>Enabled: <b>${k.enabled ? 'Yes' : 'No'}</b></div>
-         <div>Interval: ${k.interval_sec||'-'}s</div>
-         <div>Last ping age: ${k.last_ping_age_sec??'-'}s</div>
-         <div>Next due in: ${k.next_due_sec??'-'}s</div>
-         <div>URL: ${k.app_base_url || ''}/ping</div>`;
+      renderAltLog("trades", data.trades || []);
+      renderAltLog("scans", data.scans || []);
     }
 
-    document.getElementById('startBtn').onclick = async () => {
-      await api('/start', {method: 'POST'});
-      loadStatus();
-    };
-    document.getElementById('stopBtn').onclick = async () => {
-      await api('/stop', {method: 'POST'});
-      loadStatus();
-    };
-    document.getElementById('refreshBtn').onclick = loadStatus;
+    async function loadIO(){
+      const data = await apiJSON("/io");
+      renderAltLog("io", data.io || []);
+    }
 
-    // auto-refresh
-    loadStatus();
-    setInterval(loadStatus, 4000);
+    async function loadAll(manual=false){
+      try{
+        await Promise.all([loadStatus(), loadIO()]);
+        const t = new Date();
+        $$("#lastRefresh").textContent = "refreshed " + t.toLocaleTimeString();
+        if(manual){
+          // small visual bump
+          $$("#lastRefresh").style.transform = "scale(1.05)";
+          setTimeout(()=>{$$("#lastRefresh").style.transform="";},200);
+        }
+      }catch(err){
+        console.error(err);
+      }
+    }
+
+    // fast auto-refresh: every 1s to help “fast triggering”
+    setInterval(loadAll, 1000);
+    window.onload = () => loadAll(true);
   </script>
 </body>
 </html>
