@@ -10,6 +10,7 @@ import random
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime, timedelta
 from pytz import timezone
+from collections import deque
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -24,7 +25,6 @@ API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API
 BASE_URL = "https://api.coindcx.com"
 
 # -------------------- Markets --------------------
-# (Removed LTC as requested)
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT"
@@ -47,25 +47,25 @@ PAIR_RULES = {
 CANDLE_INTERVAL = 5     # seconds (5s candles)
 POLL_SEC        = 1.0
 TP_TARGET_PCT   = 0.010  # 1% target
-BUY_FRACTION_USDT = 0.30 # use 30% of free USDT on buys
-SELL_ALL_COIN     = True # exit uses full coin wallet
+BUY_FRACTION_USDT = 0.30
+SELL_ALL_COIN     = True
 
-# EMA & MACD (entry/exit gates)
+# EMA & MACD
 EMA_FAST = 5
 EMA_SLOW = 10
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Fees and safety headroom
+# Fees and safety
 FEE_PCT_PER_SIDE = 0.0010
-BUY_HEADROOM     = 1.0005  # 5bp cushion so rounding always fits
+BUY_HEADROOM     = 1.0005
 
 # Keepalive
 KEEPALIVE_SEC = 240
 
 # Rules refresh cadence
-RULES_REFRESH_SEC = 1800  # 30 min
+RULES_REFRESH_SEC = 1800
 _last_rules_refresh = 0
 
 # -------------------- Time helpers --------------------
@@ -75,17 +75,17 @@ def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
 def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # -------------------- State --------------------
-tick_logs     = {p: [] for p in PAIRS}   # (ts, price) ticks for making 5s candles
-candle_logs   = {p: [] for p in PAIRS}   # list of dicts {open,high,low,close,start}
-scan_log      = []                       # textual decisions
-trade_log     = []                       # trades & execution steps
+tick_logs     = {p: [] for p in PAIRS}
+candle_logs   = {p: [] for p in PAIRS}
+scan_log      = []
+trade_log     = []
 running       = False
 status        = {"msg": "Idle", "last": ""}
 status_epoch  = 0
 error_message = ""
 last_keepalive = 0
 
-# Position tracking per pair (simple swing system)
+# Positions
 positions = {
     # pair: {"qty": float, "entry": float, "ts": int}
 }
@@ -103,11 +103,60 @@ BAL_TTL_SEC = 15
 _bal_cache = {}
 _bal_cache_ts = 0
 
-# -------------------- Logging helper --------------------
+# ---- Raw I/O logging config ----
+IO_ENABLED   = os.environ.get("IO_ENABLED", "1") == "1"
+IO_MAX_LINES = int(os.environ.get("IO_MAX_LINES", "500"))
+IO_MAX_FIELD = int(os.environ.get("IO_MAX_FIELD", "2000"))
+IO_LOG_FILE  = os.environ.get("IO_LOG_FILE", "io_log.txt")
+io_log = deque(maxlen=IO_MAX_LINES)
+
+# -------------------- Logging helpers --------------------
 def _tlog(msg):
     line = f"{ist_now()} | {msg}"
     trade_log.append(line)
     scan_log.append(line)
+
+def _truncate(s, n):
+    try:
+        s = s if isinstance(s, str) else json.dumps(s)
+    except Exception:
+        s = str(s)
+    if s is None:
+        return ""
+    return s if len(s) <= n else s[:n] + f"...(truncated {len(s)-n} chars)"
+
+def _mask_headers(h):
+    if not isinstance(h, dict):
+        return {}
+    masked = {}
+    for k, v in h.items():
+        lk = k.lower()
+        if lk in ("x-auth-signature", "x-auth-apikey", "authorization"):
+            masked[k] = "***"
+        else:
+            masked[k] = v
+    return masked
+
+def log_io(direction, url, headers=None, payload=None, status=None, response=None):
+    if not IO_ENABLED:
+        return
+    rec = {
+        "ts": ist_now(),
+        "dir": direction,
+        "url": url,
+        "status": status,
+        "headers": _mask_headers(headers or {}),
+        "payload": _truncate(payload, IO_MAX_FIELD) if payload is not None else None,
+        "response": _truncate(response, IO_MAX_FIELD) if response is not None else None,
+    }
+    line = f"{rec['ts']} | {rec['dir']} | {rec['url']} | status={rec['status']} | headers={rec['headers']} | payload={rec['payload']} | response={rec['response']}"
+    io_log.append(line)
+    try:
+        if IO_LOG_FILE:
+            with open(IO_LOG_FILE, "a") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
 
 # -------------------- P&L helpers --------------------
 def load_profit_state():
@@ -149,7 +198,11 @@ SESSION.headers.update({"User-Agent": "CoinDCXBot/1.0 (+health; non-browser)"})
 def _http_post_with_retry(url, headers, payload, timeout=12, retries=3, backoff_base=0.5):
     for i in range(retries):
         try:
+            log_io("REQ", url, headers=headers, payload=payload)
             r = SESSION.post(url, headers=headers, data=payload, timeout=timeout)
+            body = r.text if hasattr(r, "text") else ""
+            log_io("RES", url, status=r.status_code, response=body)
+
             if r.status_code in (520, 502, 503, 504):
                 try:
                     cf = f" cf-ray={r.headers.get('CF-RAY','?')} cf-cache={r.headers.get('CF-Cache-Status','?')}"
@@ -170,7 +223,11 @@ def _http_post_with_retry(url, headers, payload, timeout=12, retries=3, backoff_
 def _http_get_with_retry(url, timeout=12, retries=3, backoff_base=0.5):
     for i in range(retries):
         try:
+            log_io("REQ", url)
             r = SESSION.get(url, timeout=timeout)
+            body = r.text if hasattr(r, "text") else ""
+            log_io("RES", url, status=r.status_code, response=body)
+
             if r.status_code in (520, 502, 503, 504):
                 _log_http_issue(f"GET {url}", r)
                 if i < retries - 1:
@@ -264,11 +321,9 @@ def get_wallet_balances():
     global _bal_cache, _bal_cache_ts
     now = time.time()
 
-    # Serve cache if fresh
     if _bal_cache and (now - _bal_cache_ts) < BAL_TTL_SEC:
         return dict(_bal_cache)
 
-    # Fetch fresh
     payload = json.dumps({"timestamp": int(now * 1000)})
     sig = hmac_signature(payload)
     headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
@@ -288,13 +343,11 @@ def get_wallet_balances():
     except Exception as e:
         scan_log.append(f"{ist_now()} | balances fail: {e}")
 
-    # Fallback: stale cache (read-only safe)
     if _bal_cache:
         age = int(now - _bal_cache_ts)
         _tlog(f"balances degraded: serving cached (age={age}s)")
         return dict(_bal_cache)
 
-    # No data at all
     _tlog("balances unavailable (no cache)")
     return {}
 
@@ -340,16 +393,11 @@ def _fee_multiplier(side):
     return 1.0 + FEE_PCT_PER_SIDE if side.upper() == "BUY" else 1.0 - FEE_PCT_PER_SIDE
 
 def normalize_qty_for_buy(pair, price, usdt_avail):
-    """
-    Turn a USDT notional into a precision/min-qty safe quantity that fits fees.
-    """
     if price <= 0:
         return 0.0
-    # fee + headroom aware
     denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
     q = usdt_avail / denom
     q = fmt_qty(pair, q)
-    # after rounding make sure still fits
     step = _qty_step(pair)
     while q >= _min_qty(pair) and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
         q = fmt_qty(pair, max(0.0, q - step))
@@ -379,11 +427,9 @@ def get_order_status(order_id=None, client_order_id=None):
 def _extract_order_id(res: dict):
     if not isinstance(res, dict):
         return None
-    # Common keys
     for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
         if res.get(k):
             return str(res[k])
-    # Nested under 'orders'
     try:
         if isinstance(res.get("orders"), list) and res["orders"]:
             o = res["orders"][0]
@@ -392,7 +438,6 @@ def _extract_order_id(res: dict):
                     return str(o[k])
     except:
         pass
-    # Wrapped under 'data'
     d = res.get("data") or {}
     for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
         if d.get(k):
@@ -431,7 +476,7 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
             candle["volume"] += 1
     if candle:
         candles.append(candle)
-    candle_logs[pair] = candles[-300:]  # keep ~25 min of 5s bars
+    candle_logs[pair] = candles[-300:]
 
 def _ema_series(vals, n):
     if len(vals) == 0:
@@ -506,7 +551,6 @@ def strategy_scan():
     prices = fetch_all_prices()
     now_ts = int(time.time())
 
-    # build ticks and candles
     for pair in PAIRS:
         if pair in prices:
             px = prices[pair]["price"]
@@ -522,7 +566,6 @@ def strategy_scan():
     if not buys_allowed:
         scan_log.append(f"{ist_now()} | NOTE: buys paused (balances stale age={bal_age}s)")
 
-    # per pair decision
     for pair in PAIRS:
         cs = candle_logs.get(pair) or []
         if len(cs) < max(EMA_SLOW, MACD_SLOW + MACD_SIGNAL) + 3:
@@ -531,13 +574,11 @@ def strategy_scan():
         closes = [c["close"] for c in cs]
         last = closes[-1]
 
-        # EMAs
         ema5_series = _ema_series(closes, EMA_FAST)
         ema10_series = _ema_series(closes, EMA_SLOW)
         e5_prev, e5_now = (ema5_series[-2], ema5_series[-1]) if len(ema5_series) >= 2 else (None, None)
         e10_prev, e10_now = (ema10_series[-2], ema10_series[-1]) if len(ema10_series) >= 2 else (None, None)
 
-        # MACD
         macd_line, macd_signal, macd_hist = _macd_series(closes)
         if not macd_line or not macd_signal:
             continue
@@ -548,16 +589,13 @@ def strategy_scan():
         macd_xup   = _cross_up(m_prev, m_now, s_prev, s_now)
         macd_xdn   = _cross_dn(m_prev, m_now, s_prev, s_now)
 
-        # MACD convergence/divergence with price
         m_for_cd = [None]*(len(closes)-len(macd_line)) + macd_line
         m_for_cd = [x for x in m_for_cd if x is not None]
         cd_note  = _macd_convergence_divergence(closes, m_for_cd)
 
-        # gates
         buy_gate  = (e5_now is not None and e10_now is not None and e5_now > e10_now) and (m_now > s_now)
         sell_gate = (e5_now is not None and e10_now is not None and e5_now < e10_now) and (m_now < s_now)
 
-        # log the full signal status
         scan_log.append(
             f"{ist_now()} | {pair} | "
             f"EMA5={round(e5_now,6)} EMA10={round(e10_now,6)} | "
@@ -566,11 +604,9 @@ def strategy_scan():
             f"CD={cd_note} | Gates: Buy={buy_gate} Sell={sell_gate} | Px={last}"
         )
 
-        # ---- Entry (BUY) ----
         have_pos = pair in positions and positions[pair].get("qty", 0.0) > 0.0
         if (not have_pos) and buy_gate and buys_allowed:
             notional = BUY_FRACTION_USDT * usdt_free
-            # Pair-aware notional floor (use exchange min_notional if available, else fallback to $1)
             rules = _rules(pair)
             min_notional = float(rules.get("min_notional", 0.0) or 0.0)
             floor = max(1.0, min_notional)
@@ -596,9 +632,8 @@ def strategy_scan():
                     _tlog(f"{pair} | BUY qty=0 (precision/min-qty/fee)")
             else:
                 _tlog(f"{pair} | BUY SKIP notional<{floor} (notional={round(notional,6)})")
-            continue  # skip sell checks this tick after buy attempt decision
+            continue
 
-        # ---- Exit (SELL) ----
         if have_pos:
             entry = positions[pair]["entry"]
             qty   = positions[pair]["qty"]
@@ -611,7 +646,7 @@ def strategy_scan():
             )
 
             if take_profit or sell_signal:
-                sell_qty = qty  # full position
+                sell_qty = qty
                 res = place_market(pair, "SELL", sell_qty)
                 oid = _extract_order_id(res)
                 if oid:
@@ -640,12 +675,10 @@ def scan_loop():
     while running:
         now_real = time.time()
 
-        # keepalive
         if now_real - last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
             last_keepalive = now_real
 
-        # refresh pair rules periodically
         if (time.time() - _last_rules_refresh) >= RULES_REFRESH_SEC:
             fetch_pair_precisions()
             _last_rules_refresh = time.time()
@@ -666,7 +699,6 @@ def scan_loop():
 # -------------------- Routes --------------------
 @app.route("/")
 def index():
-    # Supports index view (template should exist in templates/index.html)
     return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
@@ -684,11 +716,8 @@ def stop():
 def get_status():
     balances = get_wallet_balances()
     usdt_total = balances.get("USDT", 0.0)
-
-    # current positions snapshot
     pos = {p: {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]} for p, v in positions.items()}
 
-    # keepalive status
     now_real = time.time()
     last_age = now_real - (last_keepalive or 0)
     keepalive_info = {
@@ -713,6 +742,11 @@ def get_status():
         "scans": scan_log[-120:][::-1],
         "keepalive": keepalive_info
     })
+
+@app.route("/io")
+def get_io():
+    # Return last N raw I/O lines
+    return jsonify({"io": list(io_log)})
 
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
