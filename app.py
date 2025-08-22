@@ -496,10 +496,10 @@ def scan_loop():
 
                         # ---- TP-only (no SL) ----
                         if signal["side"] == "BUY":
-                            tp = fmt_price(pair, entry + 6 * risk_unit)   # 2:1 vs implicit risk_unit
+                            tp = fmt_price(pair, entry + 10 * risk_unit)   # 2:1 vs implicit risk_unit
                             pre_qty = (0.3 * usdt_bal) / entry            # cap-based sizing
                         else:
-                            tp = fmt_price(pair, entry - 6 * risk_unit)
+                            tp = fmt_price(pair, entry - 10 * risk_unit)
                             coin = pair[:-4]
                             pre_qty = float(balances.get(coin, 0.0))      # inventory-based shorts only
 
