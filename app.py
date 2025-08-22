@@ -78,7 +78,7 @@ def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y
 tick_logs     = {p: [] for p in PAIRS}   # (ts, price) ticks for making 5s candles
 candle_logs   = {p: [] for p in PAIRS}   # list of dicts {open,high,low,close,start}
 scan_log      = []                       # textual decisions
-trade_log     = []                       # successful trades
+trade_log     = []                       # successful trades & execution steps
 running       = False
 status        = {"msg": "Idle", "last": ""}
 status_epoch  = 0
@@ -97,6 +97,12 @@ profit_state = {
     "daily": {},
     "processed_orders": []
 }
+
+# -------------------- Logging helper --------------------
+def _tlog(msg):
+    line = f"{ist_now()} | {msg}"
+    trade_log.append(line)
+    scan_log.append(line)
 
 # -------------------- P&L helpers --------------------
 def load_profit_state():
@@ -138,9 +144,9 @@ def hmac_signature(payload):
 def _log_http_issue(prefix, r):
     try:
         body = r.text[:240] if hasattr(r, "text") else ""
-        scan_log.append(f"{ist_now()} | {prefix} HTTP {r.status_code} | {body}")
+        _tlog(f"{prefix} HTTP {r.status_code} | {body}")
     except Exception as e:
-        scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
+        _tlog(f"{prefix} log-fail: {e}")
 
 def _signed_post(url, body):
     payload = json.dumps(body, separators=(',', ':'))
@@ -275,8 +281,9 @@ def place_market(pair, side, qty):
         "total_quantity": f"{fmt_qty(pair, qty)}",
         "timestamp": int(time.time() * 1000)
     }
-    scan_log.append(f"{ist_now()} | {pair} | PRE-ORDER {side} qty={payload['total_quantity']} @ MKT")
+    _tlog(f"{pair} | SUBMIT {side} qty={payload['total_quantity']} @ MKT")
     res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+    _tlog(f"{pair} | SUBMIT RESP {side} => {res}")
     return res
 
 def get_order_status(order_id=None, client_order_id=None):
@@ -289,13 +296,29 @@ def get_order_status(order_id=None, client_order_id=None):
 def _extract_order_id(res: dict):
     if not isinstance(res, dict):
         return None
+
+    # Common keys
+    for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
+        if res.get(k):
+            return str(res[k])
+
+    # Nested under 'orders' (some endpoints batch)
     try:
         if isinstance(res.get("orders"), list) and res["orders"]:
             o = res["orders"][0]
-            return str(o.get("id") or o.get("order_id") or o.get("client_order_id") or "")
+            for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
+                if o.get(k):
+                    return str(o[k])
     except:
         pass
-    return str(res.get("id") or res.get("order_id") or res.get("client_order_id") or res.get("orderId") or "") or None
+
+    # Some APIs wrap under 'data'
+    d = res.get("data") or {}
+    for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
+        if d.get(k):
+            return str(d[k])
+
+    return None
 
 def _filled_avg_from_status(st):
     try:
@@ -499,17 +522,18 @@ def strategy_scan():
                     oid = _extract_order_id(res)
                     if oid:
                         st = get_order_status(order_id=oid)
+                        _tlog(f"{pair} | BUY STATUS oid={oid} => {st}")
                         filled, avg_px = _filled_avg_from_status(st)
+                        _tlog(f"{pair} | BUY PARSED filled={filled} avg_px={avg_px}")
                         if filled > 0 and avg_px > 0:
                             positions[pair] = {"qty": filled, "entry": avg_px, "ts": now_ts}
-                            trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg_px} | oid={oid}")
-                            scan_log.append(f"{ist_now()} | {pair} | BUY filled qty={filled} @ {avg_px}")
+                            _tlog(f"{pair} | BUY FILLED {filled} @ {avg_px} | oid={oid}")
                         else:
-                            scan_log.append(f"{ist_now()} | {pair} | BUY no fill | res={res}")
+                            _tlog(f"{pair} | BUY NO-FILL | oid={oid}")
                     else:
-                        scan_log.append(f"{ist_now()} | {pair} | BUY failed | res={res}")
+                        _tlog(f"{pair} | BUY FAILED (no oid) | res={res}")
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY qty=0 (precision/min-qty/fee)")
+                    _tlog(f"{pair} | BUY qty=0 (precision/min-qty/fee)")
             continue  # after a buy attempt, skip sell checks this tick
 
         # ---- Exit (SELL) ----
@@ -531,17 +555,18 @@ def strategy_scan():
                 oid = _extract_order_id(res)
                 if oid:
                     st = get_order_status(order_id=oid)
+                    _tlog(f"{pair} | SELL STATUS oid={oid} => {st}")
                     filled, avg_px = _filled_avg_from_status(st)
+                    _tlog(f"{pair} | SELL PARSED filled={filled} avg_px={avg_px}")
                     if filled > 0 and avg_px > 0:
                         pnl = (avg_px - entry) * min(filled, qty)
                         record_realized_pnl(pnl)
-                        trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
-                        scan_log.append(f"{ist_now()} | {pair} | SELL filled qty={filled} @ {avg_px} | PNL={round(pnl,6)}")
+                        _tlog(f"{pair} | SELL FILLED {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
                         positions.pop(pair, None)
                     else:
-                        scan_log.append(f"{ist_now()} | {pair} | SELL no fill | res={res}")
+                        _tlog(f"{pair} | SELL NO-FILL | oid={oid}")
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL failed | res={res}")
+                    _tlog(f"{pair} | SELL FAILED (no oid) | res={res}")
 
 # -------------------- Main loop --------------------
 _autostart_lock = threading.Lock()
@@ -623,7 +648,7 @@ def get_status():
         "positions": pos,
         "profit_today": compute_realized_pnl_today(),
         "pnl_cumulative": round(profit_state.get("cumulative_pnl", 0.0), 6),
-        "trades": trade_log[-12:][::-1],
+        "trades": trade_log[-50:][::-1],   # expanded history
         "scans": scan_log[-120:][::-1],
         "keepalive": keepalive_info
     })
