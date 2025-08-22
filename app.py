@@ -1,3 +1,5 @@
+# app.py
+
 import os
 import time
 import threading
@@ -14,23 +16,23 @@ from collections import deque
 # -------------------- Flask --------------------
 app = Flask(__name__)
 
-APP_BASE_URL    = os.environ.get("APP_BASE_URL", "https://coin-4k37.onrender.com")
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "")
 KEEPALIVE_TOKEN = os.environ.get("KEEPALIVE_TOKEN", "")
+TRADE_ENABLED = os.environ.get("TRADE_ENABLED", "1")  # "1" to enable trading, else signals only
 
-# -------------------- Exchange creds --------------------
-API_KEY = os.environ.get("API_KEY")
+# -------------------- API / Markets --------------------
+API_KEY = os.environ.get("API_KEY", "").strip()
 API_SECRET_RAW = os.environ.get("API_SECRET", "")
 API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API_SECRET_RAW
 BASE_URL = "https://api.coindcx.com"
 
-# -------------------- Markets --------------------
-# (Removed LTC as requested)
+# Pairs (LTC removed per request)
 PAIRS = [
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
     "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT"
 ]
 
-# Local fallbacks; refreshed from live rules
+# Local fallbacks; overwritten by live fetch at boot and periodically thereafter
 PAIR_RULES = {
     "BTCUSDT":  {"price_precision": 1, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
     "ETHUSDT":  {"price_precision": 2, "qty_precision": 6, "min_qty": 0.0001, "min_notional": 0.0},
@@ -43,30 +45,20 @@ PAIR_RULES = {
     "BNBUSDT":  {"price_precision": 3, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
 }
 
-# -------------------- Strategy knobs --------------------
-CANDLE_INTERVAL = 5     # seconds (you asked for 5s)
-POLL_SEC        = 1.0
-TP_TARGET_PCT   = 0.010  # 1% target (revised)
-BUY_FRACTION_USDT = 0.30 # use 30% of free USDT on buys
-SELL_ALL_COIN     = True # exit uses full coin wallet
-
-# EMA & MACD (entry/exit gates)
-EMA_FAST = 5
-EMA_SLOW = 10
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-
-# Fees and safety headroom
-FEE_PCT_PER_SIDE = 0.0010
-BUY_HEADROOM     = 1.0005  # 5bp cushion so rounding always fits
-
-# Keepalive
+# -------------------- Strategy / runtime settings --------------------
+CANDLE_INTERVAL = 5        # seconds (your request)
+POLL_SEC = 1.0             # tick poll
 KEEPALIVE_SEC = 240
 
-# Rules refresh cadence
-RULES_REFRESH_SEC = 1800  # 30 min
-_last_rules_refresh = 0
+# fees are used for min-notional checks; we aren’t adding/taking here
+FEE_PCT_PER_SIDE = 0.0010
+
+# Position sizing
+BUY_FRACTION_USDT = 0.30   # 30% of free USDT per entry
+BUY_HEADROOM = 1.0005      # 5 bps cushion for fees/rounding
+
+# Take-profit (no SL)
+TP_PCT = 0.01              # 1% target
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
@@ -75,36 +67,44 @@ def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
 def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # -------------------- State --------------------
-tick_logs     = {p: [] for p in PAIRS}   # (ts, price) ticks for making 5s candles
-candle_logs   = {p: [] for p in PAIRS}   # list of dicts {open,high,low,close,start}
-scan_log      = []                       # textual decisions
-trade_log     = []                       # successful trades
-running       = False
-status        = {"msg": "Idle", "last": ""}
-status_epoch  = 0
+tick_logs = {p: [] for p in PAIRS}     # (ts, price) raw ticks
+candle_logs = {p: [] for p in PAIRS}   # 5s candles
+scan_log, trade_log = [], []
+running = False
+status = {"msg": "Idle", "last": ""}
+status_epoch = 0
 error_message = ""
-last_keepalive = 0
 
-# Position tracking per pair (simple swing system)
-positions = {
-    # pair: {"qty": float, "entry": float, "ts": int}
-}
-
-# P&L persistence
+# inventory lots (FIFO P&L)
 PROFIT_STATE_FILE = "profit_state.json"
 profit_state = {
     "cumulative_pnl": 0.0,
     "daily": {},
+    "inventory": {},         # per market: [[qty, cost], ...]
     "processed_orders": []
 }
 
-# -------------------- P&L helpers --------------------
+# track last entry per pair for TP management
+last_entry = {p: {"entry": None, "qty": 0.0, "tp_order_id": None} for p in PAIRS}
+
+# keepalive
+_last_keepalive = 0
+
+# rules refresh cadence
+_last_rules_refresh = 0
+RULES_REFRESH_SEC = 1800  # 30 mins
+
+# -------------------- Persistence helpers --------------------
+from collections import deque
+
 def load_profit_state():
+    global profit_state
     try:
         with open(PROFIT_STATE_FILE, "r") as f:
             data = json.load(f)
         profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
         profit_state["daily"] = dict(data.get("daily", {}))
+        profit_state["inventory"] = data.get("inventory", {})
         profit_state["processed_orders"] = list(data.get("processed_orders", []))
     except:
         pass
@@ -113,6 +113,7 @@ def save_profit_state():
     tmp = {
         "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
         "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
+        "inventory": profit_state.get("inventory", {}),
         "processed_orders": profit_state.get("processed_orders", [])
     }
     try:
@@ -121,11 +122,62 @@ def save_profit_state():
     except:
         pass
 
-def record_realized_pnl(pnl):
-    pnl = float(pnl or 0.0)
-    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + pnl)
+def _get_inventory_deque(market):
+    inv = profit_state["inventory"].get(market, [])
+    dq = deque()
+    for lot in inv:
+        try:
+            q, c = float(lot[0]), float(lot[1])
+            if q > 0 and c > 0:
+                dq.append([q, c])
+        except:
+            continue
+    return dq
+
+def _set_inventory_from_deque(market, dq):
+    profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
+
+def apply_fill_update(market, side, price, qty, ts_ms, order_id):
+    if not order_id or order_id in profit_state["processed_orders"]:
+        return
+    try:
+        price = float(price); qty = float(qty)
+    except:
+        return
+    if price <= 0 or qty <= 0:
+        return
+
+    inv = _get_inventory_deque(market)
+    realized = 0.0
+
+    if side.lower() == "buy":
+        inv.append([qty, price])
+        # track last entry for TP
+        last_entry[market]["entry"] = price
+        last_entry[market]["qty"] = last_entry[market].get("qty", 0.0) + qty
+    else:
+        # FIFO realization
+        sell_q = qty
+        while sell_q > 1e-18 and inv:
+            lot_q, lot_px = inv[0]
+            used = min(sell_q, lot_q)
+            realized += (price - lot_px) * used
+            lot_q -= used
+            sell_q -= used
+            if lot_q <= 1e-18:
+                inv.popleft()
+            else:
+                inv[0][0] = lot_q
+        # reduce last_entry qty
+        last_entry[market]["qty"] = max(0.0, last_entry[market].get("qty", 0.0) - qty)
+        if last_entry[market]["qty"] <= 1e-18:
+            last_entry[market] = {"entry": None, "qty": 0.0, "tp_order_id": None}
+
+    _set_inventory_from_deque(market, inv)
+    profit_state["processed_orders"].append(order_id)
+    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
     dkey = ist_date()
-    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + pnl)
+    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
     save_profit_state()
 
 def compute_realized_pnl_today():
@@ -166,12 +218,12 @@ def _keepalive_ping():
         headers = {}
         if KEEPALIVE_TOKEN:
             url = f"{url}?t={KEEPALIVE_TOKEN}"
-            headers["X-Keepalive-Token"] = KEEPALIVE_TOKEN
-        requests.get(url, headers=headers, timeout=5)
+            headers = {"X-Keepalive-Token": KEEPALIVE_TOKEN}
+        requests.request("HEAD", url, headers=headers, timeout=5)
     except Exception:
         pass
 
-# -------------------- Exchange helpers --------------------
+# -------------------- Market rules (precision / min qty / notional) --------------------
 def fetch_pair_precisions():
     try:
         r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=12)
@@ -179,24 +231,20 @@ def fetch_pair_precisions():
             _log_http_issue("markets_details", r)
             return
         data = r.json()
-        by_pair = {}
         for item in data:
             p = item.get("pair") or item.get("market") or item.get("coindcx_name")
-            if not p:
-                continue
-            by_pair[p] = {
-                "price_precision": int(item.get("target_currency_precision", 6)),
-                "qty_precision":   int(item.get("base_currency_precision", 6)),
-                "min_qty":         float(item.get("min_quantity", 0.0) or 0.0),
-                "min_notional":    float(item.get("min_notional", 0.0) or 0.0)
-            }
-        for p in PAIRS:
-            if p in by_pair:
-                PAIR_RULES[p] = by_pair[p]
+            if p in PAIRS:
+                PAIR_RULES[p] = {
+                    "price_precision": int(item.get("target_currency_precision", 6)),
+                    "qty_precision":   int(item.get("base_currency_precision", 6)),
+                    "min_qty":         float(item.get("min_quantity", 0.0) or 0.0),
+                    "min_notional":    float(item.get("min_notional", 0.0) or 0.0)
+                }
         scan_log.append(f"{ist_now()} | market rules refreshed")
     except Exception as e:
         scan_log.append(f"{ist_now()} | markets_details fail: {e}")
 
+# -------------------- Balances / Prices --------------------
 def get_wallet_balances():
     payload = json.dumps({"timestamp": int(time.time() * 1000)})
     sig = hmac_signature(payload)
@@ -230,6 +278,7 @@ def fetch_all_prices():
 def _rules(pair): return PAIR_RULES.get(pair, {})
 def _min_qty(pair): return float(_rules(pair).get("min_qty", 0.0) or 0.0)
 def _qty_prec(pair): return int(_rules(pair).get("qty_precision", 6))
+def _min_notional(pair): return float(_rules(pair).get("min_notional", 0.0) or 0.0)
 
 def fmt_price(pair, price):
     pp = int(_rules(pair).get("price_precision", 6))
@@ -247,44 +296,32 @@ def fmt_qty(pair, qty):
 def _qty_step(pair):
     return 10 ** (-_qty_prec(pair))
 
-def _fee_multiplier(side):
-    return 1.0 + FEE_PCT_PER_SIDE if side.upper() == "BUY" else 1.0 - FEE_PCT_PER_SIDE
+def _learn_precision_from_error(pair, msg_lower):
+    if not isinstance(msg_lower, str):
+        return False
+    import re
+    m = re.search(r'([A-Z]{3,5})\s+precision\s+should\s+be\s+(\d+)', msg_lower.upper())
+    if not m:
+        return False
+    cur = m.group(1)
+    pval = int(m.group(2))
+    base = pair[:-4]
+    quote = pair[-4:]
+    if cur == base:
+        PAIR_RULES.setdefault(pair, {})["qty_precision"] = pval
+        return True
+    if cur == quote:
+        PAIR_RULES.setdefault(pair, {})["price_precision"] = pval
+        return True
+    return False
 
-def normalize_qty_for_buy(pair, price, usdt_avail):
-    """
-    Turn a USDT notional into a precision/min-qty safe quantity that fits fees.
-    """
-    if price <= 0:
-        return 0.0
-    # fee + headroom aware
-    denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
-    q = usdt_avail / denom
-    q = fmt_qty(pair, q)
-    # after rounding make sure still fits
-    step = _qty_step(pair)
-    while q >= _min_qty(pair) and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
-        q = fmt_qty(pair, max(0.0, q - step))
-    if q < _min_qty(pair): return 0.0
-    return q
-
-def place_market(pair, side, qty):
-    payload = {
-        "market": pair,
-        "side": side.lower(),
-        "order_type": "market_order",
-        "total_quantity": f"{fmt_qty(pair, qty)}",
-        "timestamp": int(time.time() * 1000)
-    }
-    scan_log.append(f"{ist_now()} | {pair} | PRE-ORDER {side} qty={payload['total_quantity']} @ MKT")
-    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
-    return res
-
-def get_order_status(order_id=None, client_order_id=None):
-    body = {"timestamp": int(time.time() * 1000)}
-    if order_id: body["id"] = order_id
-    if client_order_id: body["client_order_id"] = client_order_id
-    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
-    return res if isinstance(res, dict) else {}
+# -------------------- Orders --------------------
+def _why_trade_blocked():
+    reasons = []
+    if TRADE_ENABLED != "1": reasons.append("TRADE_ENABLED!=1")
+    if not API_KEY: reasons.append("API_KEY missing")
+    if not API_SECRET_RAW: reasons.append("API_SECRET missing")
+    return "; ".join(reasons) or None
 
 def _extract_order_id(res: dict):
     if not isinstance(res, dict):
@@ -297,18 +334,193 @@ def _extract_order_id(res: dict):
         pass
     return str(res.get("id") or res.get("order_id") or res.get("client_order_id") or res.get("orderId") or "") or None
 
-def _filled_avg_from_status(st):
-    try:
-        total_q  = float(st.get("total_quantity", st.get("quantity", 0)))
-        remain_q = float(st.get("remaining_quantity", st.get("remaining_qty", 0)))
-        exec_q   = float(st.get("executed_quantity", st.get("filled_qty", 0)))
-        filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
-        avg_px   = float(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
-        return filled, avg_px
-    except:
-        return 0.0, 0.0
+def get_order_status(order_id=None, client_order_id=None):
+    body = {"timestamp": int(time.time() * 1000)}
+    if order_id: body["id"] = order_id
+    if client_order_id: body["client_order_id"] = client_order_id
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
+    return res if isinstance(res, dict) else {}
 
-# -------------------- Candle & indicators --------------------
+def place_market(pair, side, qty):
+    payload = {
+        "market": pair,
+        "side": side.lower(),
+        "order_type": "market_order",
+        "total_quantity": f"{qty}",
+        "timestamp": int(time.time() * 1000)
+    }
+    scan_log.append(f"{ist_now()} | {pair} | PRE-ORDER {side} MKT qty={payload['total_quantity']}"
+                    f" (min_qty={_min_qty(pair)}, min_notional={_min_notional(pair)}, qp={_qty_prec(pair)})")
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+    msg = (res.get("message") or "").lower() if isinstance(res, dict) else ""
+    if res and ("precision" in msg or "min" in msg):
+        learned = _learn_precision_from_error(pair, msg)
+        if learned:
+            # retry with rounded qty again
+            payload["total_quantity"] = f"{fmt_qty(pair, float(qty))}"
+            res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+            scan_log.append(f"{ist_now()} | {pair} | RETRY market {side} qty={payload['total_quantity']} (learned_precision={learned})")
+    return res
+
+def place_limit(pair, side, qty, price):
+    p = fmt_price(pair, price)
+    q = fmt_qty(pair, qty)
+    payload = {
+        "market": pair,
+        "side": side.lower(),
+        "order_type": "limit_order",
+        "price_per_unit": f"{p}",
+        "total_quantity": f"{q}",
+        "timestamp": int(time.time() * 1000)
+    }
+    scan_log.append(f"{ist_now()} | {pair} | PRE-ORDER {side} LIMIT qty={payload['total_quantity']} @ {payload['price_per_unit']}"
+                    f" (min_qty={_min_qty(pair)}, min_notional={_min_notional(pair)}, qp={_qty_prec(pair)})")
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+    msg = (res.get("message") or "").lower() if isinstance(res, dict) else ""
+    if res and ("precision" in msg or "min" in msg):
+        learned = _learn_precision_from_error(pair, msg)
+        if learned:
+            payload["price_per_unit"] = f"{fmt_price(pair, price)}"
+            payload["total_quantity"] = f"{fmt_qty(pair, q)}"
+            res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
+            scan_log.append(f"{ist_now()} | {pair} | RETRY limit {side} qty={payload['total_quantity']} @ {payload['price_per_unit']} (learned_precision={learned})")
+    return res
+
+def _record_fill_from_status(market, side, st, order_id):
+    def _fnum(x, d=0.0):
+        try:
+            return float(x)
+        except:
+            return d
+    if not isinstance(st, dict): return 0.0, 0.0
+    total_q  = _fnum(st.get("total_quantity", st.get("quantity", st.get("orig_qty", 0))))
+    remain_q = _fnum(st.get("remaining_quantity", st.get("remaining_qty", st.get("leaves_qty", 0))))
+    exec_q   = _fnum(st.get("executed_quantity", st.get("filled_qty", st.get("executedQty", 0))))
+    filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
+    avg_px   = _fnum(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
+    if filled > 0 and avg_px > 0:
+        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time() * 1000)
+        try:
+            ts_ms = int(ts_field)
+            if ts_ms < 10 ** 12: ts_ms *= 1000
+        except:
+            ts_ms = int(time.time() * 1000)
+        apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
+    return filled, avg_px
+
+# -------------------- Indicators --------------------
+def _ema(vals, n):
+    if len(vals) < n:
+        return None
+    k = 2 / (n + 1)
+    ema = sum(vals[:n]) / n
+    for v in vals[n:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def _macd(vals, fast=12, slow=26, signal=9):
+    if len(vals) < slow + signal:
+        return None, None, None
+    # EMA series
+    def ema_series(data, n):
+        k = 2 / (n + 1)
+        out = []
+        ema = sum(data[:n]) / n
+        out.extend([None]*(n-1))
+        out.append(ema)
+        for v in data[n:]:
+            ema = v * k + ema * (1 - k)
+            out.append(ema)
+        return out
+    ema_fast_s = ema_series(vals, fast)
+    ema_slow_s = ema_series(vals, slow)
+    macd_line_s = []
+    for a, b in zip(ema_fast_s, ema_slow_s):
+        macd_line_s.append(None if (a is None or b is None) else (a - b))
+    # signal line
+    macd_clean = [m for m in macd_line_s if m is not None]
+    if len(macd_clean) < signal:
+        return None, None, None
+    sig_s = ema_series(macd_clean, signal)
+    # align lengths
+    pad = len(macd_line_s) - len(sig_s)
+    signal_line_s = [None]*pad + sig_s
+    hist_s = []
+    for m, s in zip(macd_line_s, signal_line_s):
+        hist_s.append(None if (m is None or s is None) else (m - s))
+    return macd_line_s, signal_line_s, hist_s
+
+def _divergence_note(prices, macd_line):
+    """
+    Lightweight divergence note:
+    - If price makes higher high but MACD doesn't -> bearish divergence
+    - If price makes lower low but MACD doesn't -> bullish divergence
+    Only checks last ~10 closes. Log only (does not gate).
+    """
+    if len(prices) < 15 or macd_line is None:
+        return None
+    closes = prices[-15:]
+    macds  = [m for m in macd_line[-15:] if m is not None]
+    if len(macds) < 5:
+        return None
+    ph = max(closes[-10:-1]); ch = closes[-1]
+    mh = max(macds[-10:-1]);   mhc = macds[-1]
+    pl = min(closes[-10:-1]); cl = closes[-1]
+    ml = min(macds[-10:-1]);   mlc = macds[-1]
+
+    if ch > ph and mhc <= mh:
+        return "bearish_divergence"
+    if cl < pl and mlc >= ml:
+        return "bullish_divergence"
+    return None
+
+# -------------------- Strategy logic --------------------
+def _compute_signals(pair):
+    cs = candle_logs.get(pair) or []
+    if len(cs) < 35:  # enough history for MACD 26+9 and EMAs
+        return None
+
+    closes = [c["close"] for c in cs]
+    ema5  = _ema(closes, 5)
+    ema20 = _ema(closes, 20)
+
+    # emulate last two points for cross
+    ema5_prev  = _ema(closes[:-1], 5)
+    ema20_prev = _ema(closes[:-1], 20)
+
+    macd_line, signal_line, hist = _macd(closes)
+    if macd_line is None:  # not enough history
+        return None
+
+    m_curr = macd_line[-1]; s_curr = signal_line[-1]
+    m_prev = macd_line[-2] if len(macd_line) >= 2 else None
+    s_prev = signal_line[-2] if len(signal_line) >= 2 else None
+
+    bull_cross_ema = (ema5_prev is not None and ema20_prev is not None and ema5_prev <= ema20_prev and ema5 >= ema20)
+    bear_cross_ema = (ema5_prev is not None and ema20_prev is not None and ema5_prev >= ema20_prev and ema5 <= ema20)
+
+    bull_cross_macd = (m_prev is not None and s_prev is not None and m_prev <= s_prev and m_curr > s_curr)
+    bear_cross_macd = (m_prev is not None and s_prev is not None and m_prev >= s_prev and m_curr < s_curr)
+
+    div_note = _divergence_note(closes, macd_line)
+
+    return {
+        "ema5": ema5, "ema20": ema20,
+        "macd": m_curr, "signal": s_curr, "hist": (m_curr - s_curr) if (m_curr is not None and s_curr is not None) else None,
+        "bull_cross_ema": bool(bull_cross_ema),
+        "bear_cross_ema": bool(bear_cross_ema),
+        "bull_cross_macd": bool(bull_cross_macd),
+        "bear_cross_macd": bool(bear_cross_macd),
+        "divergence": div_note
+    }
+
+def _can_buy(signals):
+    return signals["bull_cross_ema"] and signals["bull_cross_macd"]
+
+def _can_sell(signals):
+    return signals["bear_cross_ema"] and signals["bear_cross_macd"]
+
+# -------------------- Aggregation --------------------
 def aggregate_candles(pair, interval=CANDLE_INTERVAL):
     ticks = tick_logs[pair]
     if not ticks:
@@ -328,256 +540,146 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
             candle["volume"] += 1
     if candle:
         candles.append(candle)
-    candle_logs[pair] = candles[-300:]  # keep ~25 min of 5s bars
-
-def _ema_series(vals, n):
-    if len(vals) == 0:
-        return []
-    k = 2 / (n + 1)
-    ema_vals = []
-    ema = vals[0]
-    for v in vals:
-        ema = v * k + ema * (1 - k)
-        ema_vals.append(ema)
-    return ema_vals
-
-def _macd_series(closes):
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
-        return [], [], []
-    ema_fast = _ema_series(closes, MACD_FAST)
-    ema_slow = _ema_series(closes, MACD_SLOW)
-    macd = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal = _ema_series(macd, MACD_SIGNAL)
-    hist = [m - s for m, s in zip(macd[-len(signal):], signal)]
-    # align lengths: take last len(signal)
-    macd_al = macd[-len(signal):]
-    return macd_al, signal, hist
-
-def _cross_up(a_prev, a_now, b_prev, b_now):
-    return a_prev is not None and b_prev is not None and a_prev <= b_prev and a_now > b_now
-
-def _cross_dn(a_prev, a_now, b_prev, b_now):
-    return a_prev is not None and b_prev is not None and a_prev >= b_prev and a_now < b_now
-
-def _swing_highs(vals, look=5):
-    idx = []
-    for i in range(look, len(vals)-look):
-        if all(vals[i] >= vals[i-k] for k in range(1, look+1)) and all(vals[i] >= vals[i+k] for k in range(1, look+1)):
-            idx.append(i)
-    return idx
-
-def _swing_lows(vals, look=5):
-    idx = []
-    for i in range(look, len(vals)-look):
-        if all(vals[i] <= vals[i-k] for k in range(1, look+1)) and all(vals[i] <= vals[i+k] for k in range(1, look+1)):
-            idx.append(i)
-    return idx
-
-def _macd_convergence_divergence(closes, macd_line):
-    """
-    Heuristic:
-    - look at last 2 swing highs and last 2 swing lows on price and macd_line
-    - if price HH but MACD LH -> bearish divergence
-    - if price LL but MACD HL -> bullish divergence
-    Else report convergence (or not enough data).
-    Also include simple slope agreement over last N.
-    """
-    note = "n/a"
-    if len(closes) < 30 or len(macd_line) < 30:
-        return "insufficient"
-
-    N = 20
-    p_seg = closes[-N:]
-    m_seg = macd_line[-N:]
-
-    # slope sign
-    p_slope = p_seg[-1] - p_seg[0]
-    m_slope = m_seg[-1] - m_seg[0]
-    slope_note = f"slope price={'↑' if p_slope>0 else '↓' if p_slope<0 else '→'}, macd={'↑' if m_slope>0 else '↓' if m_slope<0 else '→'}"
-
-    # swing points based on short lookback
-    look = 3
-    ph = _swing_highs(closes, look)
-    mh = _swing_highs(macd_line, look)
-    pl = _swing_lows(closes, look)
-    ml = _swing_lows(macd_line, look)
-
-    bear_div = bull_div = False
-    if len(ph) >= 2 and len(mh) >= 2:
-        # last two highs
-        p1, p2 = closes[ph[-2]], closes[ph[-1]]
-        m1, m2 = macd_line[mh[-2]], macd_line[mh[-1]]
-        if p2 > p1 and m2 <= m1:
-            bear_div = True
-    if len(pl) >= 2 and len(ml) >= 2:
-        # last two lows
-        p1, p2 = closes[pl[-2]], closes[pl[-1]]
-        m1, m2 = macd_line[ml[-2]], macd_line[ml[-1]]
-        if p2 < p1 and m2 >= m1:
-            bull_div = True
-
-    if bear_div:
-        note = f"Bearish divergence ({slope_note})"
-    elif bull_div:
-        note = f"Bullish divergence ({slope_note})"
-    else:
-        # slopes agree?
-        agree = (p_slope >= 0 and m_slope >= 0) or (p_slope <= 0 and m_slope <= 0)
-        note = f"Convergence ({'agree' if agree else 'mixed'}; {slope_note})"
-    return note
-
-# -------------------- Strategy core --------------------
-def strategy_scan():
-    prices = fetch_all_prices()
-    now_ts = int(time.time())
-
-    # build ticks and candles
-    for pair in PAIRS:
-        if pair in prices:
-            px = prices[pair]["price"]
-            tick_logs[pair].append((now_ts, px))
-            if len(tick_logs[pair]) > 6000:
-                tick_logs[pair] = tick_logs[pair][-6000:]
-            aggregate_candles(pair, CANDLE_INTERVAL)
-
-    balances = get_wallet_balances()
-    usdt_free = balances.get("USDT", 0.0)
-
-    # per pair decision
-    for pair in PAIRS:
-        cs = candle_logs.get(pair) or []
-        if len(cs) < max(EMA_SLOW, MACD_SLOW + MACD_SIGNAL) + 3:
-            continue
-
-        closes = [c["close"] for c in cs]
-        last = closes[-1]
-
-        # EMAs
-        ema5_series = _ema_series(closes, EMA_FAST)
-        ema10_series = _ema_series(closes, EMA_SLOW)
-        e5_prev, e5_now = (ema5_series[-2], ema5_series[-1]) if len(ema5_series) >= 2 else (None, None)
-        e10_prev, e10_now = (ema10_series[-2], ema10_series[-1]) if len(ema10_series) >= 2 else (None, None)
-
-        # MACD
-        macd_line, macd_signal, macd_hist = _macd_series(closes)
-        if not macd_line or not macd_signal:
-            continue
-        m_prev, m_now = (macd_line[-2], macd_line[-1])
-        s_prev, s_now = (macd_signal[-2], macd_signal[-1])
-
-        macd_state = "bullish" if m_now > s_now else "bearish" if m_now < s_now else "flat"
-        macd_xup   = _cross_up(m_prev, m_now, s_prev, s_now)
-        macd_xdn   = _cross_dn(m_prev, m_now, s_prev, s_now)
-
-        # MACD convergence/divergence with price
-        # (align macd_line length with closes tail for check)
-        m_for_cd = [None]*(len(closes)-len(macd_line)) + macd_line
-        m_for_cd = [x for x in m_for_cd if x is not None]
-        cd_note  = _macd_convergence_divergence(closes, m_for_cd)
-
-        # gates
-        buy_gate  = (e5_now is not None and e10_now is not None and e5_now > e10_now) and (m_now > s_now)
-        sell_gate = (e5_now is not None and e10_now is not None and e5_now < e10_now) and (m_now < s_now)
-
-        # log the full signal status
-        scan_log.append(
-            f"{ist_now()} | {pair} | "
-            f"EMA5={round(e5_now,6)} EMA10={round(e10_now,6)} | "
-            f"MACD={round(m_now,6)} SIG={round(s_now,6)} "
-            f"(state={macd_state}, xup={macd_xup}, xdn={macd_xdn}) | "
-            f"CD={cd_note} | Gates: Buy={buy_gate} Sell={sell_gate} | Px={last}"
-        )
-
-        # ---- Entry (BUY) ----
-        have_pos = pair in positions and positions[pair].get("qty", 0.0) > 0.0
-        if (not have_pos) and buy_gate:
-            notional = BUY_FRACTION_USDT * usdt_free
-            if notional >= 1.0:  # simple tiny floor
-                qty = normalize_qty_for_buy(pair, last, notional)
-                if qty > 0:
-                    res = place_market(pair, "BUY", qty)
-                    oid = _extract_order_id(res)
-                    if oid:
-                        st = get_order_status(order_id=oid)
-                        filled, avg_px = _filled_avg_from_status(st)
-                        if filled > 0 and avg_px > 0:
-                            positions[pair] = {"qty": filled, "entry": avg_px, "ts": now_ts}
-                            trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg_px} | oid={oid}")
-                            scan_log.append(f"{ist_now()} | {pair} | BUY filled qty={filled} @ {avg_px}")
-                        else:
-                            scan_log.append(f"{ist_now()} | {pair} | BUY no fill | res={res}")
-                    else:
-                        scan_log.append(f"{ist_now()} | {pair} | BUY failed | res={res}")
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY qty=0 (precision/min-qty/fee)")
-            continue  # after a buy attempt, skip sell checks this tick
-
-        # ---- Exit (SELL) ----
-        if have_pos:
-            entry = positions[pair]["entry"]
-            qty   = positions[pair]["qty"]
-            take_profit = (last >= entry * (1.0 + TP_TARGET_PCT))
-            sell_signal = sell_gate
-
-            # log the exit conditions check
-            scan_log.append(
-                f"{ist_now()} | {pair} | EXIT-CHECK entry={entry} last={last} "
-                f"TP@{round(100*TP_TARGET_PCT,2)}% hit={take_profit} | SellSignal={sell_signal}"
-            )
-
-            if take_profit or sell_signal:
-                sell_qty = qty  # full position (and we assume wallet has it)
-                res = place_market(pair, "SELL", sell_qty)
-                oid = _extract_order_id(res)
-                if oid:
-                    st = get_order_status(order_id=oid)
-                    filled, avg_px = _filled_avg_from_status(st)
-                    if filled > 0 and avg_px > 0:
-                        pnl = (avg_px - entry) * min(filled, qty)
-                        record_realized_pnl(pnl)
-                        trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
-                        scan_log.append(f"{ist_now()} | {pair} | SELL filled qty={filled} @ {avg_px} | PNL={round(pnl,6)}")
-                        positions.pop(pair, None)
-                    else:
-                        scan_log.append(f"{ist_now()} | {pair} | SELL no fill | res={res}")
-                else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL failed | res={res}")
+    candle_logs[pair] = candles[-600:]  # ~50 min of 5s bars
 
 # -------------------- Main loop --------------------
 _autostart_lock = threading.Lock()
 
 def scan_loop():
-    global running, status_epoch, last_keepalive, _last_rules_refresh
+    global running, status_epoch, _last_keepalive, _last_rules_refresh
     scan_log.clear()
     running = True
+    scan_log.append(f"{ist_now()} | LOOP started (signals + trading)")
 
     while running:
         now_real = time.time()
-
-        # keepalive
-        if now_real - last_keepalive >= KEEPALIVE_SEC:
+        if now_real - _last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
-            last_keepalive = now_real
+            _last_keepalive = now_real
 
-        # refresh pair rules periodically
+        prices = fetch_all_prices()
+
         if (time.time() - _last_rules_refresh) >= RULES_REFRESH_SEC:
             fetch_pair_precisions()
             _last_rules_refresh = time.time()
 
-        try:
-            strategy_scan()
-        except Exception as e:
-            msg = f"{ist_now()} | scan_loop error: {e}"
-            scan_log.append(msg)
-            scan_log.append(traceback.format_exc().splitlines()[-1])
+        now_ts = int(time.time())
+        balances = get_wallet_balances()
+
+        # ticks & candles
+        for pair in PAIRS:
+            if pair in prices:
+                px = prices[pair]["price"]
+                tick_logs[pair].append((now_ts, px))
+                if len(tick_logs[pair]) > 5000:
+                    tick_logs[pair] = tick_logs[pair][-5000:]
+                aggregate_candles(pair, CANDLE_INTERVAL)
+
+        # per-pair strategy
+        blocked_reason = _why_trade_blocked()
+        if blocked_reason:
+            scan_log.append(f"{ist_now()} | TRADE BLOCKED | {blocked_reason} — signals only (no orders)")
+
+        usdt = balances.get("USDT", 0.0)
+
+        for pair in PAIRS:
+            if pair not in prices:
+                continue
+            last_px = prices[pair]["price"]
+            signals = _compute_signals(pair)
+            if not signals:
+                continue
+
+            # log signals
+            scan_log.append(
+                f"{ist_now()} | {pair} | "
+                f"EMA5={round(signals['ema5'],6) if signals['ema5'] else None} "
+                f"EMA20={round(signals['ema20'],6) if signals['ema20'] else None} "
+                f"MACD={round(signals['macd'],6) if signals['macd'] is not None else None} "
+                f"SIG={round(signals['signal'],6) if signals['signal'] is not None else None} "
+                f"HIST={round(signals['hist'],6) if signals['hist'] is not None else None} "
+                f"DIV={signals['divergence']} | "
+                f"Gates: BUY={_can_buy(signals)} SELL={_can_sell(signals)}"
+            )
+
+            # compute free coin balance for possible sells
+            coin = pair[:-4]
+            coin_bal = float(balances.get(coin, 0.0))
+
+            # ---- SELL path (whichever comes first: 1% TP or Sell signal) ----
+            entry = last_entry[pair]["entry"]
+            qty_held = last_entry[pair]["qty"]
+            if entry and qty_held > 0:
+                up_pct = (last_px/entry - 1.0) if entry > 0 else 0.0
+                tp_hit = (up_pct >= TP_PCT)
+                sell_signal = _can_sell(signals)
+
+                if tp_hit or sell_signal:
+                    if blocked_reason:
+                        scan_log.append(f"{ist_now()} | {pair} | SELL would place (tp_hit={tp_hit} sell_signal={sell_signal}) but blocked: {blocked_reason}")
+                    else:
+                        sell_qty = min(qty_held, coin_bal)
+                        sell_qty = fmt_qty(pair, sell_qty)
+                        if sell_qty >= _min_qty(pair):
+                            res = place_market(pair, "SELL", sell_qty)
+                            oid = _extract_order_id(res)
+                            if oid:
+                                st = get_order_status(order_id=oid)
+                                filled, avg_px = _record_fill_from_status(pair, "SELL", st, oid)
+                                trade_log.append({"time": ist_now(), "pair": pair, "side": "SELL", "qty": filled, "px": avg_px, "reason": "TP" if tp_hit else "SellSignal"})
+                                scan_log.append(f"{ist_now()} | {pair} | SOLD {filled} @ {avg_px} (reason: {'TP' if tp_hit else 'SellSignal'})")
+                            else:
+                                scan_log.append(f"{ist_now()} | {pair} | SELL create failed | res={res}")
+                        else:
+                            scan_log.append(f"{ist_now()} | {pair} | SELL skip — qty<{_min_qty(pair)}")
+
+                    # proceed to next pair after attempting sell
+                    continue
+
+            # ---- BUY path (only if flat on that coin) ----
+            if not entry or qty_held <= 1e-12:
+                if _can_buy(signals):
+                    if blocked_reason:
+                        scan_log.append(f"{ist_now()} | {pair} | BUY would place but blocked: {blocked_reason}")
+                    else:
+                        # 30% of free USDT -> qty (fee/headroom aware rounding)
+                        spend_usdt = float(usdt) * BUY_FRACTION_USDT
+                        if spend_usdt <= 0:
+                            scan_log.append(f"{ist_now()} | {pair} | BUY skip — USDT=0")
+                        else:
+                            # max affordable qty with fees cushion
+                            denom = max(last_px * (1.0 + FEE_PCT_PER_SIDE) * BUY_HEADROOM, 1e-12)
+                            raw_qty = spend_usdt / denom
+                            qty = fmt_qty(pair, raw_qty)
+
+                            # ensure min_notional
+                            mn = _min_notional(pair)
+                            if mn > 0 and (qty * last_px) < mn:
+                                qty = fmt_qty(pair, mn / last_px)
+
+                            if qty >= _min_qty(pair) and (qty * last_px) > 0:
+                                res = place_market(pair, "BUY", qty)
+                                oid = _extract_order_id(res)
+                                if oid:
+                                    st = get_order_status(order_id=oid)
+                                    filled, avg_px = _record_fill_from_status(pair, "BUY", st, oid)
+                                    trade_log.append({"time": ist_now(), "pair": pair, "side": "BUY", "qty": filled, "px": avg_px, "reason": "BuySignal"})
+                                    scan_log.append(f"{ist_now()} | {pair} | BOUGHT {filled} @ {avg_px}")
+                                    # place TP limit (optional). We do NOT need a resting TP since we exit on either TP or sell signal.
+                                    # Keeping simple: we monitor and sell when tp_hit or sell_signal; no resting order needed.
+                                else:
+                                    scan_log.append(f"{ist_now()} | {pair} | BUY create failed | res={res}")
+                            else:
+                                scan_log.append(f"{ist_now()} | {pair} | BUY skip — qty<{_min_qty(pair)} or notional too small")
 
         status["msg"], status["last"] = "Running", ist_now()
         status_epoch = int(time.time())
         time.sleep(POLL_SEC)
 
     status["msg"] = "Idle"
+    scan_log.append(f"{ist_now()} | LOOP stopped")
 
-# -------------------- Routes --------------------
+# -------------------- Routes & UI --------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -596,22 +698,23 @@ def stop():
 @app.route("/status")
 def get_status():
     balances = get_wallet_balances()
-    usdt_total = balances.get("USDT", 0.0)
+    coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
+    profit_today = compute_realized_pnl_today()
+    profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
+    cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
 
-    # current positions snapshot
-    pos = {}
-    for p, v in positions.items():
-        pos[p] = {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]}
+    # visible positions
+    positions = {p: {"entry": last_entry[p]["entry"], "qty": last_entry[p]["qty"]} for p in PAIRS}
 
-    # keepalive status
+    # keepalive ui info
     now_real = time.time()
-    last_age = now_real - (last_keepalive or 0)
+    ka_last_age = now_real - (_last_keepalive or 0)
     keepalive_info = {
         "enabled": bool(KEEPALIVE_TOKEN),
         "interval_sec": KEEPALIVE_SEC,
-        "last_ping_epoch": int(last_keepalive or 0),
-        "last_ping_age_sec": (max(0, int(last_age)) if last_keepalive else None),
-        "next_due_sec": (max(0, int(KEEPALIVE_SEC - last_age)) if last_keepalive else None),
+        "last_ping_epoch": int(_last_keepalive or 0),
+        "last_ping_age_sec": (max(0, int(ka_last_age)) if _last_keepalive else None),
+        "next_due_sec": (max(0, int(KEEPALIVE_SEC - ka_last_age)) if _last_keepalive else None),
         "app_base_url": APP_BASE_URL,
     }
 
@@ -619,25 +722,28 @@ def get_status():
         "status": status["msg"],
         "last": status["last"],
         "status_epoch": status_epoch,
-        "usdt": usdt_total,
-        "positions": pos,
-        "profit_today": compute_realized_pnl_today(),
-        "pnl_cumulative": round(profit_state.get("cumulative_pnl", 0.0), 6),
+        "usdt": balances.get("USDT", 0.0),
+        "profit_today": profit_today,
+        "profit_yesterday": profit_yesterday,
+        "pnl_cumulative": cumulative_pnl,
+        "processed_orders": len(profit_state.get("processed_orders", [])),
+        "inventory_markets": list(profit_state.get("inventory", {}).keys()),
+        "positions": positions,
+        "coins": coins,
         "trades": trade_log[-12:][::-1],
         "scans": scan_log[-120:][::-1],
+        "error": error_message,
         "keepalive": keepalive_info
     })
 
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
     token = os.environ.get("KEEPALIVE_TOKEN", "")
-    provided = (request.args.get("t") or
-                request.headers.get("X-Keepalive-Token") or "")
+    provided = (request.args.get("t") or request.headers.get("X-Keepalive-Token") or "")
     if token and provided != token:
         print(f"[{ist_now()}] /ping forbidden (bad token) method={request.method}")
         return "forbidden", 403
-
-    print(f"[{ist_now()}] /ping ok method={request.method}")
+    print(f"{ist_now()} | /ping ok method={request.method}")
     if request.method == "HEAD":
         return ("", 200)
     return ("pong", 200)
@@ -655,7 +761,7 @@ def _boot_kick():
     try:
         load_profit_state()
         fetch_pair_precisions()
-        time.sleep(0.5)
+        time.sleep(1.0)
         _start_loop_once()
     except Exception as e:
         print("boot kick failed:", e)
