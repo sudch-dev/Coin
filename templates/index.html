@@ -1,378 +1,145 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta charset="UTF-8">
   <title>Dashboard</title>
   <style>
-    :root{
-      --bg:#000;
-      --card:#0b0b0b;
-      --muted:#8a8a8a;
-      --green:#18ff6d;
-      --red:#ff3b3b;
-      --amber:#ffd166;
-      --line:#1a1a1a;
+    body {
+      background-color: #000;
+      color: #eee;
+      font-family: monospace, sans-serif;
+      margin: 0; padding: 0;
     }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
-      margin:0; background:var(--bg); color:#e5e5e5;
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif;
+    header {
+      background: #111;
+      padding: 10px;
+      font-size: 20px;
+      font-weight: bold;
+      text-align: center;
+      color: #0f0;
     }
-    header{
-      position:sticky; top:0; z-index:5;
-      background:linear-gradient(to bottom, rgba(0,0,0,.9), rgba(0,0,0,.6));
-      backdrop-filter: blur(6px);
-      border-bottom:1px solid var(--line);
-      padding:14px 16px;
-      display:flex; align-items:center; gap:14px;
+    .container {
+      display: flex;
+      flex-wrap: wrap;
+      padding: 10px;
     }
-    .title{font-weight:700; letter-spacing:.5px; font-size:20px}
-    .dot{width:10px; height:10px; border-radius:50%; background:#666; display:inline-block}
-    .dot.ok{background:var(--green)} .dot.idle{background:#666} .dot.warn{background:var(--amber)} .dot.err{background:var(--red)}
-    .muted{color:var(--muted)}
-    .row{display:grid; gap:16px; padding:16px}
-    @media(min-width:1200px){ .row{grid-template-columns: 1.3fr 1fr} }
-    .cards{display:grid; gap:16px}
-    @media(min-width:900px){ .cards{grid-template-columns: repeat(3, 1fr)} }
-    .card{
-      background:var(--card); border:1px solid var(--line);
-      border-radius:12px; padding:14px;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset, 0 8px 24px rgba(0,0,0,.45);
+    .panel {
+      flex: 1 1 45%;
+      margin: 10px;
+      background: #111;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 10px;
+      overflow: auto;
+      max-height: 400px;
     }
-    .card h3{margin:0 0 10px 0; font-size:14px; text-transform:uppercase; letter-spacing:.08em; color:#bdbdbd}
-    .metric{display:flex; align-items:baseline; gap:8px}
-    .metric .v{font-size:24px; font-weight:700}
-    .metric .sub{font-size:12px; color:var(--muted)}
-    .grid2{display:grid; gap:10px; grid-template-columns: 1fr 1fr}
-    .btns{display:flex; flex-wrap:wrap; gap:8px}
-    button{
-      background:#101010; color:#d9d9d9; border:1px solid var(--line);
-      padding:8px 10px; border-radius:8px; cursor:pointer; font-weight:600;
+    h2 { font-size: 16px; margin: 0 0 5px 0; color: #0f0; }
+    .btns { margin-bottom: 10px; }
+    button {
+      background: #222; color: #0f0; border: 1px solid #0f0;
+      padding: 5px 10px; margin-right: 5px; cursor: pointer;
     }
-    button:hover{border-color:#2b2b2b}
-    .btn-on{color:var(--green); border-color:#1e3a2a; background:#071b0f}
-    .btn-off{color:var(--red); border-color:#3a1e1e; background:#1b0707}
-    .btn-mode{border-color:#2b2b2b}
-    .kbd{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace; background:#111; border:1px solid #222; border-radius:6px; padding:1px 6px}
-    .table{width:100%; border-collapse:collapse; font-size:13px}
-    .table th,.table td{padding:8px 10px; border-bottom:1px solid #111}
-    .table th{color:#aaa; font-weight:600; text-align:left; text-transform:uppercase; font-size:11px; letter-spacing:.06em}
-    .tag{font-size:11px; padding:2px 6px; border-radius:999px; border:1px solid #222; background:#0f0f0f; color:#bdbdbd}
-    .tag.ok{color:var(--green); border-color:#173f2d}
-    .tag.warn{color:var(--amber); border-color:#4a3a15}
-    .tag.err{color:var(--red); border-color:#3f1717}
-    .logwrap{display:grid; gap:16px}
-    .logs{background:#060606; border:1px solid var(--line); border-radius:12px; overflow:hidden}
-    .loghead{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid #101010; color:#bdbdbd; font-size:13px}
-    .logcontent{max-height:48vh; overflow:auto; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace; background:#050505}
-    .logline{padding:6px 10px; white-space:pre-wrap; word-break:break-word; border-bottom:1px dashed #0c0c0c}
-    .logline:nth-child(odd){background:#080808}
-    .logline .pos{color:var(--green)} .logline .neg{color:var(--red)}
-    .errbar{display:none; margin:8px 0 0 0; padding:8px 10px; border:1px solid #3f1717; background:#1b0707; color:#ffaaaa; border-radius:8px; font-size:12px}
-    .rightcol{display:grid; gap:16px}
-    .pill{display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border:1px solid #1b1b1b; border-radius:999px; background:#0e0e0e; color:#bdbdbd; font-size:11px}
-    .hl{color:var(--green)} .danger{color:var(--red)}
+    button:hover { background: #0f0; color: #000; }
+    .pos { color: #0f0; }
+    .neg { color: #f33; }
+    .logline:nth-child(odd) { background: #181818; }
+    .logline:nth-child(even) { background: #101010; }
+    .error { color: #f33; font-weight: bold; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: 2px 4px; border-bottom: 1px solid #333; }
   </style>
 </head>
 <body>
-  <header>
-    <span id="dot" class="dot idle"></span>
-    <div class="title">Dashboard</div>
-    <div class="muted" id="statusText">Loading…</div>
-    <div style="margin-left:auto; display:flex; align-items:center; gap:10px">
-      <span class="pill">Mode: <b id="mode">—</b></span>
-      <span class="pill">Bal Age: <span id="balAge">—</span></span>
-      <span class="pill">Flags: <span id="flagMini">—</span></span>
-    </div>
-  </header>
-
-  <div class="row">
-    <div class="leftcol">
-      <div class="cards">
-        <div class="card">
-          <h3>Wallet</h3>
-          <div class="metric"><div class="v hl" id="usdt">$—</div><div class="sub">USDT free</div></div>
-          <div class="grid2" style="margin-top:12px">
-            <div><div class="muted">Profit Today</div><div class="v" id="pnlToday">—</div></div>
-            <div><div class="muted">PnL Cumulative</div><div class="v" id="pnlCum">—</div></div>
-          </div>
-          <div class="errbar" id="err"></div>
-        </div>
-
-        <div class="card">
-          <h3>Toggles</h3>
-          <div class="btns" style="margin-bottom:8px">
-            <button id="btnIgnoreOn"  class="btn-on"  onclick="setToggle('ignore_balance_age', true)">Ignore Bal Age ON</button>
-            <button id="btnIgnoreOff" class="btn-off" onclick="setToggle('ignore_balance_age', false)">Ignore Bal Age OFF</button>
-          </div>
-          <div class="btns" style="margin-bottom:8px">
-            <button id="btnPaperOn"  class="btn-on"  onclick="setToggle('paper_trade', true)">Paper Mode ON</button>
-            <button id="btnPaperOff" class="btn-off" onclick="setToggle('paper_trade', false)">Paper Mode OFF</button>
-          </div>
-          <div class="btns" style="margin-bottom:8px">
-            <button class="btn-mode" onclick="setToggle('strategy_mode','aggressive')">Aggressive</button>
-            <button class="btn-mode" onclick="setToggle('strategy_mode','balanced')">Balanced</button>
-            <button class="btn-mode" onclick="setToggle('strategy_mode','conservative')">Conservative</button>
-            <button class="btn-mode" onclick="setToggle('strategy_mode','turbo')">Turbo</button>
-          </div>
-          <div class="btns" style="margin-top:8px">
-            <button onclick="postJSON('/start')">Start</button>
-            <button onclick="postJSON('/stop')">Stop</button>
-          </div>
-          <div class="muted" style="margin-top:10px">Keys: <span class="kbd">t</span> toggle ignore-balance-age, <span class="kbd">p</span> toggle paper, <span class="kbd">m</span> cycle mode</div>
-        </div>
-
-        <div class="card">
-          <h3>Positions</h3>
-          <table class="table" id="posTable">
-            <thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Since</th></tr></thead>
-            <tbody id="posBody"><tr><td colspan="4" class="muted">No open positions</td></tr></tbody>
-          </table>
-        </div>
+  <header>Dashboard</header>
+  <div class="container">
+    <div class="panel" style="flex:1 1 100%;">
+      <div class="btns">
+        <button onclick="postJSON('/start')">Start</button>
+        <button onclick="postJSON('/stop')">Stop</button>
+        <span id="statusLine"></span>
       </div>
-
-      <div class="logwrap" style="margin-top:16px">
-        <div class="logs">
-          <div class="loghead">
-            <div>Decision / Scan Log</div>
-            <div class="muted" id="scanCount">—</div>
-          </div>
-          <div class="logcontent" id="scanLog"></div>
-        </div>
-        <div class="logs">
-          <div class="loghead">
-            <div>Trade / API Log</div>
-            <div class="muted" id="tradeCount">—</div>
-          </div>
-          <div class="logcontent" id="tradeLog"></div>
-        </div>
-      </div>
+      <div class="error" id="err"></div>
     </div>
 
-    <div class="rightcol">
-      <div class="card">
-        <h3>Keepalive</h3>
-        <div class="grid2">
-          <div><div class="muted">Enabled</div><div id="kaEnabled" class="v">—</div></div>
-          <div><div class="muted">Interval</div><div id="kaInterval" class="v">—</div></div>
-          <div><div class="muted">Last Ping Age</div><div id="kaAge" class="v">—</div></div>
-          <div><div class="muted">Next Due</div><div id="kaNext" class="v">—</div></div>
-        </div>
-      </div>
+    <div class="panel">
+      <h2>Balances</h2>
+      <table id="balances"></table>
+      <p>USDT: <span id="usdt"></span></p>
+      <p>Profit Today: <span id="profitToday"></span></p>
+      <p>Profit Yesterday: <span id="profitYesterday"></span></p>
+      <p>Cumulative P&L: <span id="pnl"></span></p>
+    </div>
 
-      <div class="card">
-        <h3>Flags / Mode</h3>
-        <div style="display:flex; flex-direction:column; gap:8px">
-          <div>Ignore Bal Age: <span id="flagIgnore" class="tag">—</span></div>
-          <div>Paper Mode: <span id="flagPaper" class="tag">—</span></div>
-          <div>Strategy Mode: <span id="flagMode" class="tag">—</span></div>
-        </div>
-        <div style="margin-top:10px" class="muted">Use buttons or keys to toggle.</div>
-      </div>
+    <div class="panel">
+      <h2>Recent Trades</h2>
+      <div id="trades"></div>
+    </div>
 
-      <div class="card">
-        <h3>Raw I/O (last)</h3>
-        <div class="logcontent" id="ioLog" style="max-height:30vh"></div>
-      </div>
+    <div class="panel" style="flex:1 1 100%;">
+      <h2>Scan Log</h2>
+      <div id="scans"></div>
     </div>
   </div>
 
-  <!-- Inject your admin toggle key safely (server-side/template). Leave empty in public builds. -->
   <script>
-    // Example: set via template — <script>window.TOGGLE_KEY="{{ADMIN_TOGGLE_KEY}}";</script>
-    window.TOGGLE_KEY = window.TOGGLE_KEY || "";
-  </script>
+    async function loadStatus(){
+      try{
+        const res = await fetch('/status');
+        const data = await res.json();
+        document.getElementById('statusLine').textContent =
+          data.status + " | Last: " + data.last;
 
-  <script>
-    const fmtUSD = (n)=> {
-      if(n===null || n===undefined || isNaN(n)) return "—";
-      const x = Number(n);
-      return x>=1000 ? '$'+x.toLocaleString(undefined,{maximumFractionDigits:2}) : '$'+x.toFixed(2);
-    };
-    const fmtNum = (n, d=6)=> (n===null||n===undefined||isNaN(n)) ? "—" : Number(n).toFixed(d);
-    const timeAgo = (sec)=> sec==null ? "—" : (sec<60? sec+"s" : (sec/60).toFixed(1)+"m");
+        // balances
+        let tbl = "";
+        for(const [coin, bal] of Object.entries(data.coins)){
+          tbl += `<tr><td>${coin}</td><td>${bal}</td></tr>`;
+        }
+        document.getElementById('balances').innerHTML = tbl;
+        document.getElementById('usdt').textContent = data.usdt.toFixed(2);
+        document.getElementById('profitToday').textContent = data.profit_today;
+        document.getElementById('profitYesterday').textContent = data.profit_yesterday;
+        document.getElementById('pnl').textContent = data.pnl_cumulative;
 
-    async function fetchJSON(url){
-      const r = await fetch(url, {cache:'no-store'}); 
-      if(!r.ok) throw new Error(url+' -> '+r.status);
-      return r.json();
+        // trades
+        const tdiv = document.getElementById('trades');
+        tdiv.innerHTML = "";
+        (data.trades||[]).forEach(t=>{
+          const d = document.createElement('div');
+          d.className = "logline";
+          d.innerHTML = `<span class="${t.side==='BUY'?'pos':'neg'}">` +
+                        `${t.time} | ${t.pair} | ${t.side} | ${t.entry} | qty=${t.qty} | SL=${t.sl} | TP=${t.tp}</span>`;
+          tdiv.appendChild(d);
+        });
+
+        // scans
+        const sdiv = document.getElementById('scans');
+        sdiv.innerHTML = "";
+        (data.scans||[]).forEach(l=>{
+          const d = document.createElement('div');
+          d.className = "logline";
+          if(l.includes("SELL")) d.innerHTML = `<span class="neg">${l}</span>`;
+          else if(l.includes("BUY")) d.innerHTML = `<span class="pos">${l}</span>`;
+          else d.textContent = l;
+          sdiv.appendChild(d);
+        });
+
+        document.getElementById('err').textContent = data.error||"";
+      }catch(e){
+        document.getElementById('err').textContent = "Error fetching /status: " + e;
+      }
     }
+
     async function postJSON(url){
-      const r = await fetch(url, {method:'POST'});
-      if(!r.ok) throw new Error(url+' -> '+r.status);
-      return r.json().catch(()=> ({}));
-    }
-
-    function setDot(status, balAge){
-      const el = document.getElementById('dot'); el.className='dot';
-      if(status==='Running') el.classList.add(balAge!=null && balAge<60 ? 'ok' : 'warn');
-      else el.classList.add('idle');
-      document.getElementById('statusText').textContent = status;
-    }
-
-    function setTag(el, on){
-      el.className='tag ' + (on? 'ok':'err');
-      el.textContent = on? 'ON':'OFF';
-    }
-
-    function renderStatus(data){
-      setDot(data.status, data.balances_age_sec);
-      document.getElementById('mode').textContent = (data.flags?.strategy_mode||'—').toUpperCase();
-      document.getElementById('balAge').textContent = timeAgo(data.balances_age_sec);
-      document.getElementById('flagMini').textContent =
-        `${data.flags?.ignore_balance_age?'IBA:ON':'IBA:OFF'} • ${data.flags?.paper_trade?'PAPER:ON':'PAPER:OFF'} • ${(data.flags?.strategy_mode||'—').toUpperCase()}`;
-      document.getElementById('usdt').textContent = fmtUSD(data.usdt||0);
-      document.getElementById('pnlToday').textContent = fmtNum(data.profit_today||0, 4);
-      document.getElementById('pnlCum').textContent = fmtNum(data.pnl_cumulative||0, 4);
-
-      // Flags
-      setTag(document.getElementById('flagIgnore'), !!(data.flags && data.flags.ignore_balance_age));
-      setTag(document.getElementById('flagPaper'),  !!(data.flags && data.flags.paper_trade));
-      const fm = document.getElementById('flagMode');
-      fm.className='tag ok'; fm.textContent = (data.flags?.strategy_mode||'—').toUpperCase();
-
-      // Positions
-      const body = document.getElementById('posBody');
-      body.innerHTML = '';
-      const pos = data.positions || {};
-      const keys = Object.keys(pos);
-      if(keys.length===0){
-        body.innerHTML = '<tr><td colspan="4" class="muted">No open positions</td></tr>';
-      }else{
-        keys.forEach(k=>{
-          const p = pos[k];
-          const since = (p.ts && p.ts>0) ? new Date(p.ts*1000).toLocaleTimeString() : '—';
-          body.insertAdjacentHTML('beforeend',
-            `<tr>
-              <td>${k}</td>
-              <td>${fmtNum(p.qty, 6)}</td>
-              <td>${fmtNum(p.entry, 6)}</td>
-              <td class="muted">${since}</td>
-            </tr>`);
-        });
-      }
-
-      // Logs
-      const scans = data.scans || [];
-      const trades = data.trades || [];
-      renderLog('scanLog', scans);
-      renderLog('tradeLog', trades);
-      document.getElementById('scanCount').textContent = scans.length ? `${scans.length} lines` : 'no entries';
-      document.getElementById('tradeCount').textContent = trades.length ? `${trades.length} lines` : 'no entries';
-
-      // Keepalive
-      const ka = data.keepalive || {};
-      document.getElementById('kaEnabled').textContent = ka.enabled? 'Yes':'No';
-      document.getElementById('kaInterval').textContent = (ka.interval_sec||0)+'s';
-      document.getElementById('kaAge').textContent = timeAgo(ka.last_ping_age_sec);
-      document.getElementById('kaNext').textContent = ka.next_due_sec!=null ? (ka.next_due_sec+'s') : '—';
-    }
-
-    function renderLog(id, arr){
-      const el = document.getElementById(id);
-      const userScrolledUp = (el.scrollTop + el.clientHeight) < (el.scrollHeight - 20);
-      const atBottom = !userScrolledUp;
-      const frag = document.createDocumentFragment();
-      arr.forEach(line=>{
-        const div = document.createElement('div');
-        div.className = 'logline';
-        const cls = line.includes('| PNL=') ? (line.includes('PNL=-') ? 'neg':'pos') : '';
-        div.innerHTML = `<span class="${cls}">${escapeHtml(line)}</span>`;
-        frag.appendChild(div);
-      });
-      el.innerHTML = '';
-      el.appendChild(frag);
-      if(atBottom){ el.scrollTop = el.scrollHeight; }
-    }
-
-    function escapeHtml(s){
-      return (s||'').toString()
-        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
-
-    async function loadAll(manual=false){
       try{
-        const data = await fetchJSON('/status');
-        renderStatus(data);
-        // also pull /io (best-effort)
-        try{
-          const io = await fetchJSON('/io');
-          renderIO(io.io || []);
-        }catch(_){}
-        document.getElementById('err').style.display='none';
+        await fetch(url, {method:'POST'});
+        loadStatus();
       }catch(e){
-        const er = document.getElementById('err');
-        er.style.display='block'; er.textContent = e.message || e;
+        document.getElementById('err').textContent = "Error: " + e;
       }
     }
 
-    function renderIO(lines){
-      const el = document.getElementById('ioLog');
-      const userScrolledUp = (el.scrollTop + el.clientHeight) < (el.scrollHeight - 20);
-      const atBottom = !userScrolledUp;
-      el.innerHTML = '';
-      lines.slice(-100).forEach(l=>{
-        el.insertAdjacentHTML('beforeend', `<div class="logline">${escapeHtml(l)}</div>`);
-      });
-      if(atBottom){ el.scrollTop = el.scrollHeight; }
-    }
-
-    async function setToggle(name, state){
-      try{
-        const payload = { key:(window.TOGGLE_KEY||''), name, state };
-        const res = await fetch('/toggle', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify(payload)
-        });
-        const j = await res.json();
-        if(!res.ok || !j.ok) throw new Error(j.error || ('toggle '+name+' failed'));
-        await loadAll(true);
-      }catch(e){
-        const el = document.getElementById('err');
-        el.style.display='block'; el.textContent = e.message || e;
-      }
-    }
-
-    function cycleMode(cur){
-      const order = ['aggressive','balanced','conservative','turbo'];
-      const i = order.indexOf((cur||'balanced').toLowerCase());
-      return order[(i+1)%order.length];
-    }
-
-    // Keyboard shortcuts
-    window.addEventListener('keydown', (e)=>{
-      const k = e.key.toLowerCase();
-      if(k==='t'){
-        fetch('/status').then(r=>r.json()).then(d=>{
-          const cur = !!(d.flags && d.flags.ignore_balance_age);
-          setToggle('ignore_balance_age', !cur);
-        });
-      }else if(k==='p'){
-        fetch('/status').then(r=>r.json()).then(d=>{
-          const cur = !!(d.flags && d.flags.paper_trade);
-          setToggle('paper_trade', !cur);
-        });
-      }else if(k==='m'){
-        fetch('/status').then(r=>r.json()).then(d=>{
-          const cur = (d.flags && d.flags.strategy_mode) || 'balanced';
-          const next = cycleMode(cur);
-          setToggle('strategy_mode', next);
-        });
-      }
-    });
-
-    // Polling
-    let timer = null;
-    function startPoll(){
-      if(timer) clearInterval(timer);
-      timer = setInterval(loadAll, 1500); // fast refresh
-    }
-
-    // Boot
-    loadAll().then(startPoll);
+    setInterval(loadStatus, 5000);
+    loadStatus();
   </script>
 </body>
 </html>
