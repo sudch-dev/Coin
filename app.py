@@ -1,4 +1,4 @@
-# app.py (compact, keepalive + null-safe)
+# app.py — compact EMA crossover (TP 0.5%, no SL), USDT-only, real trades, keepalive
 import os, time, json, hmac, hashlib, threading, requests
 from flask import Flask, render_template, jsonify
 from datetime import datetime
@@ -24,34 +24,34 @@ KEEPALIVE_SEC = 240
 _last_keepalive = 0
 def _keepalive_ping():
     if not APP_BASE_URL: return
-    try:
-        requests.get(f"{APP_BASE_URL}/ping", timeout=5)
-    except Exception:
-        pass
+    try: requests.get(f"{APP_BASE_URL}/ping", timeout=5)
+    except Exception: pass
 
 # ---------- Timing / knobs ----------
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-CANDLE_INTERVAL = 3  #changed from 5
+CANDLE_INTERVAL = 5
 LOOP_SEC        = 1.0
 RULES_REFRESH_SEC = 30*24*3600   # 30 days
 BAL_TTL_SEC     = 15
 
-RISK_PER_TRADE  = 0.02   # 1% risk
-BUY_NOTIONAL_CAP= 0.30   # 30% of free USDT
-TP_ATR_MULT     = 1.0
-SL_ATR_MULT     = 0.7
+# Sizing / policy (kept same)
+RISK_PER_TRADE   = 0.01   # 1% risk proxy
+BUY_NOTIONAL_CAP = 0.30   # cap vs free USDT
+TP_PCT           = 0.005  # +0.5%/-0.5% TP
+SHORT_SELL_FRACTION = 0.30  # if shorting from inventory, sell up to 30% of coin balance
 
-START_WITH_USDT = True
-FORCE_LIQUIDATE_ON_NEED = True
+START_WITH_USDT = True                 # if True, sell non-USDT coins at boot (limits shorting)
+FORCE_LIQUIDATE_ON_NEED = True         # free USDT before a long entry if required
 
 # ---------- State ----------
 PAIR_RULES = {}              # pair -> {price_precision, qty_precision, min_qty, min_notional}
 ALL_USDT_PAIRS = []          # discovered USDT pairs
 tick_logs   = defaultdict(list)
 candle_logs = defaultdict(list)
-positions   = {}             # pair -> {"qty","entry","stop","tp"}
+# positions[pair] = {"side":"LONG"/"SHORT","qty":float,"entry":float,"tp":float}
+positions   = {}
 scan_log, trade_log = [], []
 running = False
 status = {"msg":"Idle", "last":""}
@@ -209,7 +209,7 @@ def _filled_avg_from_status(st):
     except Exception:
         return 0.0, 0.0
 
-# ---------- Candles / Indicators ----------
+# ---------- Candles / EMA ----------
 def aggregate_candles(pair):
     t = tick_logs[pair]
     if not t: return
@@ -226,43 +226,25 @@ def aggregate_candles(pair):
     if candle: candles.append(candle)
     candle_logs[pair] = candles[-300:]
 
-def _ema(vals, n):
-    if len(vals)<n: return None
-    k=2/(n+1); e=vals[0]; out=[]
+def _ema_series(vals, n):
+    if len(vals)==0: return []
+    k=2/(n+1); out=[]; e=vals[0]
     for v in vals: e=v*k+e*(1-k); out.append(e)
     return out
 
-def _atr(cs, n=36):
-    if len(cs)<n+2: return 0.0
-    trs=[]; pc=cs[-(n+1)]["close"]
-    for c in cs[-n:]:
-        h,l,cl=c["high"],c["low"],c["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc))); pc=cl
-    k=2/(n+1); a=trs[0]
-    for t in trs: a=t*k+a*(1-k)
-    return float(a)
-
-# ---------- Signals / sizing ----------
-def score_and_signal(pair):
-    cs=candle_logs.get(pair,[])
-    if len(cs)<40: return None
-    last=cs[-1]["close"]
-    closes=[c["close"] for c in cs]
-    ema5=_ema(closes,5)[-1]; ema13=_ema(closes,13)[-1]
-    atr=_atr(cs,36); atr_pct=(atr/last) if last>0 else 0.0
-    hi=max(c["high"] for c in cs[-13:-1]); lo=min(c["low"] for c in cs[-13:-1])
-    if last>hi and ema5>ema13 and atr_pct>=0.0006:
-        return {"side":"BUY","px":last,"atr":atr}
-    return None
-
-def size_for_buy(pair, px, atr, usdt_free):
-    if px<=0 or atr<=0: return 0.0
+# ---------- Sizing helpers ----------
+def size_for_long(px, usdt_free):
+    # proxy risk = TP distance; position size bounded by RISK_PER_TRADE and BUY_NOTIONAL_CAP
+    if px<=0: return 0.0
     risk_amt = max(0.0, RISK_PER_TRADE*usdt_free)
-    stop_dist= SL_ATR_MULT*atr
+    stop_dist = px*TP_PCT if TP_PCT>0 else px*0.005
     if stop_dist<=0: return 0.0
     qty_risk = risk_amt/stop_dist
     qty_cap  = (BUY_NOTIONAL_CAP*usdt_free)/px if usdt_free>0 else 0.0
     return min(qty_risk, qty_cap)
+
+def size_for_short_from_inventory(coin_bal):
+    return max(0.0, SHORT_SELL_FRACTION * float(coin_bal or 0.0))
 
 # ---------- Capital policy (strict USDT) ----------
 def liquidate_all_non_usdt(reason="boot"):
@@ -293,14 +275,15 @@ def ensure_usdt_liquidity(usdt_needed):
     if not FORCE_LIQUIDATE_ON_NEED: return True
     bal=get_wallet_balances(); have=float(bal.get("USDT",0.0))
     if have>=usdt_needed: return True
-    # close positions first
+    # close open LONGs first
     for pair,p in list(positions.items()):
+        if p.get("side")!="LONG": continue
         q=fmt_qty_floor(pair, p["qty"])
         if q<=0: continue
         res=place_market(pair,"SELL",q); oid=_extract_order_id(res)
         if oid:
             st=get_order_status(order_id=oid); filled,px=_filled_avg_from_status(st)
-            trade_log.append(f"{ist_now()} | {pair} | LIQ-EXIT filled={filled} px={px}")
+            trade_log.append(f"{ist_now()} | {pair} | LIQ-EXIT LONG filled={filled} px={px}")
             positions.pop(pair,None)
         bal=get_wallet_balances(); have=float(bal.get("USDT",0.0))
         if have>=usdt_needed: return True
@@ -319,50 +302,91 @@ def ensure_usdt_liquidity(usdt_needed):
         if have>=usdt_needed: return True
     return False
 
-# ---------- Strategy tick ----------
+# ---------- Strategy tick (EMA crossover only) ----------
 def strategy_tick():
     prices=fetch_all_prices(); now=int(time.time())
+    # ticks & candles
     for pair,obj in prices.items():
         px=obj["price"]; tick_logs[pair].append((now,px))
         if len(tick_logs[pair])>6000: tick_logs[pair]=tick_logs[pair][-6000:]
         aggregate_candles(pair)
 
     balances=get_wallet_balances(); usdt_free=float(balances.get("USDT",0.0))
-    best=None
-    for pair in list(candle_logs.keys()):
-        sig=score_and_signal(pair)
-        if sig: best=(pair,sig); break
-    if not best:
-        scan_log.append(f"{ist_now()} | no entry"); return
+    any_signal=False
 
-    pair,sig=best; px=sig["px"]; atr=sig["atr"]
-    need_notional = min(BUY_NOTIONAL_CAP*usdt_free, size_for_buy(pair,px,atr,usdt_free)*px)
-    if ensure_usdt_liquidity(need_notional):
-        balances=get_wallet_balances(); usdt_free=float(balances.get("USDT",0.0))
-        qty=size_for_buy(pair,px,atr,usdt_free); qty=fmt_qty_floor(pair, qty)
-        if qty<=0:
-            scan_log.append(f"{ist_now()} | {pair} | qty too small"); return
-        sl=fmt_price(pair, px - SL_ATR_MULT*atr); tp=fmt_price(pair, px + TP_ATR_MULT*atr)
-        res=place_market(pair,"BUY",qty); oid=_extract_order_id(res)
-        if oid:
-            st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
-            if filled>0 and avg>0:
-                positions[pair]={"qty":filled,"entry":avg,"stop":sl,"tp":tp}
-                trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg} | SL={sl} TP={tp} | oid={oid}")
-        else:
-            scan_log.append(f"{ist_now()} | {pair} | BUY failed")
+    for pair, cs in list(candle_logs.items()):
+        if len(cs)<20: continue
+        closes=[c["close"] for c in cs]
+        ema5=_ema_series(closes,5)
+        ema13=_ema_series(closes,13)
+        if len(ema5)<2 or len(ema13)<2: continue
+        e5_prev,e5_now = ema5[-2], ema5[-1]
+        e13_prev,e13_now = ema13[-2], ema13[-1]
+        last = closes[-1]
 
-    # exits
-    for pair,p in list(positions.items()):
-        last=prices.get(pair,{}).get("price")
-        if not last: continue
-        if last>=p["tp"] or last<=p["stop"]:
-            q=fmt_qty_floor(pair, p["qty"])
-            res=place_market(pair,"SELL",q); oid=_extract_order_id(res)
-            if oid:
-                st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
-                trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg} | oid={oid}")
-                positions.pop(pair,None)
+        pos = positions.get(pair)
+
+        # --- LONG entry: EMA5 crosses above EMA13 ---
+        if (pos is None) and (e5_prev <= e13_prev and e5_now > e13_now):
+            any_signal=True
+            # ensure capital
+            # risk proxy = TP distance, target notional = min(cap, risk based)
+            need_notional = BUY_NOTIONAL_CAP*usdt_free
+            if ensure_usdt_liquidity(need_notional):
+                balances=get_wallet_balances(); usdt_free=float(balances.get("USDT",0.0))
+                qty=size_for_long(last, usdt_free); qty=fmt_qty_floor(pair, qty)
+                if qty>0:
+                    tp=fmt_price(pair, last*(1.0+TP_PCT))
+                    res=place_market(pair,"BUY",qty); oid=_extract_order_id(res)
+                    if oid:
+                        st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
+                        if filled>0 and avg>0:
+                            positions[pair]={"side":"LONG","qty":filled,"entry":avg,"tp":tp}
+                            trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg} | TP={tp} | oid={oid}")
+                else:
+                    scan_log.append(f"{ist_now()} | {pair} | LONG qty too small")
+
+        # --- SHORT entry: EMA5 crosses below EMA13 (needs coin inventory) ---
+        elif (pos is None) and (e5_prev >= e13_prev and e5_now < e13_now):
+            any_signal=True
+            coin = pair[:-4]
+            coin_bal = float(balances.get(coin, 0.0))
+            qty = fmt_qty_floor(pair, size_for_short_from_inventory(coin_bal))
+            if qty>0:
+                tp=fmt_price(pair, last*(1.0-TP_PCT))
+                res=place_market(pair,"SELL",qty); oid=_extract_order_id(res)
+                if oid:
+                    st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
+                    if filled>0 and avg>0:
+                        positions[pair]={"side":"SHORT","qty":filled,"entry":avg,"tp":tp}
+                        trade_log.append(f"{ist_now()} | {pair} | SHORT SELL {filled} @ {avg} | TP={tp} | oid={oid}")
+            else:
+                scan_log.append(f"{ist_now()} | {pair} | SHORT skipped (no coin inventory)")
+
+        # --- Exit LONG at TP ---
+        elif pos and pos.get("side")=="LONG":
+            if last >= pos["tp"]:
+                q=fmt_qty_floor(pair, pos["qty"])
+                if q>0:
+                    res=place_market(pair,"SELL",q); oid=_extract_order_id(res)
+                    if oid:
+                        st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
+                        trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg} | oid={oid}")
+                positions.pop(pair, None)
+
+        # --- Exit SHORT at TP (buy back lower) ---
+        elif pos and pos.get("side")=="SHORT":
+            if last <= pos["tp"]:
+                q=fmt_qty_floor(pair, pos["qty"])
+                if q>0:
+                    res=place_market(pair,"BUY",q); oid=_extract_order_id(res)
+                    if oid:
+                        st=get_order_status(order_id=oid); filled,avg=_filled_avg_from_status(st)
+                        trade_log.append(f"{ist_now()} | {pair} | BUYBACK {filled} @ {avg} | oid={oid}")
+                positions.pop(pair, None)
+
+    if not any_signal:
+        scan_log.append(f"{ist_now()} | no entry")
 
 # ---------- Main loop ----------
 def scan_loop():
