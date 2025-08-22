@@ -4,9 +4,18 @@ from flask import Flask, render_template, jsonify
 from datetime import datetime, timedelta
 from pytz import timezone
 from collections import defaultdict, deque
+from collections import deque
 
 # ---------- Flask ----------
 app = Flask(__name__)
+
+
+# optional: keep minimal in-memory IO log
+io_log = deque(maxlen=500)
+
+@app.route("/io")
+def get_io():
+    return jsonify({"io": list(io_log)})
 
 # ---------- Creds / API ----------
 API_KEY = os.environ.get("API_KEY", "")
