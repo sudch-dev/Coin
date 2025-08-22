@@ -33,14 +33,14 @@ def _keepalive_ping():
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-CANDLE_INTERVAL = 5
+CANDLE_INTERVAL = 3  #changed from 5
 LOOP_SEC        = 1.0
 RULES_REFRESH_SEC = 30*24*3600   # 30 days
 BAL_TTL_SEC     = 15
 
-RISK_PER_TRADE  = 0.01   # 1% risk
+RISK_PER_TRADE  = 0.02   # 1% risk
 BUY_NOTIONAL_CAP= 0.30   # 30% of free USDT
-TP_ATR_MULT     = 1.4
+TP_ATR_MULT     = 1.0
 SL_ATR_MULT     = 0.7
 
 START_WITH_USDT = True
