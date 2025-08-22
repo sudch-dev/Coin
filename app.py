@@ -25,19 +25,19 @@ API_SECRET_RAW = os.environ.get("API_SECRET", "")
 API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API_SECRET_RAW
 BASE_URL = "https://api.coindcx.com"
 
-# ========================= Market universe & rules =========================
-PAIR_RULES = {}              # pair -> rules (price_precision, qty_precision, min_qty, min_notional)
+# ========================= Market rules (USDT only) =========================
+PAIR_RULES = {}              # pair -> {price_precision, qty_precision, min_qty, min_notional}
 ALL_USDT_PAIRS = []          # discovered USDT pairs
 MAX_MONITORED_PAIRS = int(os.environ.get("MAX_MONITORED_PAIRS", "200"))
 
 # ========================= Core knobs =========================
-CANDLE_INTERVAL    = 5          # seconds (5s bars)
+CANDLE_INTERVAL    = 5           # seconds (5s bars)
 POLL_SEC           = 1.0
-FEE_PCT_PER_SIDE   = 0.0010     # taker fee per side
+FEE_PCT_PER_SIDE   = 0.0010      # taker fee per side
 BUY_HEADROOM       = 1.0005
-BUY_FRACTION_USDT  = 0.30       # cap notional per buy vs free USDT
+BUY_FRACTION_USDT  = 0.30        # cap notional per buy vs free USDT
 KEEPALIVE_SEC      = 240
-RULES_REFRESH_SEC  = 1800       # 30m
+RULES_REFRESH_SEC  = 30 * 24 * 3600   # 30 days
 
 # ---- Profiles (plus TURBO) ----
 STRATEGY_MODE = os.environ.get("STRATEGY_MODE", "balanced")
@@ -74,7 +74,7 @@ _last_rules_refresh = 0
 
 # positions: pair -> {"qty","entry","ts","stop","trail","highest","atr","tp"}
 positions = {}
-cooldown_until = {}                 # pair -> epoch when entries are allowed again
+cooldown_until = {}                 # pair -> epoch when entries allowed again
 
 # P&L persistence
 PROFIT_STATE_FILE = "profit_state.json"
@@ -85,10 +85,10 @@ BAL_TTL_SEC = max(12, int(os.environ.get("BAL_TTL_SEC", "15")))   # avoid hammer
 _bal_cache = {}
 _bal_cache_ts = 0
 
-# Runtime toggles
+# Runtime toggles (real trades by default)
 IGNORE_BAL_AGE = False
 PAPER_TRADE    = False
-ADMIN_TOGGLE_KEY = os.environ.get("ADMIN_TOGGLE_KEY", "")
+ADMIN_TOGGLE_KEY = os.environ.get("ADMIN_TOGGLE_KEY", "")  # set in env to allow toggles
 
 # ========================= HTTP session: robust + retries/backoff =========================
 from requests.adapters import HTTPAdapter
@@ -99,7 +99,7 @@ except Exception:
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "CoinDCXBot/2.2 Allocator",
+    "User-Agent": "CoinDCXBot/Allocator 3.0",
     "Connection": "keep-alive",
     "Accept": "application/json",
 })
@@ -118,7 +118,7 @@ SESSION.mount("http://", adapter)
 _err_streak = {"get": 0, "post": 0}
 _poll_backoff = 0.0  # added to POLL_SEC in the main loop after bursts of errors
 
-# I/O logging (safe)
+# I/O logging (summarized)
 IO_ENABLED   = os.environ.get("IO_ENABLED", "1") == "1"
 IO_MAX_FIELD = int(os.environ.get("IO_MAX_FIELD", "2000"))
 IO_LOG_FILE  = os.environ.get("IO_LOG_FILE", "io_log.txt")
@@ -127,7 +127,7 @@ def _truncate(s, n):
     try: s = s if isinstance(s, str) else json.dumps(s)
     except Exception: s = str(s)
     if s is None: return ""
-    return s if len(s) <= n else s[:n] + f"...(truncated {len(s)-n} chars)"
+    return s if len(s) <= n else s[:n] + f"...(+{len(s)-n} chars)"
 
 def _mask_headers(h):
     if not isinstance(h, dict): return {}
@@ -138,13 +138,20 @@ def _mask_headers(h):
 
 def log_io(direction, url, headers=None, payload=None, status=None, response=None):
     if not IO_ENABLED: return
+    short_resp = None
+    try:
+        if response:
+            rs = str(response)
+            short_resp = rs if len(rs) <= 500 else f"<{len(rs)} chars>"
+    except Exception:
+        short_resp = "<unloggable>"
     rec = {
         "ts": ist_now(), "dir": direction, "url": url, "status": status,
         "headers": _mask_headers(headers or {}),
         "payload": _truncate(payload, IO_MAX_FIELD) if payload is not None else None,
-        "response": _truncate(response, IO_MAX_FIELD) if response is not None else None,
+        "response": short_resp,
     }
-    line = f"{rec['ts']} | {rec['dir']} | {rec['url']} | status={rec['status']} | headers={rec['headers']} | payload={rec['payload']} | response={rec['response']}"
+    line = f"{rec['ts']} | {rec['dir']} | {rec['url']} | status={rec['status']} | resp={short_resp}"
     io_log.append(line)
     try:
         if IO_LOG_FILE:
@@ -152,6 +159,11 @@ def log_io(direction, url, headers=None, payload=None, status=None, response=Non
                 f.write(line + "\n")
     except Exception:
         pass
+
+# ========================= Signing & HTTP =========================
+def hmac_signature(payload_str):
+    # payload_str must be the exact string we send on the wire
+    return hmac.new(API_SECRET, payload_str.encode(), hashlib.sha256).hexdigest()
 
 def _http_post_with_retry(url, headers, payload, timeout=12, retries=2, backoff=0.5):
     """Our wrapper on top of Session retries; adds jitter + circuit-breaker."""
@@ -162,7 +174,6 @@ def _http_post_with_retry(url, headers, payload, timeout=12, retries=2, backoff=
             r = SESSION.post(url, headers=headers, data=payload, timeout=timeout)
             body = r.text if hasattr(r, "text") else ""
             log_io("RES", url, status=r.status_code, response=body)
-            # Soft retry on transient status
             if r.status_code in (429, 500, 502, 503, 504, 520):
                 time.sleep(backoff * (2 ** i) + random.random() * 0.25)
                 continue
@@ -194,6 +205,203 @@ def _http_get_with_retry(url, timeout=10, retries=2, backoff=0.5):
     _err_streak["get"] += 1
     _poll_backoff = min(3.0, 0.5 * _err_streak["get"])
     return None
+
+def _signed_post(url, body_dict, timeout=12):
+    payload = json.dumps(body_dict, separators=(',', ':'))  # exact string must be signed
+    sig = hmac_signature(payload)
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sig,
+        "Content-Type": "application/json"
+    }
+    r = _http_post_with_retry(url, headers, payload, timeout=timeout, retries=2)
+    if r is None:
+        return {}
+    if r.ok and r.headers.get("content-type","").startswith("application/json"):
+        return r.json()
+    _log_http_issue(f"POST {url}", r)
+    return {}
+
+def _log_http_issue(prefix, r):
+    try:
+        body = r.text[:240] if hasattr(r, "text") else ""
+        scan_log.append(f"{ist_now()} | {prefix} HTTP {r.status_code} | {body}")
+    except Exception as e:
+        scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
+
+# ========================= Rules, balances, prices =========================
+def refresh_markets_and_pairs():
+    """Refresh rules and USDT market list (rarely changes)."""
+    global PAIR_RULES, ALL_USDT_PAIRS
+    url = f"{BASE_URL}/exchange/v1/markets_details"
+    r = _http_get_with_retry(url, timeout=15, retries=2)
+    if not r or not r.ok:
+        if r: _log_http_issue("markets_details", r)
+        return
+    data = r.json()
+    rules = {}
+    usdt_pairs = []
+    for it in data:
+        p = it.get("pair") or it.get("market") or it.get("coindcx_name")
+        if not p: 
+            continue
+        rules[p] = {
+            "price_precision": int(it.get("target_currency_precision", 6)),  # PRICE
+            "qty_precision":   int(it.get("base_currency_precision", 6)),    # QTY
+            "min_qty":         float(it.get("min_quantity", 0.0) or 0.0),
+            "min_notional":    float(it.get("min_notional", 0.0) or 0.0),
+        }
+        if p.endswith("USDT"):
+            usdt_pairs.append(p)
+    PAIR_RULES = rules
+    ALL_USDT_PAIRS = sorted(usdt_pairs)
+    scan_log.append(f"{ist_now()} | market rules refreshed | USDT pairs={len(ALL_USDT_PAIRS)}")
+
+def get_wallet_balances():
+    """Respects BAL_TTL_SEC to avoid hammering the API."""
+    global _bal_cache, _bal_cache_ts
+    now = time.time()
+    if _bal_cache and (now - _bal_cache_ts) < BAL_TTL_SEC:
+        return dict(_bal_cache)
+    payload = json.dumps({"timestamp": int(now * 1000)}, separators=(',', ':'))
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    r = _http_post_with_retry(f"{BASE_URL}/exchange/v1/users/balances", headers, payload, timeout=12, retries=2)
+    if r and r.ok:
+        balances = {}
+        try:
+            for b in r.json():
+                balances[b["currency"]] = float(b["balance"])
+            _bal_cache, _bal_cache_ts = balances, now
+            return balances
+        except Exception as e:
+            scan_log.append(f"{ist_now()} | balances parse fail: {e}")
+    else:
+        if r: _log_http_issue("balances", r)
+    return dict(_bal_cache) if _bal_cache else {}
+
+def balances_age_sec():
+    return int(time.time() - _bal_cache_ts) if _bal_cache_ts else None
+
+def fetch_all_prices():
+    """
+    Pull tickers and keep USDT pairs only. Timeout short; cap the pairs per tick.
+    """
+    r = _http_get_with_retry(f"{BASE_URL}/exchange/ticker", timeout=7, retries=2)
+    if r and r.ok:
+        now = int(time.time())
+        ret = {}
+        count = 0
+        for item in r.json():
+            m = item.get("market")
+            if not m or not m.endswith("USDT"): continue
+            if m not in PAIR_RULES: continue
+            ret[m] = {"price": float(item["last_price"]), "ts": now}
+            count += 1
+            if count >= MAX_MONITORED_PAIRS: break
+        return ret
+    else:
+        if r: _log_http_issue("ticker", r)
+    return {}
+
+# ========================= Precision & formatting =========================
+def _qty_prec(pair):  return int(PAIR_RULES.get(pair, {}).get("qty_precision", 6))
+def _price_prec(pair):return int(PAIR_RULES.get(pair, {}).get("price_precision", 6))
+def _min_qty(pair):   return float(PAIR_RULES.get(pair, {}).get("min_qty", 0.0))
+def _min_notional(pair): return float(PAIR_RULES.get(pair, {}).get("min_notional", 0.0))
+
+def fmt_price(pair, price):
+    pp = _price_prec(pair)
+    return float(f"{float(price):.{pp}f}")
+
+def fmt_qty_floor(pair, qty):
+    """Floor to allowed step, then enforce min_qty. Never rounds up."""
+    qp   = _qty_prec(pair)
+    step = 10 ** (-qp)
+    if qty <= 0:
+        return 0.0
+    q = float(qty)
+    q = (int(q / step)) * step  # floor
+    q = float(f"{q:.{qp}f}")
+    return q if q >= _min_qty(pair) else 0.0
+
+def _qty_step(pair): return 10 ** (-_qty_prec(pair))
+def _fee_multiplier(side): return 1.0 + FEE_PCT_PER_SIDE if side.upper()=="BUY" else 1.0 - FEE_PCT_PER_SIDE
+
+def normalize_qty_for_buy(pair, price, usdt_avail):
+    if price <= 0: return 0.0
+    denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
+    q = usdt_avail / denom
+    q = fmt_qty_floor(pair, q)
+    step = _qty_step(pair)
+    while q >= _min_qty(pair) and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
+        q = max(0.0, q - step)
+        q = fmt_qty_floor(pair, q)
+    if q < _min_qty(pair): return 0.0
+    return q
+
+# ========================= Orders (real / paper) =========================
+def place_market(pair, side, qty):
+    """
+    Create a MARKET order. Floors qty to step; enforces min_qty.
+    """
+    # paper disabled by default; keep path for testing
+    if PAPER_TRADE:
+        px = candle_logs.get(pair, [])[-1]["close"] if candle_logs.get(pair) else 0.0
+        oid = f"paper-{int(time.time()*1000)}"
+        trade_log.append(f"{ist_now()} | {pair} | PAPER SUBMIT {side} qty={qty} @ MKT (px≈{px}) | oid={oid}")
+        return {"id": oid, "status": "accepted", "side": side.lower(), "qty": qty}
+
+    qty = fmt_qty_floor(pair, qty)
+    if qty <= 0:
+        scan_log.append(f"{ist_now()} | {pair} | ABORT {side}: qty too small after floor")
+        return {}
+
+    payload = {
+        "market": pair,
+        "side": side.lower(),                  # "buy" / "sell"
+        "order_type": "market_order",
+        "total_quantity": f"{qty}",
+        "timestamp": int(time.time() * 1000),
+    }
+
+    trade_log.append(f"{ist_now()} | {pair} | SUBMIT {side} qty={payload['total_quantity']} @ MKT")
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload, timeout=10)
+    trade_log.append(f"{ist_now()} | {pair} | SUBMIT RESP => {res}")
+    return res
+
+def get_order_status(order_id=None, client_order_id=None):
+    body = {"timestamp": int(time.time() * 1000)}
+    if order_id: body["id"] = order_id
+    if client_order_id: body["client_order_id"] = client_order_id
+    return _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body, timeout=12) or {}
+
+def _extract_order_id(res: dict):
+    if not isinstance(res, dict): return None
+    try:
+        if isinstance(res.get("orders"), list) and res["orders"]:
+            o = res["orders"][0]
+            for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+                if o.get(k): return str(o[k])
+    except Exception:
+        pass
+    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+        if res.get(k): return str(res[k])
+    d = res.get("data") or {}
+    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+        if d.get(k): return str(d[k])
+    return None
+
+def _filled_avg_from_status(st):
+    try:
+        total_q  = float(st.get("total_quantity", st.get("quantity", 0)))
+        remain_q = float(st.get("remaining_quantity", st.get("remaining_qty", 0)))
+        exec_q   = float(st.get("executed_quantity", st.get("filled_qty", 0)))
+        filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
+        avg_px   = float(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
+        return filled, avg_px
+    except Exception:
+        return 0.0, 0.0
 
 # ========================= P&L helpers =========================
 def load_profit_state():
@@ -228,207 +436,117 @@ def record_realized_pnl(pnl):
 def compute_realized_pnl_today():
     return round(profit_state["daily"].get(ist_date(), 0.0), 6)
 
-# ========================= Signing & helpers =========================
-def hmac_signature(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-
-def _log_http_issue(prefix, r):
-    try:
-        body = r.text[:240] if hasattr(r, "text") else ""
-        scan_log.append(f"{ist_now()} | {prefix} HTTP {r.status_code} | {body}")
-    except Exception as e:
-        scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
-
-def _signed_post(url, body):
-    payload = json.dumps(body, separators=(',', ':'))
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    r = _http_post_with_retry(url, headers, payload, timeout=12, retries=2)
-    if r is None: return {}
-    if not r.ok:
-        _log_http_issue(f"POST {url}", r)
-        return {}
-    ctype = r.headers.get("content-type", "")
-    return r.json() if ctype.startswith("application/json") else {}
-
-def _keepalive_ping():
-    try:
-        if APP_BASE_URL:
-            url = f"{APP_BASE_URL}/ping"
-            headers = {}
-            if KEEPALIVE_TOKEN:
-                url = f"{url}?t={KEEPALIVE_TOKEN}"
-                headers["X-Keepalive-Token"] = KEEPALIVE_TOKEN
-            SESSION.get(url, headers=headers, timeout=5)
-    except Exception:
-        pass
-
-# ========================= Exchange helpers =========================
-def refresh_markets_and_pairs():
-    """Refresh rules and USDT market list."""
-    global PAIR_RULES, ALL_USDT_PAIRS
-    r = _http_get_with_retry(f"{BASE_URL}/exchange/v1/markets_details", timeout=15, retries=2)
-    if not r or not r.ok:
-        if r: _log_http_issue("markets_details", r)
-        return
-    data = r.json()
-    rules = {}
-    usdt_pairs = []
-    for it in data:
-        p = it.get("pair") or it.get("market") or it.get("coindcx_name")
-        if not p: continue
-        rules[p] = {
-            "price_precision": int(it.get("target_currency_precision", 6)),
-            "qty_precision":   int(it.get("base_currency_precision", 6)),
-            "min_qty":         float(it.get("min_quantity", 0.0) or 0.0),
-            "min_notional":    float(it.get("min_notional", 0.0) or 0.0),
-        }
-        if p.endswith("USDT"): usdt_pairs.append(p)
-    PAIR_RULES = rules
-    ALL_USDT_PAIRS = sorted(usdt_pairs)
-    scan_log.append(f"{ist_now()} | market rules refreshed | USDT pairs={len(ALL_USDT_PAIRS)}")
-
-def get_wallet_balances():
-    """Respects BAL_TTL_SEC to avoid hammering the API."""
-    global _bal_cache, _bal_cache_ts
-    now = time.time()
-    if _bal_cache and (now - _bal_cache_ts) < BAL_TTL_SEC:
-        return dict(_bal_cache)
-    payload = json.dumps({"timestamp": int(now * 1000)})
-    sig = hmac_signature(payload)
-    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
-    r = _http_post_with_retry(f"{BASE_URL}/exchange/v1/users/balances", headers, payload, timeout=12, retries=2)
-    if r and r.ok:
-        balances = {}
-        try:
-            for b in r.json():
-                balances[b["currency"]] = float(b["balance"])
-            _bal_cache, _bal_cache_ts = balances, now
-            return balances
-        except Exception as e:
-            scan_log.append(f"{ist_now()} | balances parse fail: {e}")
-    else:
-        if r: _log_http_issue("balances", r)
-    return dict(_bal_cache) if _bal_cache else {}
-
-def balances_age_sec():
-    return int(time.time() - _bal_cache_ts) if _bal_cache_ts else None
-
-def fetch_all_prices():
-    """
-    Pull tickers and keep USDT pairs only. Timeout short; we cap the pairs per tick.
-    """
-    r = _http_get_with_retry(f"{BASE_URL}/exchange/ticker", timeout=7, retries=2)
-    if r and r.ok:
-        now = int(time.time())
-        ret = {}
-        count = 0
-        for item in r.json():
-            m = item.get("market")
-            if not m or not m.endswith("USDT"): continue
-            if m not in PAIR_RULES: continue
-            ret[m] = {"price": float(item["last_price"]), "ts": now}
-            count += 1
-            if count >= MAX_MONITORED_PAIRS: break
-        return ret
-    else:
-        if r: _log_http_issue("ticker", r)
-    return {}
-
-# ========================= Precision & formatting =========================
-def _rules(pair): return PAIR_RULES.get(pair, {})
-def _min_qty(pair): return float(_rules(pair).get("min_qty", 0.0) or 0.0)
-def _qty_prec(pair): return int(_rules(pair).get("qty_precision", 6))
-
-def fmt_price(pair, price):
-    pp = int(_rules(pair).get("price_precision", 6))
-    return float(f"{float(price):.{pp}f}")
-
-def fmt_qty(pair, qty):
+# ========================= Liquidation helpers =========================
+def safe_sell_qty(pair, wallet_qty, last_px=None):
+    """Clamp DOWN to wallet amount & step; enforce min_qty; return 0 if too small/notional too small."""
+    if wallet_qty <= 0: 
+        return 0.0
     qp = _qty_prec(pair)
+    step = 10 ** (-qp)
     mq = _min_qty(pair)
-    q = max(float(qty), mq)
+
+    q = float(wallet_qty)
+    q = (int(q / step)) * step
     q = float(f"{q:.{qp}f}")
-    if q < mq: q = float(f"{mq:.{qp}f}")
+    if q < mq:
+        return 0.0
+    if last_px is not None:
+        min_notional = float(_min_notional(pair))
+        if last_px * q < min_notional:
+            return 0.0
     return q
 
-def _qty_step(pair): return 10 ** (-_qty_prec(pair))
-def _fee_multiplier(side): return 1.0 + FEE_PCT_PER_SIDE if side.upper()=="BUY" else 1.0 - FEE_PCT_PER_SIDE
+def liquidate_all_non_usdt(reason="boot"):
+    """
+    Sell any non-USDT balances that have a valid USDT market and meet min-qty/notional.
+    Logs an explicit reason if a coin is skipped.
+    """
+    bal = get_wallet_balances()
+    prices = fetch_all_prices()  # we only keep *USDT* pairs here
 
-def normalize_qty_for_buy(pair, price, usdt_avail):
-    if price <= 0: return 0.0
-    denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
-    q = usdt_avail / denom
-    q = fmt_qty(pair, q)
-    step = _qty_step(pair)
-    while q >= _min_qty(pair) and (price * q * _fee_multiplier("BUY") * BUY_HEADROOM) > usdt_avail + 1e-12:
-        q = fmt_qty(pair, max(0.0, q - step))
-    if q < _min_qty(pair): return 0.0
-    return q
+    for cur, amt in bal.items():
+        if cur == "USDT" or amt <= 0:
+            continue
 
-# ========================= Orders (paper/live) =========================
-def _extract_order_id(res: dict):
-    if not isinstance(res, dict): return None
-    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
-        if res.get(k): return str(res[k])
-    try:
-        if isinstance(res.get("orders"), list) and res["orders"]:
-            o = res["orders"][0]
-            for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
-                if o.get(k): return str(o[k])
-    except Exception:
-        pass
-    d = res.get("data") or {}
-    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
-        if d.get(k): return str(d[k])
-    return None
+        usdt_pair = f"{cur}USDT"
+        if usdt_pair not in PAIR_RULES:
+            scan_log.append(f"{ist_now()} | {cur} | SKIP-LIQ: no USDT market (rules missing)")
+            continue
 
-def _filled_avg_from_status(st):
-    try:
-        total_q  = float(st.get("total_quantity", st.get("quantity", 0)))
-        remain_q = float(st.get("remaining_quantity", st.get("remaining_qty", 0)))
-        exec_q   = float(st.get("executed_quantity", st.get("filled_qty", 0)))
-        filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
-        avg_px   = float(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
-        return filled, avg_px
-    except Exception:
-        return 0.0, 0.0
+        last_px = float(prices.get(usdt_pair, {}).get("price", 0.0))
+        q = safe_sell_qty(usdt_pair, amt, last_px)
+        if q <= 0:
+            rq = _min_qty(usdt_pair)
+            mn = float(_min_notional(usdt_pair))
+            scan_log.append(
+                f"{ist_now()} | {cur} | SKIP-LIQ: qty/notional too small (bal={amt}, min_qty={rq}, min_notional={mn}, px={last_px})"
+            )
+            continue
 
-# paper order bookkeeping (so we can return a consistent price)
-_paper_orders = {}  # oid -> {"pair","qty","side","px"}
+        trade_log.append(f"{ist_now()} | {usdt_pair} | FORCE-LIQ {reason} | SELL {q} @ MKT")
+        res = place_market(usdt_pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            st = get_order_status(order_id=oid)
+            filled, px = _filled_avg_from_status(st)
+            trade_log.append(f"{ist_now()} | {usdt_pair} | FORCE-LIQ status oid={oid} filled={filled} px={px}")
+        else:
+            trade_log.append(f"{ist_now()} | {usdt_pair} | FORCE-LIQ failed (no oid) | res={res}")
 
-def place_market(pair, side, qty):
-    qty = fmt_qty(pair, qty)
-    if PAPER_TRADE:
-        px = candle_logs.get(pair, [])[-1]["close"] if candle_logs.get(pair) else 0.0
-        oid = f"paper-{int(time.time()*1000)}"
-        _paper_orders[oid] = {"pair": pair, "qty": qty, "side": side.lower(), "px": px}
-        line = f"{ist_now()} | {pair} | PAPER SUBMIT {side} qty={qty} @ MKT (px≈{px}) | oid={oid}"
-        trade_log.append(line); scan_log.append(line)
-        return {"id": oid, "status": "accepted", "side": side.lower(), "qty": qty}
-    payload = {
-        "market": pair,
-        "side": side.lower(),
-        "order_type": "market_order",
-        "total_quantity": f"{qty}",
-        "timestamp": int(time.time() * 1000)
-    }
-    # submit
-    line = f"{ist_now()} | {pair} | SUBMIT {side} qty={payload['total_quantity']} @ MKT"
-    trade_log.append(line); scan_log.append(line)
-    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
-    trade_log.append(f"{ist_now()} | {pair} | SUBMIT RESP {side} => {res}")
-    return res
+def ensure_usdt_liquidity(usdt_needed):
+    bal = get_wallet_balances()
+    have = float(bal.get("USDT", 0.0))
+    if have >= usdt_needed: return True
+    short = usdt_needed - have
+    if not FORCE_LIQUIDATE_ON_NEED:
+        scan_log.append(f"{ist_now()} | LIQUIDITY short={short} (skipped: FORCE_LIQUIDATE_ON_NEED=False)")
+        return False
 
-def get_order_status(order_id=None, client_order_id=None):
-    if PAPER_TRADE and order_id and str(order_id).startswith("paper-"):
-        rec = _paper_orders.get(order_id, {})
-        px = rec.get("px", 0.0)
-        return {"total_quantity": 0.0, "remaining_quantity": 0.0, "executed_quantity": 0.0, "avg_price": px}
-    body = {"timestamp": int(time.time() * 1000)}
-    if order_id: body["id"] = order_id
-    if client_order_id: body["client_order_id"] = client_order_id
-    return _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body) or {}
+    # Close open positions first
+    for pair, pos in list(positions.items()):
+        q = safe_sell_qty(pair, pos["qty"], last_px=None)
+        if q <= 0:
+            scan_log.append(f"{ist_now()} | {pair} | LIQUIDITY-EXIT skipped: qty below min step/min_qty")
+            continue
+        trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-EXIT | SELL {q} @ MKT")
+        res = place_market(pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            st = get_order_status(order_id=oid)
+            filled, px = _filled_avg_from_status(st)
+            pnl = (px - pos["entry"]) * min(filled, q) * (1 - 2*FEE_PCT_PER_SIDE)  # fee-aware approx
+            record_realized_pnl(pnl)
+            trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-EXIT filled={filled} px={px} pnl={round(pnl,6)}")
+            positions.pop(pair, None)
+            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+            if have >= usdt_needed: return True
+
+    # Sell any stray balances (non-USDT)
+    bal = get_wallet_balances()
+    prices = fetch_all_prices()
+    for cur, amt in bal.items():
+        if cur == "USDT" or amt <= 0:
+            continue
+        pair = f"{cur}USDT"
+        if pair not in PAIR_RULES:
+            scan_log.append(f"{ist_now()} | {cur} | LIQUIDITY-SELL skipped: no USDT market")
+            continue
+        last_px = float(prices.get(pair, {}).get("price", 0.0))
+        q = safe_sell_qty(pair, amt, last_px)
+        if q <= 0:
+            scan_log.append(f"{ist_now()} | {cur} | LIQUIDITY-SELL skipped: qty/notional too small (bal={amt}, px={last_px})")
+            continue
+        trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-SELL wallet | SELL {q} @ MKT")
+        res = place_market(pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            get_order_status(order_id=oid)  # best-effort
+            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+            if have >= usdt_needed: return True
+
+    bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+    scan_log.append(f"{ist_now()} | LIQUIDITY still short={max(0.0, usdt_needed-have)} after liquidation")
+    return have >= usdt_needed
 
 # ========================= Indicators =========================
 def aggregate_candles(pair, interval=CANDLE_INTERVAL):
@@ -502,11 +620,6 @@ def _size_by_risk(usdt_free, price, atr, risk_per_trade):
     qty_cap = (cap_notional / price) if cap_notional>0 else qty_risk
     return max(0.0, min(qty_risk, qty_cap))
 
-def _pnl_after_fees(entry, exit_px, qty):
-    buy_cost  = entry * (1 + FEE_PCT_PER_SIDE) * qty
-    sell_recv = exit_px * (1 - FEE_PCT_PER_SIDE) * qty
-    return sell_recv - buy_cost
-
 def score_pair(pair, cs):
     """Return (score, details) — higher is better; demote if any gate fails."""
     if len(cs) < max(36, BRK_LOOKBACK) + 3:
@@ -527,7 +640,6 @@ def score_pair(pair, cs):
     momentum_ok   = m_now > s_now
     breakout_up   = (hi is not None) and (last > hi)
 
-    # score components
     breakout_mag = ((last - (hi or last)) / (atr if atr>0 else 1e-9))
     ema_premium  = (last - ema_htf) / (atr if atr>0 else 1e-9)
     mom_delta    = (m_now - s_now) / (abs(s_now)+1e-9)
@@ -544,69 +656,6 @@ def score_pair(pair, cs):
     if not (volatility_ok and trend_ok and momentum_ok and breakout_up):
         score -= 1e6
     return score, det
-
-# ========================= Capital policy helpers =========================
-def liquidate_all_non_usdt(reason="boot"):
-    bal = get_wallet_balances()
-    for cur, amt in bal.items():
-        if cur == "USDT" or amt <= 0: continue
-        pair = f"{cur}USDT"
-        if pair not in PAIR_RULES: continue
-        q = fmt_qty(pair, amt)
-        line = f"{ist_now()} | {pair} | FORCE-LIQ {reason} | SELL {q} @ MKT"
-        trade_log.append(line); scan_log.append(line)
-        res = place_market(pair, "SELL", q)
-        oid = _extract_order_id(res)
-        if oid:
-            st = get_order_status(order_id=oid)
-            filled, px = _filled_avg_from_status(st)
-            trade_log.append(f"{ist_now()} | {pair} | FORCE-LIQ status oid={oid} filled={filled} px={px}")
-        else:
-            trade_log.append(f"{ist_now()} | {pair} | FORCE-LIQ failed (no oid) | res={res}")
-
-def ensure_usdt_liquidity(usdt_needed):
-    bal = get_wallet_balances()
-    have = float(bal.get("USDT", 0.0))
-    if have >= usdt_needed: return True
-    short = usdt_needed - have
-    if not FORCE_LIQUIDATE_ON_NEED:
-        scan_log.append(f"{ist_now()} | LIQUIDITY short={short} (skipped: FORCE_LIQUIDATE_ON_NEED=False)")
-        return False
-
-    # Close open positions first
-    for pair, pos in list(positions.items()):
-        q = pos["qty"]
-        trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-EXIT | SELL {q} @ MKT")
-        res = place_market(pair, "SELL", q)
-        oid = _extract_order_id(res)
-        if oid:
-            st = get_order_status(order_id=oid)
-            filled, px = _filled_avg_from_status(st)
-            pnl = _pnl_after_fees(pos["entry"], px, min(filled, q))
-            record_realized_pnl(pnl)
-            trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-EXIT filled={filled} px={px} pnl={round(pnl,6)}")
-            positions.pop(pair, None)
-            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
-            if have >= usdt_needed: return True
-
-    # Sell any stray balances
-    bal = get_wallet_balances()
-    for cur, amt in bal.items():
-        if cur == "USDT" or amt <= 0: continue
-        pair = f"{cur}USDT"
-        if pair not in PAIR_RULES: continue
-        q = fmt_qty(pair, amt)
-        trade_log.append(f"{ist_now()} | {pair} | LIQUIDITY-SELL wallet | SELL {q} @ MKT")
-        res = place_market(pair, "SELL", q)
-        oid = _extract_order_id(res)
-        if oid:
-            get_order_status(order_id=oid)  # best-effort
-            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
-            if have >= usdt_needed: return True
-
-    bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
-    scan_log.append(f"{ist_now()} | LIQUIDITY still short={max(0.0, usdt_needed-have)} after liquidation")
-    return have >= usdt_needed
 
 # ========================= Strategy core =========================
 def strategy_scan():
@@ -640,7 +689,6 @@ def strategy_scan():
 
     # ---- SCORE all available pairs, pick the best ----
     best_pair = None; best_score = -1e12; best_det = None
-    # Only evaluate pairs we have candles for (i.e., ticked recently)
     for pair, cs in candle_logs.items():
         if not cs: continue
         score, det = score_pair(pair, cs)
@@ -657,7 +705,6 @@ def strategy_scan():
 
     # ---- ENTRY (allocator) ----
     if best_pair and can_open_more and buys_allowed:
-        cs = candle_logs.get(best_pair) or []
         last = best_det["last"]; atr = best_det["atr"]; atr_pct = best_det["atr_pct"]
         gates = best_det["gates"]
         have_pos = best_pair in positions and positions[best_pair].get("qty", 0.0) > 0.0
@@ -672,7 +719,7 @@ def strategy_scan():
             # Calculate size then secure liquidity
             raw_qty = _size_by_risk(usdt_free, last, atr, RISK_PER_TRADE)
             target_notional = raw_qty * last
-            min_needed = max(target_notional, _rules(best_pair).get("min_notional", 0.0))
+            min_needed = max(target_notional, _min_notional(best_pair))
             scan_log.append(f"{ist_now()} | {best_pair} | ENTRY-CALC usdt_free={usdt_free} raw_qty={raw_qty} notional={target_notional} min_need={min_needed}")
 
             if ensure_usdt_liquidity(min_needed):
@@ -741,7 +788,7 @@ def strategy_scan():
                 st = get_order_status(order_id=oid)
                 filled, avg_px = _filled_avg_from_status(st)
                 if filled > 0 and avg_px > 0:
-                    pnl = _pnl_after_fees(p["entry"], avg_px, min(filled, q))
+                    pnl = (avg_px - p["entry"]) * min(filled, q) * (1 - 2*FEE_PCT_PER_SIDE)
                     record_realized_pnl(pnl)
                     trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
                     positions.pop(pair, None)
@@ -751,7 +798,19 @@ def strategy_scan():
             else:
                 scan_log.append(f"{ist_now()} | {pair} | SELL failed (no oid) | res={res}")
 
-# ========================= Main loop =========================
+# ========================= Keepalive & loop =========================
+def _keepalive_ping():
+    try:
+        if APP_BASE_URL:
+            url = f"{APP_BASE_URL}/ping"
+            headers = {}
+            if KEEPALIVE_TOKEN:
+                url = f"{url}?t={KEEPALIVE_TOKEN}"
+                headers["X-Keepalive-Token"] = KEEPALIVE_TOKEN
+            SESSION.get(url, headers=headers, timeout=5)
+    except Exception:
+        pass
+
 _autostart_lock = threading.Lock()
 
 def scan_loop():
@@ -849,6 +908,8 @@ def toggle():
             if state not in ("aggressive","balanced","conservative","turbo"):
                 return jsonify({"ok": False, "error": "invalid mode"}), 400
             STRATEGY_MODE = state; apply_profile(); val = STRATEGY_MODE
+        elif name == "force_rules_refresh":
+            refresh_markets_and_pairs(); val = "done"
         else:
             return jsonify({"ok": False, "error": "unknown toggle"}), 400
 
@@ -889,7 +950,6 @@ def _start_loop_once():
 
 def _boot_kick():
     try:
-        load_profit_state()
         refresh_markets_and_pairs()
         time.sleep(0.5)
         if START_WITH_USDT:
@@ -904,7 +964,6 @@ if os.environ.get("AUTOSTART", "1") == "1":
 
 if __name__ == "__main__":
     apply_profile()
-    load_profit_state()
     refresh_markets_and_pairs()
     if START_WITH_USDT:
         liquidate_all_non_usdt(reason="boot")
