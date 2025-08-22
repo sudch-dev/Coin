@@ -1,4 +1,15 @@
 # app.py (compact)import os, time, json, hmac, hashlib, threading, requests
+import os
+import time
+import json
+import hmac
+import hashlib
+import threading
+import requests
+from flask import Flask, render_template, jsonify
+from datetime import datetime
+from pytz import timezone
+from collections import defaultdict, deque
 from flask import Flask, render_template, jsonify
 from datetime import datetime
 from pytz import timezone
