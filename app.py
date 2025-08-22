@@ -10,7 +10,7 @@ import random
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime, timedelta
 from pytz import timezone
-from collections import deque
+from collections import deque, defaultdict
 
 # -------------------- Flask --------------------
 app = Flask(__name__)
@@ -24,89 +24,73 @@ API_SECRET_RAW = os.environ.get("API_SECRET", "")
 API_SECRET = API_SECRET_RAW.encode() if isinstance(API_SECRET_RAW, str) else API_SECRET_RAW
 BASE_URL = "https://api.coindcx.com"
 
-# -------------------- Markets --------------------
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
-    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT"
-]
+# -------------------- Dynamic Markets --------------------
+# Built from /markets_details; only USDT-quoted pairs will be monitored dynamically
+PAIR_RULES = {}                 # pair -> rules (price_precision, qty_precision, min_qty, min_notional)
+ALL_USDT_PAIRS = []             # all USDT pairs found on exchange
+MAX_MONITORED_PAIRS = int(os.environ.get("MAX_MONITORED_PAIRS", "200"))
 
-# Local fallbacks; refreshed from live rules
-PAIR_RULES = {
-    "BTCUSDT":  {"price_precision": 1, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
-    "ETHUSDT":  {"price_precision": 2, "qty_precision": 6, "min_qty": 0.0001, "min_notional": 0.0},
-    "XRPUSDT":  {"price_precision": 4, "qty_precision": 4, "min_qty": 0.1,    "min_notional": 0.0},
-    "SHIBUSDT": {"price_precision": 8, "qty_precision": 4, "min_qty": 10000,  "min_notional": 0.0},
-    "DOGEUSDT": {"price_precision": 5, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
-    "SOLUSDT":  {"price_precision": 2, "qty_precision": 4, "min_qty": 0.01,   "min_notional": 0.0},
-    "AEROUSDT": {"price_precision": 3, "qty_precision": 2, "min_qty": 0.01,   "min_notional": 0.0},
-    "ADAUSDT":  {"price_precision": 4, "qty_precision": 2, "min_qty": 0.1,    "min_notional": 0.0},
-    "BNBUSDT":  {"price_precision": 3, "qty_precision": 4, "min_qty": 0.001,  "min_notional": 0.0},
-}
-
-# -------------------- Strategy knobs --------------------
-CANDLE_INTERVAL    = 5     # seconds (5s candles)
+# -------------------- Strategy knobs (global allocator) --------------------
+CANDLE_INTERVAL    = 5       # seconds (5s candles)
 POLL_SEC           = 1.0
-BUY_FRACTION_USDT  = 0.30  # cap notional per trade (also used by risk-based sizing cap)
-SELL_ALL_COIN      = True
-
-# Fees and safety headroom
-FEE_PCT_PER_SIDE = 0.0010
-BUY_HEADROOM     = 1.0005  # 5bp cushion so rounding fits
-
-# Keepalive
-KEEPALIVE_SEC = 240
-
-# Rules refresh cadence
-RULES_REFRESH_SEC = 1800
+BUY_FRACTION_USDT  = 0.30    # cap notional per trade (also clamps risk sizing cap)
+FEE_PCT_PER_SIDE   = 0.0010  # taker fee per side
+BUY_HEADROOM       = 1.0005
+KEEPALIVE_SEC      = 240
+RULES_REFRESH_SEC  = 1800
 _last_rules_refresh = 0
 
-# ===== Fast Momentum Breakout knobs =====
-HTF_EMA_LEN        = 12      # trend filter on closes (~1 min EMA over 5s bars)
-ATR_N              = 36      # ATR window (~3 min)
-BRK_LOOKBACK       = 36      # breakout lookback (~3 min high/low)
-MIN_ATR_PCT        = 0.0008  # require ATR >= 0.08% of price (avoid chop)
-RISK_PER_TRADE     = 0.01    # risk 1% of free USDT per trade
-ATR_SL_MULT        = 0.8     # initial stop = entry - 0.8*ATR
-ATR_TP_MULT        = 1.6     # take profit  = entry + 1.6*ATR (≈2R)
-TRAIL_MULT         = 0.8     # trailing stop = highest - 0.8*ATR
-COOLDOWN_SEC       = 30      # cooldown after exit/failure
-MAX_CONCURRENT_POS = 1       # throttle: at most N open pairs
+# ======== Strategy Profiles (incl. turbo) ========
+STRATEGY_MODE = "balanced"   # default
+STRATEGY_PROFILES = {
+    "aggressive":   {"BRK_LOOKBACK":24, "MIN_ATR_PCT":0.0005, "ATR_SL_MULT":0.6, "ATR_TP_MULT":1.2, "RISK_PER_TRADE":0.015, "MAX_CONCURRENT_POS":2},
+    "balanced":     {"BRK_LOOKBACK":36, "MIN_ATR_PCT":0.0008, "ATR_SL_MULT":0.7, "ATR_TP_MULT":1.6, "RISK_PER_TRADE":0.010, "MAX_CONCURRENT_POS":1},
+    "conservative": {"BRK_LOOKBACK":60, "MIN_ATR_PCT":0.0012,"ATR_SL_MULT":0.8, "ATR_TP_MULT":2.0, "RISK_PER_TRADE":0.007, "MAX_CONCURRENT_POS":1},
+    "turbo":        {"BRK_LOOKBACK":12, "MIN_ATR_PCT":0.0003,"ATR_SL_MULT":0.5, "ATR_TP_MULT":1.0, "RISK_PER_TRADE":0.030, "MAX_CONCURRENT_POS":3}
+}
+# knobs bound from profile (will be set via apply_profile)
+BRK_LOOKBACK=36; MIN_ATR_PCT=0.0008; ATR_SL_MULT=0.7; ATR_TP_MULT=1.6; RISK_PER_TRADE=0.01; MAX_CONCURRENT_POS=1
+
+# Risk brakes
+DAILY_DD_STOP = float(os.environ.get("DAILY_DD_STOP", "-0.03"))  # stop buying if daily pnl < -3% of USDT
+
+# Dynamic allocator options
+START_WITH_USDT = os.environ.get("START_WITH_USDT", "1") == "1"            # sell all non-USDT at boot
+FORCE_LIQUIDATE_ON_NEED = os.environ.get("FORCE_LIQUIDATE_ON_NEED", "1") == "1"
 
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
 def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
-def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # -------------------- State --------------------
-tick_logs     = {p: [] for p in PAIRS}   # (ts, price) ticks
-candle_logs   = {p: [] for p in PAIRS}   # {open,high,low,close,start}
-scan_log      = []                       # decisions + signals
-trade_log     = []                       # execution + pnl lines
-running       = False
-status        = {"msg": "Idle", "last": ""}
-status_epoch  = 0
-error_message = ""
+tick_logs   = defaultdict(list)   # pair -> [(ts, price)]
+candle_logs = defaultdict(list)   # pair -> [{open,high,low,close,volume,start}]
+scan_log    = []
+trade_log   = []
+running     = False
+status      = {"msg": "Idle", "last": ""}
+status_epoch= 0
 last_keepalive = 0
 
-# Position tracking per pair
-positions = {
-    # pair: {"qty": float, "entry": float, "ts": int, "stop": float, "trail": float, "highest": float, "atr": float}
-}
-cooldown_until = {}  # pair -> epoch until entries are blocked
+# Positions (one per pair, allocator prefers single global position by profile)
+positions = {}  # pair -> {"qty","entry","ts","stop","trail","highest","atr"}
+
+cooldown_until = {}  # pair -> epoch
 
 # P&L persistence
 PROFIT_STATE_FILE = "profit_state.json"
-profit_state = {
-    "cumulative_pnl": 0.0,
-    "daily": {},
-    "processed_orders": []
-}
+profit_state = {"cumulative_pnl": 0.0, "daily": {}, "processed_orders": []}
 
 # Balance cache
 BAL_TTL_SEC = 15
 _bal_cache = {}
 _bal_cache_ts = 0
+
+# ---- Runtime flags (toggles) ----
+IGNORE_BAL_AGE = False
+PAPER_TRADE    = False
+ADMIN_TOGGLE_KEY = os.environ.get("ADMIN_TOGGLE_KEY", "")
 
 # ---- Raw I/O logging config ----
 IO_ENABLED   = os.environ.get("IO_ENABLED", "1") == "1"
@@ -131,25 +115,19 @@ def _truncate(s, n):
     return s if len(s) <= n else s[:n] + f"...(truncated {len(s)-n} chars)"
 
 def _mask_headers(h):
-    if not isinstance(h, dict):
-        return {}
+    if not isinstance(h, dict): return {}
     masked = {}
     for k, v in h.items():
-        lk = k.lower()
-        if lk in ("x-auth-signature", "x-auth-apikey", "authorization"):
+        if k.lower() in ("x-auth-signature","x-auth-apikey","authorization"):
             masked[k] = "***"
         else:
             masked[k] = v
     return masked
 
 def log_io(direction, url, headers=None, payload=None, status=None, response=None):
-    if not IO_ENABLED:
-        return
+    if not IO_ENABLED: return
     rec = {
-        "ts": ist_now(),
-        "dir": direction,
-        "url": url,
-        "status": status,
+        "ts": ist_now(), "dir": direction, "url": url, "status": status,
         "headers": _mask_headers(headers or {}),
         "payload": _truncate(payload, IO_MAX_FIELD) if payload is not None else None,
         "response": _truncate(response, IO_MAX_FIELD) if response is not None else None,
@@ -158,105 +136,84 @@ def log_io(direction, url, headers=None, payload=None, status=None, response=Non
     io_log.append(line)
     try:
         if IO_LOG_FILE:
-            with open(IO_LOG_FILE, "a") as f:
-                f.write(line + "\n")
+            with open(IO_LOG_FILE, "a") as f: f.write(line + "\n")
     except Exception:
         pass
 
 # -------------------- P&L helpers --------------------
 def load_profit_state():
     try:
-        with open(PROFIT_STATE_FILE, "r") as f:
-            data = json.load(f)
+        with open(PROFIT_STATE_FILE, "r") as f: data = json.load(f)
         profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
         profit_state["daily"] = dict(data.get("daily", {}))
         profit_state["processed_orders"] = list(data.get("processed_orders", []))
-    except:
-        pass
+    except: pass
 
 def save_profit_state():
     tmp = {
         "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
-        "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
+        "daily": {k: round(v, 6) for k,v in profit_state.get("daily", {}).items()},
         "processed_orders": profit_state.get("processed_orders", [])
     }
     try:
-        with open(PROFIT_STATE_FILE, "w") as f:
-            json.dump(tmp, f)
-    except:
-        pass
+        with open(PROFIT_STATE_FILE, "w") as f: json.dump(tmp, f)
+    except: pass
 
 def record_realized_pnl(pnl):
     pnl = float(pnl or 0.0)
     profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + pnl)
-    dkey = ist_date()
-    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + pnl)
+    d = ist_date()
+    profit_state["daily"][d] = float(profit_state["daily"].get(d, 0.0) + pnl)
     save_profit_state()
 
-def compute_realized_pnl_today():
-    return round(profit_state["daily"].get(ist_date(), 0.0), 6)
+def compute_realized_pnl_today(): return round(profit_state["daily"].get(ist_date(), 0.0), 6)
 
-# -------------------- HTTP session + retry helpers --------------------
+# -------------------- HTTP + signed helpers --------------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "CoinDCXBot/1.0 (+health; non-browser)"})
+SESSION.headers.update({"User-Agent": "CoinDCXBot/2.0 Allocator"})
 
-def _http_post_with_retry(url, headers, payload, timeout=12, retries=3, backoff_base=0.5):
+def _http_post_with_retry(url, headers, payload, timeout=12, retries=3, backoff=0.5):
     for i in range(retries):
         try:
             log_io("REQ", url, headers=headers, payload=payload)
             r = SESSION.post(url, headers=headers, data=payload, timeout=timeout)
             body = r.text if hasattr(r, "text") else ""
             log_io("RES", url, status=r.status_code, response=body)
-
-            if r.status_code in (520, 502, 503, 504):
-                try:
-                    cf = f" cf-ray={r.headers.get('CF-RAY','?')} cf-cache={r.headers.get('CF-Cache-Status','?')}"
-                except Exception:
-                    cf = ""
-                _log_http_issue(f"POST {url}{cf}", r)
-                if i < retries - 1:
-                    time.sleep(backoff_base * (2 ** i) + random.random() * 0.25)
+            if r.status_code in (520,502,503,504):
+                if i < retries-1:
+                    time.sleep(backoff * (2**i) + random.random()*0.25)
                     continue
             return r
         except Exception as e:
             scan_log.append(f"{ist_now()} | POST fail {url} | {e.__class__.__name__}: {e}")
-            if i < retries - 1:
-                time.sleep(backoff_base * (2 ** i) + random.random() * 0.25)
-                continue
-            return None
+            if i < retries-1: time.sleep(backoff * (2**i) + random.random()*0.25)
+            else: return None
 
-def _http_get_with_retry(url, timeout=12, retries=3, backoff_base=0.5):
+def _http_get_with_retry(url, timeout=12, retries=3, backoff=0.5):
     for i in range(retries):
         try:
             log_io("REQ", url)
             r = SESSION.get(url, timeout=timeout)
             body = r.text if hasattr(r, "text") else ""
             log_io("RES", url, status=r.status_code, response=body)
-
-            if r.status_code in (520, 502, 503, 504):
-                _log_http_issue(f"GET {url}", r)
-                if i < retries - 1:
-                    time.sleep(backoff_base * (2 ** i) + random.random() * 0.25)
+            if r.status_code in (520,502,503,504):
+                if i < retries-1:
+                    time.sleep(backoff * (2**i) + random.random()*0.25)
                     continue
             return r
         except Exception as e:
             scan_log.append(f"{ist_now()} | GET fail {url} | {e.__class__.__name__}: {e}")
-            if i < retries - 1:
-                time.sleep(backoff_base * (2 ** i) + random.random() * 0.25)
-                continue
-            return None
+            if i < retries-1: time.sleep(backoff*(2**i)+random.random()*0.25)
+            else: return None
 
-# -------------------- Signed HTTP helpers --------------------
-def hmac_signature(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+def hmac_signature(payload): return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
 def _log_http_issue(prefix, r):
     try:
         body = r.text[:240] if hasattr(r, "text") else ""
-        cf = f" cf-ray={r.headers.get('CF-RAY','?')} cf-cache={r.headers.get('CF-Cache-Status','?')}"
-        _tlog(f"{prefix} HTTP {r.status_code}{cf} | {body}")
+        scan_log.append(f"{ist_now()} | {prefix} HTTP {r.status_code} | {body}")
     except Exception as e:
-        _tlog(f"{prefix} log-fail: {e}")
+        scan_log.append(f"{ist_now()} | {prefix} log-fail: {e}")
 
 def _signed_post(url, body):
     payload = json.dumps(body, separators=(',', ':'))
@@ -264,13 +221,9 @@ def _signed_post(url, body):
     headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
     try:
         r = _http_post_with_retry(url, headers, payload, timeout=12, retries=3)
-        if r is None:
-            _tlog(f"{url} HTTP fail (no response after retries)")
-            return {}
-        if not r.ok:
-            _log_http_issue(f"POST {url}", r)
-            return {}
-        if r.headers.get("content-type", "").startswith("application/json"):
+        if r is None: _tlog(f"{url} HTTP fail (no response after retries)"); return {}
+        if not r.ok: _log_http_issue(f"POST {url}", r); return {}
+        if r.headers.get("content-type","").startswith("application/json"):
             return r.json()
         _tlog(f"POST {url} unexpected content-type: {r.headers.get('content-type','')[:60]}")
         return {}
@@ -281,54 +234,46 @@ def _signed_post(url, body):
 
 def _keepalive_ping():
     try:
-        if not APP_BASE_URL:
-            return
-        url = f"{APP_BASE_URL}/ping"
-        headers = {}
-        if KEEPALIVE_TOKEN:
-            url = f"{url}?t={KEEPALIVE_TOKEN}"
-            headers["X-Keepalive-Token"] = KEEPALIVE_TOKEN
-        SESSION.get(url, headers=headers, timeout=5)
-    except Exception:
-        pass
+        if APP_BASE_URL:
+            url = f"{APP_BASE_URL}/ping"
+            headers = {}
+            if KEEPALIVE_TOKEN:
+                url = f"{url}?t={KEEPALIVE_TOKEN}"
+                headers["X-Keepalive-Token"] = KEEPALIVE_TOKEN
+            SESSION.get(url, headers=headers, timeout=5)
+    except Exception: pass
 
 # -------------------- Exchange helpers --------------------
-def fetch_pair_precisions():
-    try:
-        r = _http_get_with_retry(f"{BASE_URL}/exchange/v1/markets_details", timeout=12, retries=3)
-        if not r or not r.ok:
-            if r:
-                _log_http_issue("markets_details", r)
-            return
-        data = r.json()
-        by_pair = {}
-        for item in data:
-            p = item.get("pair") or item.get("market") or item.get("coindcx_name")
-            if not p:
-                continue
-            by_pair[p] = {
-                "price_precision": int(item.get("target_currency_precision", 6)),
-                "qty_precision":   int(item.get("base_currency_precision", 6)),
-                "min_qty":         float(item.get("min_quantity", 0.0) or 0.0),
-                "min_notional":    float(item.get("min_notional", 0.0) or 0.0)
-            }
-        for p in PAIRS:
-            if p in by_pair:
-                PAIR_RULES[p] = by_pair[p]
-        scan_log.append(f"{ist_now()} | market rules refreshed")
-    except Exception as e:
-        scan_log.append(f"{ist_now()} | markets_details fail: {e}")
+def refresh_markets_and_pairs():
+    """
+    Refresh PAIR_RULES and ALL_USDT_PAIRS from markets_details.
+    """
+    global PAIR_RULES, ALL_USDT_PAIRS
+    r = _http_get_with_retry(f"{BASE_URL}/exchange/v1/markets_details", timeout=15, retries=3)
+    if not r or not r.ok:
+        if r: _log_http_issue("markets_details", r)
+        return
+    data = r.json()
+    rules = {}
+    usdt_pairs = []
+    for item in data:
+        p = item.get("pair") or item.get("market") or item.get("coindcx_name")
+        if not p: continue
+        tprec = int(item.get("target_currency_precision", 6))
+        bprec = int(item.get("base_currency_precision", 6))
+        minq  = float(item.get("min_quantity", 0.0) or 0.0)
+        minnot= float(item.get("min_notional", 0.0) or 0.0)
+        rules[p] = {"price_precision": tprec, "qty_precision": bprec, "min_qty": minq, "min_notional": minnot}
+        if p.endswith("USDT"):
+            usdt_pairs.append(p)
+    PAIR_RULES = rules
+    ALL_USDT_PAIRS = sorted(usdt_pairs)
+    scan_log.append(f"{ist_now()} | market rules refreshed | USDT pairs={len(ALL_USDT_PAIRS)}")
 
 def get_wallet_balances():
-    """
-    Cached balances with TTL. On failure, returns last known cache.
-    """
     global _bal_cache, _bal_cache_ts
     now = time.time()
-
-    if _bal_cache and (now - _bal_cache_ts) < BAL_TTL_SEC:
-        return dict(_bal_cache)
-
+    if _bal_cache and (now - _bal_cache_ts) < BAL_TTL_SEC: return dict(_bal_cache)
     payload = json.dumps({"timestamp": int(now * 1000)})
     sig = hmac_signature(payload)
     headers = {"X-AUTH-APIKEY": API_KEY or "", "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
@@ -336,39 +281,39 @@ def get_wallet_balances():
     try:
         r = _http_post_with_retry(f"{BASE_URL}/exchange/v1/users/balances", headers, payload, timeout=10, retries=3)
         if r and r.ok:
-            data = r.json()
-            for b in data:
+            for b in r.json():
                 balances[b['currency']] = float(b['balance'])
-            _bal_cache = balances
-            _bal_cache_ts = now
+            _bal_cache, _bal_cache_ts = balances, now
             return balances
         else:
-            if r is not None:
-                _log_http_issue("balances", r)
+            if r: _log_http_issue("balances", r)
     except Exception as e:
         scan_log.append(f"{ist_now()} | balances fail: {e}")
+    return dict(_bal_cache) if _bal_cache else {}
 
-    if _bal_cache:
-        age = int(now - _bal_cache_ts)
-        _tlog(f"balances degraded: serving cached (age={age}s)")
-        return dict(_bal_cache)
-
-    _tlog("balances unavailable (no cache)")
-    return {}
-
-def balances_age_sec():
-    return int(time.time() - _bal_cache_ts) if _bal_cache_ts else None
+def balances_age_sec(): return int(time.time() - _bal_cache_ts) if _bal_cache_ts else None
 
 def fetch_all_prices():
+    """
+    Pull all tickers and keep USDT pairs (cap to MAX_MONITORED_PAIRS for runtime sanity).
+    """
     try:
         r = _http_get_with_retry(f"{BASE_URL}/exchange/ticker", timeout=10, retries=3)
         if r and r.ok:
             now = int(time.time())
-            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
-                    for item in r.json() if item.get("market") in PAIRS}
+            items = r.json()
+            ret = {}
+            count = 0
+            for it in items:
+                m = it.get("market")
+                if not m or not m.endswith("USDT"): continue
+                if m not in PAIR_RULES: continue  # only markets we have rules for
+                ret[m] = {"price": float(it["last_price"]), "ts": now}
+                count += 1
+                if count >= MAX_MONITORED_PAIRS: break
+            return ret
         else:
-            if r:
-                _log_http_issue("ticker", r)
+            if r: _log_http_issue("ticker", r)
     except Exception as e:
         scan_log.append(f"{ist_now()} | ticker fail: {e}")
     return {}
@@ -387,22 +332,14 @@ def fmt_qty(pair, qty):
     mq = _min_qty(pair)
     q = max(float(qty), mq)
     q = float(f"{q:.{qp}f}")
-    if q < mq:
-        q = float(f"{mq:.{qp}f}")
+    if q < mq: q = float(f"{mq:.{qp}f}")
     return q
 
-def _qty_step(pair):
-    return 10 ** (-_qty_prec(pair))
-
-def _fee_multiplier(side):
-    return 1.0 + FEE_PCT_PER_SIDE if side.upper() == "BUY" else 1.0 - FEE_PCT_PER_SIDE
+def _qty_step(pair): return 10 ** (-_qty_prec(pair))
+def _fee_multiplier(side): return 1.0 + FEE_PCT_PER_SIDE if side.upper()=="BUY" else 1.0 - FEE_PCT_PER_SIDE
 
 def normalize_qty_for_buy(pair, price, usdt_avail):
-    """
-    Turn a USDT notional into a precision/min-qty safe quantity that fits fees.
-    """
-    if price <= 0:
-        return 0.0
+    if price <= 0: return 0.0
     denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
     q = usdt_avail / denom
     q = fmt_qty(pair, q)
@@ -412,20 +349,30 @@ def normalize_qty_for_buy(pair, price, usdt_avail):
     if q < _min_qty(pair): return 0.0
     return q
 
+# -------------------- Order helpers (paper/live) --------------------
 def place_market(pair, side, qty):
-    payload = {
-        "market": pair,
-        "side": side.lower(),
-        "order_type": "market_order",
-        "total_quantity": f"{fmt_qty(pair, qty)}",
-        "timestamp": int(time.time() * 1000)
-    }
+    qty = fmt_qty(pair, qty)
+    if PAPER_TRADE:
+        px = candle_logs.get(pair, [])[-1]["close"] if candle_logs.get(pair) else 0.0
+        _tlog(f"{pair} | PAPER SUBMIT {side} qty={qty} @ MKT (px≈{px})")
+        fake_id = f"paper-{int(time.time()*1000)}"
+        res = {"id": fake_id, "status": "accepted", "side": side.lower(), "qty": qty}
+        _tlog(f"{pair} | PAPER SUBMIT RESP {side} => {res}")
+        return res
+    payload = {"market": pair, "side": side.lower(), "order_type": "market_order",
+               "total_quantity": f"{qty}", "timestamp": int(time.time() * 1000)}
     _tlog(f"{pair} | SUBMIT {side} qty={payload['total_quantity']} @ MKT")
     res = _signed_post(f"{BASE_URL}/exchange/v1/orders/create", payload) or {}
     _tlog(f"{pair} | SUBMIT RESP {side} => {res}")
     return res
 
 def get_order_status(order_id=None, client_order_id=None):
+    if PAPER_TRADE and order_id and str(order_id).startswith("paper-"):
+        px = 0.0
+        # best-effort last price among any candles
+        for cs in candle_logs.values():
+            if cs: px = cs[-1]["close"]; break
+        return {"total_quantity": 0.0, "remaining_quantity": 0.0, "executed_quantity": 0.0, "avg_price": px}
     body = {"timestamp": int(time.time() * 1000)}
     if order_id: body["id"] = order_id
     if client_order_id: body["client_order_id"] = client_order_id
@@ -433,23 +380,18 @@ def get_order_status(order_id=None, client_order_id=None):
     return res if isinstance(res, dict) else {}
 
 def _extract_order_id(res: dict):
-    if not isinstance(res, dict):
-        return None
-    for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
-        if res.get(k):
-            return str(res[k])
+    if not isinstance(res, dict): return None
+    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+        if res.get(k): return str(res[k])
     try:
         if isinstance(res.get("orders"), list) and res["orders"]:
             o = res["orders"][0]
-            for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
-                if o.get(k):
-                    return str(o[k])
-    except:
-        pass
+            for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+                if o.get(k): return str(o[k])
+    except: pass
     d = res.get("data") or {}
-    for k in ("id", "order_id", "orderId", "client_order_id", "clientOrderId"):
-        if d.get(k):
-            return str(d[k])
+    for k in ("id","order_id","orderId","client_order_id","clientOrderId"):
+        if d.get(k): return str(d[k])
     return None
 
 def _filled_avg_from_status(st):
@@ -458,320 +400,386 @@ def _filled_avg_from_status(st):
         remain_q = float(st.get("remaining_quantity", st.get("remaining_qty", 0)))
         exec_q   = float(st.get("executed_quantity", st.get("filled_qty", 0)))
         filled   = exec_q if exec_q > 0 else max(0.0, total_q - remain_q)
-        avg_px   = float(st.get("avg_price", st.get("average_price",
-                            st.get("avg_execution_price", st.get("price", 0)))))
+        avg_px   = float(st.get("avg_price", st.get("average_price", st.get("avg_execution_price", st.get("price", 0)))))
         return filled, avg_px
-    except:
-        return 0.0, 0.0
+    except: return 0.0, 0.0
 
-# -------------------- Candle & indicators --------------------
+# -------------------- Indicators --------------------
 def aggregate_candles(pair, interval=CANDLE_INTERVAL):
     ticks = tick_logs[pair]
-    if not ticks:
-        return
+    if not ticks: return
     candles, candle, last_window = [], None, None
     for ts, price in sorted(ticks, key=lambda x: x[0]):
         wstart = ts - (ts % interval)
         if last_window != wstart:
-            if candle:
-                candles.append(candle)
+            if candle: candles.append(candle)
             candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
             last_window = wstart
         else:
             candle["high"] = max(candle["high"], price)
-            candle["low"] = min(candle["low"], price)
-            candle["close"] = price
+            candle["low"]  = min(candle["low"],  price)
+            candle["close"]= price
             candle["volume"] += 1
-    if candle:
-        candles.append(candle)
-    candle_logs[pair] = candles[-300:]  # ~25 minutes of 5s bars
+    if candle: candles.append(candle)
+    candle_logs[pair] = candles[-300:]  # ~25 min
 
 def _ema_series(vals, n):
-    if len(vals) == 0:
-        return []
-    k = 2 / (n + 1)
-    ema_vals = []
-    ema = vals[0]
+    if len(vals) == 0: return []
+    k = 2/(n+1); ema_vals=[]; ema = vals[0]
     for v in vals:
-        ema = v * k + ema * (1 - k)
+        ema = v*k + ema*(1-k)
         ema_vals.append(ema)
     return ema_vals
 
 def _macd_series(closes):
-    MACD_FAST = 12
-    MACD_SLOW = 26
-    MACD_SIGNAL = 9
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
-        return [], [], []
+    MACD_FAST=12; MACD_SLOW=26; MACD_SIGNAL=9
+    if len(closes) < MACD_SLOW + MACD_SIGNAL: return [],[],[]
     ema_fast = _ema_series(closes, MACD_FAST)
     ema_slow = _ema_series(closes, MACD_SLOW)
-    macd = [f - s for f, s in zip(ema_fast, ema_slow)]
+    macd = [f-s for f,s in zip(ema_fast, ema_slow)]
     signal = _ema_series(macd, MACD_SIGNAL)
-    hist = [m - s for m, s in zip(macd[-len(signal):], signal)]
-    macd_al = macd[-len(signal):]
-    return macd_al, signal, hist
+    hist = [m - s for m,s in zip(macd[-len(signal):], signal)]
+    return macd[-len(signal):], signal, hist
 
-def _swing_highs(vals, look=5):
-    idx = []
-    for i in range(look, len(vals)-look):
-        if all(vals[i] >= vals[i-k] for k in range(1, look+1)) and all(vals[i] >= vals[i+k] for k in range(1, look+1)):
-            idx.append(i)
-    return idx
-
-def _swing_lows(vals, look=5):
-    idx = []
-    for i in range(look, len(vals)-look):
-        if all(vals[i] <= vals[i-k] for k in range(1, look+1)) and all(vals[i] <= vals[i+k] for k in range(1, look+1)):
-            idx.append(i)
-    return idx
-
-def _macd_convergence_divergence(closes, macd_line):
-    if len(closes) < 30 or len(macd_line) < 30:
-        return "insufficient"
-    N = 20
-    p_seg = closes[-N:]
-    m_seg = macd_line[-N:]
-    p_slope = p_seg[-1] - p_seg[0]
-    m_slope = m_seg[-1] - m_seg[0]
-    slope_note = f"slope price={'↑' if p_slope>0 else '↓' if p_slope<0 else '→'}, macd={'↑' if m_slope>0 else '↓' if m_slope<0 else '→'}"
-    look = 3
-    ph = _swing_highs(closes, look); mh = _swing_highs(macd_line, look)
-    pl = _swing_lows(closes, look);  ml = _swing_lows(macd_line, look)
-    bear_div = bull_div = False
-    if len(ph) >= 2 and len(mh) >= 2:
-        p1, p2 = closes[ph[-2]], closes[ph[-1]]
-        m1, m2 = macd_line[mh[-2]], macd_line[mh[-1]]
-        if p2 > p1 and m2 <= m1: bear_div = True
-    if len(pl) >= 2 and len(ml) >= 2:
-        p1, p2 = closes[pl[-2]], closes[pl[-1]]
-        m1, m2 = macd_line[ml[-2]], macd_line[ml[-1]]
-        if p2 < p1 and m2 >= m1: bull_div = True
-    if bear_div: return f"Bearish divergence ({slope_note})"
-    if bull_div: return f"Bullish divergence ({slope_note})"
-    agree = (p_slope >= 0 and m_slope >= 0) or (p_slope <= 0 and m_slope <= 0)
-    return f"Convergence ({'agree' if agree else 'mixed'}; {slope_note})"
-
-# ---- ATR, breakout, risk sizing helpers ----
-def _atr_from_candles(cs, n=ATR_N):
-    """Wilder-style ATR approx on 5s candles."""
-    if len(cs) < n + 2:
-        return 0.0
-    trs = []
-    prev_close = cs[-(n+1)]["close"]
+# -------------------- Dynamic allocator helpers --------------------
+def _atr_from_candles(cs, n):
+    if len(cs) < n + 2: return 0.0
+    trs=[]; prev_close = cs[-(n+1)]["close"]
     for c in cs[-n:]:
-        high, low, close = c["high"], c["low"], c["close"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-        prev_close = close
-    # simple EMA of TR for speed
-    k = 2 / (n + 1)
-    atr = trs[0]
-    for tr in trs:
-        atr = tr * k + atr * (1 - k)
+        high,low,close = c["high"], c["low"], c["close"]
+        tr = max(high-low, abs(high-prev_close), abs(low-prev_close))
+        trs.append(tr); prev_close = close
+    k = 2/(n+1); atr = trs[0]
+    for tr in trs: atr = tr*k + atr*(1-k)
     return float(atr)
 
-def _recent_hl(cs, lb=BRK_LOOKBACK):
-    if len(cs) < lb:
-        return None, None
-    highs = [c["high"] for c in cs[-lb:]]
-    lows  = [c["low"]  for c in cs[-lb:]]
+def _recent_hl(cs, lb):
+    if len(cs) < lb: return None, None
+    highs=[c["high"] for c in cs[-lb:]]; lows=[c["low"] for c in cs[-lb:]]
     return max(highs), min(lows)
 
-def _size_by_risk(usdt_free, price, atr):
-    """
-    Risk per trade = RISK_PER_TRADE * usdt_free.
-    Stop distance = ATR_SL_MULT * atr  -> qty_risk = risk / stop_distance.
-    Clamp by BUY_FRACTION_USDT notional cap.
-    """
-    if atr <= 0 or price <= 0:
-        return 0.0
+def _size_by_risk(usdt_free, price, atr, risk_per_trade, min_notional_cap=True):
+    if atr<=0 or price<=0: return 0.0
     stop_dist = ATR_SL_MULT * atr
-    if stop_dist <= 0:
-        return 0.0
-    risk_amt = max(0.0, RISK_PER_TRADE * usdt_free)
-    if risk_amt <= 0:
-        return 0.0
-    qty_risk = risk_amt / stop_dist                 # quantity in coins
-    notional_cap = BUY_FRACTION_USDT * usdt_free
-    qty_cap = (notional_cap / price) if notional_cap > 0 else qty_risk
-    qty = min(qty_risk, qty_cap)
-    return max(0.0, qty)
+    if stop_dist <= 0: return 0.0
+    risk_amt = max(0.0, risk_per_trade * usdt_free)
+    if risk_amt <= 0: return 0.0
+    qty_risk = risk_amt / stop_dist
+    notional_cap = BUY_FRACTION_USDT * usdt_free if min_notional_cap else float("inf")
+    qty_cap = (notional_cap / price) if notional_cap>0 else qty_risk
+    return max(0.0, min(qty_risk, qty_cap))
 
 def _pnl_after_fees(entry, exit_px, qty):
     buy_cost  = entry * (1 + FEE_PCT_PER_SIDE) * qty
     sell_recv = exit_px * (1 - FEE_PCT_PER_SIDE) * qty
     return sell_recv - buy_cost
 
-# -------------------- Strategy core --------------------
+def apply_profile():
+    global BRK_LOOKBACK, MIN_ATR_PCT, ATR_SL_MULT, ATR_TP_MULT, RISK_PER_TRADE, MAX_CONCURRENT_POS
+    p = STRATEGY_PROFILES.get(STRATEGY_MODE, STRATEGY_PROFILES["balanced"])
+    BRK_LOOKBACK   = p["BRK_LOOKBACK"]
+    MIN_ATR_PCT    = p["MIN_ATR_PCT"]
+    ATR_SL_MULT    = p["ATR_SL_MULT"]
+    ATR_TP_MULT    = p["ATR_TP_MULT"]
+    RISK_PER_TRADE = p["RISK_PER_TRADE"]
+    MAX_CONCURRENT_POS = p.get("MAX_CONCURRENT_POS", 1)
+    scan_log.append(f"{ist_now()} | STRATEGY mode applied: {STRATEGY_MODE} => {p}")
+
+def fee_aware_tp(entry, atr):
+    """
+    Target price that covers both-side fees + desired ATR multiple.
+    """
+    gross_target = entry + ATR_TP_MULT * atr
+    fee_buffer   = entry * (2 * FEE_PCT_PER_SIDE + 0.0001)  # small extra buffer
+    return gross_target + fee_buffer
+
+# --- Capital allocator primitives ---
+def liquidate_all_non_usdt(reason="boot"):
+    bal = get_wallet_balances()
+    for cur, amt in bal.items():
+        if cur == "USDT" or amt <= 0: continue
+        pair = f"{cur}USDT"
+        if pair not in PAIR_RULES: continue
+        q = fmt_qty(pair, amt)
+        _tlog(f"{pair} | FORCE-LIQ {reason} | SELL {q} @ MKT")
+        res = place_market(pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            st = get_order_status(order_id=oid)
+            filled, px = _filled_avg_from_status(st)
+            _tlog(f"{pair} | FORCE-LIQ status oid={oid} filled={filled} px={px}")
+        else:
+            _tlog(f"{pair} | FORCE-LIQ failed (no oid) | res={res}")
+
+def ensure_usdt_liquidity(usdt_needed):
+    bal = get_wallet_balances()
+    have = float(bal.get("USDT", 0.0))
+    if have >= usdt_needed: return True
+    short = usdt_needed - have
+    if not FORCE_LIQUIDATE_ON_NEED:
+        scan_log.append(f"{ist_now()} | LIQUIDITY short={short} but FORCE_LIQUIDATE_ON_NEED=False")
+        return False
+
+    # 1) Close open positions first (free capital fastest)
+    for pair, pos in list(positions.items()):
+        q = pos["qty"]
+        _tlog(f"{pair} | LIQUIDITY-EXIT to free USDT | SELL {q} @ MKT")
+        res = place_market(pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            st = get_order_status(order_id=oid)
+            filled, px = _filled_avg_from_status(st)
+            pnl = _pnl_after_fees(pos["entry"], px, min(filled, q))
+            record_realized_pnl(pnl)
+            _tlog(f"{pair} | LIQUIDITY-EXIT filled={filled} px={px} pnl={round(pnl,6)}")
+            positions.pop(pair, None)
+            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+            if have >= usdt_needed: return True
+
+    # 2) Sell any non-USDT balances
+    bal = get_wallet_balances()
+    for cur, amt in bal.items():
+        if cur == "USDT" or amt <= 0: continue
+        pair = f"{cur}USDT"
+        if pair not in PAIR_RULES: continue
+        q = fmt_qty(pair, amt)
+        _tlog(f"{pair} | LIQUIDITY-SELL wallet | SELL {q} @ MKT")
+        res = place_market(pair, "SELL", q)
+        oid = _extract_order_id(res)
+        if oid:
+            st = get_order_status(order_id=oid)
+            filled, px = _filled_avg_from_status(st)
+            _tlog(f"{pair} | LIQUIDITY-SELL status oid={oid} filled={filled} px={px}")
+            bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+            if have >= usdt_needed: return True
+
+    bal = get_wallet_balances(); have = float(bal.get("USDT",0.0))
+    scan_log.append(f"{ist_now()} | LIQUIDITY still short={max(0.0, usdt_needed-have)} after liquidation attempts")
+    return have >= usdt_needed
+
+# -------------------- Scoring (pick-the-best) --------------------
+def score_pair(pair, cs):
+    """
+    Return a tuple (score, details_dict) for ranking.
+    """
+    if len(cs) < max(36, BRK_LOOKBACK) + 3: return -1e9, {"reason": "insufficient_candles"}
+    closes = [c["close"] for c in cs]
+    last = closes[-1]
+    ema_htf = _ema_series(closes, 12)[-1] if len(closes)>=12 else last
+    macd_line, macd_signal, _ = _macd_series(closes)
+    if not macd_line or not macd_signal: return -1e9, {"reason":"no_macd"}
+    m_now, s_now = macd_line[-1], macd_signal[-1]
+    atr = _atr_from_candles(cs, 36)
+    atr_pct = (atr/last) if last>0 else 0.0
+    hi, lo = _recent_hl(cs, BRK_LOOKBACK)
+
+    # Gates
+    volatility_ok = atr_pct >= MIN_ATR_PCT
+    trend_ok      = last > ema_htf
+    momentum_ok   = m_now > s_now
+    breakout_up   = (hi is not None) and (last > hi)
+
+    # Score components
+    #  - prioritize volatility (atr_pct), breakout distance over ATR, momentum delta, and distance above EMA
+    breakout_mag = ((last - (hi or last)) / (atr if atr>0 else 1e-9))
+    ema_premium  = (last - ema_htf) / (atr if atr>0 else 1e-9)
+    mom_delta    = (m_now - s_now) / (abs(s_now)+1e-9)
+
+    # Raw score
+    score = 100*atr_pct + 50*breakout_mag + 20*mom_delta + 10*ema_premium
+
+    details = {
+        "last": last, "ema": ema_htf, "macd": m_now, "sig": s_now,
+        "atr": atr, "atr_pct": atr_pct, "hi": hi, "lo": lo,
+        "gates": {"volatility_ok": volatility_ok, "trend_ok": trend_ok,
+                  "momentum_ok": momentum_ok, "breakout_up": breakout_up},
+        "components": {"atr_pct": atr_pct, "breakout_mag": breakout_mag,
+                       "mom_delta": mom_delta, "ema_premium": ema_premium},
+    }
+
+    # If any gate fails, demote score heavily but keep comparable ordering
+    if not (volatility_ok and trend_ok and momentum_ok and breakout_up):
+        score -= 1e6
+    return score, details
+
+# -------------------- Strategy core (dynamic allocator) --------------------
 def strategy_scan():
     prices = fetch_all_prices()
     now_ts = int(time.time())
 
-    # build ticks and candles
-    for pair in PAIRS:
-        if pair in prices:
-            px = prices[pair]["price"]
-            tick_logs[pair].append((now_ts, px))
-            if len(tick_logs[pair]) > 6000:
-                tick_logs[pair] = tick_logs[pair][-6000:]
-            aggregate_candles(pair, CANDLE_INTERVAL)
+    # Build ticks/candles for all seen pairs
+    for pair, obj in prices.items():
+        px = obj["price"]
+        tick_logs[pair].append((now_ts, px))
+        if len(tick_logs[pair]) > 6000:
+            tick_logs[pair] = tick_logs[pair][-6000:]
+        aggregate_candles(pair, CANDLE_INTERVAL)
 
     balances = get_wallet_balances()
-    usdt_free = balances.get("USDT", 0.0)
+    usdt_free = float(balances.get("USDT", 0.0))
     bal_age = balances_age_sec()
     buys_allowed = (bal_age is not None and bal_age <= BAL_TTL_SEC * 3)
-    if not buys_allowed:
+    if IGNORE_BAL_AGE:
+        buys_allowed = True
+        scan_log.append(f"{ist_now()} | OVERRIDE: ignore_balance_age=True (age={bal_age}s)")
+    elif not buys_allowed:
         scan_log.append(f"{ist_now()} | NOTE: buys paused (balances stale age={bal_age}s)")
 
-    # throttle concurrent positions
+    # Risk brake — stop opening if daily drawdown too deep relative to wallet USDT
+    usdt_basis = balances.get("USDT", 0.0) or 1.0
+    if compute_realized_pnl_today() <= DAILY_DD_STOP * usdt_basis:
+        buys_allowed = False
+        scan_log.append(f"{ist_now()} | DAILY DD STOP | buys blocked today")
+
+    # ---- SCORE ALL ----
+    best_pair = None; best_score = -1e12; best_det = None
+    for pair, cs in candle_logs.items():
+        if not cs: continue
+        score, det = score_pair(pair, cs)
+        # brief per-pair scan line (compact)
+        scan_log.append(
+            f"{ist_now()} | {pair} | score={round(score,3)} | "
+            f"Px={det.get('last')} ATR%={round(100*det.get('atr_pct',0),3)} "
+            f"Gates v={det['gates']['volatility_ok']} t={det['gates']['trend_ok']} "
+            f"m={det['gates']['momentum_ok']} brk={det['gates']['breakout_up']}"
+        )
+        if score > best_score:
+            best_score, best_pair, best_det = score, pair, det
+
+    # ---- ENTRY DECISION (global allocator) ----
     open_count = sum(1 for v in positions.values() if v.get("qty", 0.0) > 0)
     can_open_more = open_count < MAX_CONCURRENT_POS
 
-    for pair in PAIRS:
-        cs = candle_logs.get(pair) or []
-        if len(cs) < max(HTF_EMA_LEN, ATR_N, BRK_LOOKBACK) + 3:
-            continue
+    if best_pair and can_open_more and buys_allowed:
+        cs = candle_logs.get(best_pair) or []
+        last = best_det["last"]; atr = best_det["atr"]; atr_pct = best_det["atr_pct"]
+        gates = best_det["gates"]
+        have_pos = best_pair in positions and positions[best_pair].get("qty", 0.0) > 0.0
+        cooled = now_ts >= int(cooldown_until.get(best_pair, 0))
 
-        closes = [c["close"] for c in cs]
-        last   = closes[-1]
-        high_b, low_b = _recent_hl(cs, BRK_LOOKBACK)
-        atr    = _atr_from_candles(cs, ATR_N)
-        atr_pct = (atr / last) if last > 0 else 0.0
-
-        # trend & momentum filters
-        ema_htf = _ema_series(closes, HTF_EMA_LEN)[-1] if len(closes) >= HTF_EMA_LEN else last
-        macd_line, macd_signal, _ = _macd_series(closes)
-        if not macd_line or not macd_signal:
-            continue
-        m_now, s_now = macd_line[-1], macd_signal[-1]
-
-        # log snapshot for transparency
+        # Log the selection summary
         scan_log.append(
-            f"{ist_now()} | {pair} | last={last} ATR={round(atr,6)} ({round(100*atr_pct,3)}%) "
-            f"| EMA{HTF_EMA_LEN}={round(ema_htf,6)} | MACD={round(m_now,6)} SIG={round(s_now,6)} "
-            f"| HL[{BRK_LOOKBACK}] hi={high_b} lo={low_b}"
+            f"{ist_now()} | SELECT {best_pair} | best_score={round(best_score,3)} | "
+            f"Px={last} ATR%={round(100*atr_pct,3)} | Gates={gates} | have_pos={have_pos} cooled={cooled}"
         )
 
-        # ENTRY (LONG)
-        have_pos = pair in positions and positions[pair].get("qty", 0.0) > 0.0
-        cooled   = now_ts >= int(cooldown_until.get(pair, 0))
-        breakout_up   = (high_b is not None) and (last > high_b)
-        volatility_ok = atr_pct >= MIN_ATR_PCT
-        trend_ok      = last > ema_htf
-        momentum_ok   = m_now > s_now
-
-        if (not have_pos) and cooled and buys_allowed and can_open_more and breakout_up and volatility_ok and trend_ok and momentum_ok:
-            # risk-based size -> quantity; normalize via notional for fees/precision
-            raw_qty = _size_by_risk(usdt_free, last, atr)
+        if (not have_pos) and cooled and gates["volatility_ok"] and gates["trend_ok"] and gates["momentum_ok"] and gates["breakout_up"]:
+            # risk-based size, fee-aware, and ensure liquidity
+            raw_qty = _size_by_risk(usdt_free, last, atr, RISK_PER_TRADE)
             target_notional = raw_qty * last
-            qty = normalize_qty_for_buy(pair, last, target_notional)
-            scan_log.append(f"{ist_now()} | {pair} | ENTRY-CALC raw_qty={raw_qty} norm_qty={qty} usdt_free={usdt_free}")
-            if qty > 0:
-                res = place_market(pair, "BUY", qty)
-                oid = _extract_order_id(res)
-                if oid:
-                    st = get_order_status(order_id=oid)
-                    filled, avg_px = _filled_avg_from_status(st)
-                    if filled > 0 and avg_px > 0:
-                        stop = max(0.0, avg_px - ATR_SL_MULT * atr)
-                        positions[pair] = {
-                            "qty": filled, "entry": avg_px, "ts": now_ts,
-                            "stop": stop, "trail": stop, "highest": avg_px, "atr": atr
-                        }
-                        trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg_px} | stop={round(stop,6)} | oid={oid}")
-                        open_count += 1
-                        can_open_more = open_count < MAX_CONCURRENT_POS
+            min_needed = max(target_notional, _rules(best_pair).get("min_notional", 0.0))
+            scan_log.append(f"{ist_now()} | {best_pair} | ENTRY-CALC usdt_free={usdt_free} raw_qty={raw_qty} notional={target_notional} min_need={min_needed}")
+
+            if ensure_usdt_liquidity(min_needed):
+                # recompute after freeing funds
+                balances = get_wallet_balances()
+                usdt_free = float(balances.get("USDT", 0.0))
+                raw_qty = _size_by_risk(usdt_free, last, atr, RISK_PER_TRADE)
+                target_notional = raw_qty * last
+                qty = normalize_qty_for_buy(best_pair, last, target_notional)
+                scan_log.append(f"{ist_now()} | {best_pair} | ENTRY-NORM qty={qty} usdt_free={usdt_free}")
+
+                if qty > 0:
+                    res = place_market(best_pair, "BUY", qty)
+                    oid = _extract_order_id(res)
+                    if oid:
+                        st = get_order_status(order_id=oid)
+                        filled, avg_px = _filled_avg_from_status(st)
+                        if filled > 0 and avg_px > 0:
+                            stop = max(0.0, avg_px - ATR_SL_MULT * atr)
+                            tprice = fee_aware_tp(avg_px, atr)  # fee-aware TP
+                            positions[best_pair] = {
+                                "qty": filled, "entry": avg_px, "ts": now_ts,
+                                "stop": stop, "trail": stop, "highest": avg_px, "atr": atr, "tp": tprice
+                            }
+                            trade_log.append(f"{ist_now()} | {best_pair} | BUY {filled} @ {avg_px} | stop={round(stop,6)} tp={round(tprice,6)} | oid={oid}")
+                            open_count += 1; can_open_more = open_count < MAX_CONCURRENT_POS
+                        else:
+                            scan_log.append(f"{ist_now()} | {best_pair} | BUY no fill | oid={oid}")
+                            cooldown_until[best_pair] = now_ts + 20
                     else:
-                        scan_log.append(f"{ist_now()} | {pair} | BUY no fill | oid={oid}")
-                        cooldown_until[pair] = now_ts + COOLDOWN_SEC
+                        scan_log.append(f"{ist_now()} | {best_pair} | BUY failed (no oid) | res={res}")
+                        cooldown_until[best_pair] = now_ts + 20
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | BUY failed (no oid) | res={res}")
-                    cooldown_until[pair] = now_ts + COOLDOWN_SEC
+                    scan_log.append(f"{ist_now()} | {best_pair} | BUY qty=0 (risk/min-qty/fees)")
             else:
-                scan_log.append(f"{ist_now()} | {pair} | BUY qty=0 (risk/min-qty/fees)")
-            continue  # after buy attempt, skip exit branch this tick
+                scan_log.append(f"{ist_now()} | {best_pair} | ENTRY aborted: could not free liquidity")
+        # else: gates not met or cooling — just skip
+    # else: nothing eligible or capacity filled
 
-        # EXIT / MANAGEMENT
-        if have_pos:
-            p = positions[pair]
-            qty   = p["qty"]
-            entry = p["entry"]
-            atr_p = p.get("atr", atr) or atr
+    # ---- EXIT / MANAGEMENT for all open positions ----
+    for pair, p in list(positions.items()):
+        cs = candle_logs.get(pair) or []
+        if not cs: continue
+        closes = [c["close"] for c in cs]
+        last = closes[-1]
+        atr_p = p.get("atr", _atr_from_candles(cs, 36))
+        # trailing update
+        p["highest"] = max(p.get("highest", p["entry"]), last)
+        new_trail = p["highest"] - ATR_SL_MULT * atr_p
+        if new_trail > p.get("trail", p["stop"]):
+            p["trail"] = new_trail
+        active_stop = max(p.get("stop", p["entry"] - ATR_SL_MULT*atr_p), p.get("trail", 0.0))
+        # fee-aware take profit
+        tp_price = p.get("tp", fee_aware_tp(p["entry"], atr_p))
+        take_profit = last >= tp_price
+        hard_stop   = last <= active_stop
 
-            # trailing update
-            p["highest"] = max(p.get("highest", entry), last)
-            new_trail = p["highest"] - TRAIL_MULT * atr_p
-            if new_trail > p.get("trail", p["stop"]):
-                p["trail"] = new_trail
-            active_stop = max(p.get("stop", entry - ATR_SL_MULT*atr_p), p.get("trail", 0.0))
+        # momentum give-up (secondary)
+        ema_htf = _ema_series(closes, 12)[-1] if len(closes)>=12 else last
+        macd_line, macd_signal, _ = _macd_series(closes)
+        give_up = False
+        if macd_line and macd_signal:
+            give_up = (macd_line[-1] < macd_signal[-1]) and (last < ema_htf)
 
-            take_profit = last >= entry + ATR_TP_MULT * atr_p
-            hard_stop   = last <= active_stop
-            give_up     = (m_now < s_now) and (last < ema_htf)  # momentum loss + below trend
+        scan_log.append(
+            f"{ist_now()} | {pair} | MANAGE entry={p['entry']} last={last} stop={round(active_stop,6)} "
+            f"tp={round(tp_price,6)} | TP={take_profit} SL={hard_stop} giveup={give_up}"
+        )
 
-            scan_log.append(
-                f"{ist_now()} | {pair} | MANAGE entry={entry} last={last} "
-                f"stop={round(active_stop,6)} tp@{round(entry + ATR_TP_MULT*atr_p,6)} "
-                f"| TP={take_profit} SL={hard_stop} giveup={give_up}"
-            )
-
-            if hard_stop or take_profit or give_up:
-                res = place_market(pair, "SELL", qty)
-                oid = _extract_order_id(res)
-                if oid:
-                    st = get_order_status(order_id=oid)
-                    filled, avg_px = _filled_avg_from_status(st)
-                    if filled > 0 and avg_px > 0:
-                        pnl = _pnl_after_fees(entry, avg_px, min(filled, qty))
-                        record_realized_pnl(pnl)
-                        trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
-                        positions.pop(pair, None)
-                        cooldown_until[pair] = now_ts + COOLDOWN_SEC
-                        open_count -= 1
-                        can_open_more = open_count < MAX_CONCURRENT_POS
-                    else:
-                        scan_log.append(f"{ist_now()} | {pair} | SELL no fill | oid={oid}")
+        if hard_stop or take_profit or give_up:
+            q = p["qty"]
+            res = place_market(pair, "SELL", q)
+            oid = _extract_order_id(res)
+            if oid:
+                st = get_order_status(order_id=oid)
+                filled, avg_px = _filled_avg_from_status(st)
+                if filled > 0 and avg_px > 0:
+                    pnl = _pnl_after_fees(p["entry"], avg_px, min(filled, q))
+                    record_realized_pnl(pnl)
+                    trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
+                    positions.pop(pair, None)
+                    cooldown_until[pair] = int(time.time()) + 30
                 else:
-                    scan_log.append(f"{ist_now()} | {pair} | SELL failed (no oid) | res={res}")
+                    scan_log.append(f"{ist_now()} | {pair} | SELL no fill | oid={oid}")
+            else:
+                scan_log.append(f"{ist_now()} | {pair} | SELL failed (no oid) | res={res}")
 
 # -------------------- Main loop --------------------
 _autostart_lock = threading.Lock()
 
 def scan_loop():
     global running, status_epoch, last_keepalive, _last_rules_refresh
-    scan_log.clear()
-    running = True
-
+    scan_log.clear(); running = True
     while running:
         now_real = time.time()
-
-        # keepalive
         if now_real - last_keepalive >= KEEPALIVE_SEC:
-            _keepalive_ping()
-            last_keepalive = now_real
-
-        # refresh pair rules periodically
+            _keepalive_ping(); last_keepalive = now_real
         if (time.time() - _last_rules_refresh) >= RULES_REFRESH_SEC:
-            fetch_pair_precisions()
-            _last_rules_refresh = time.time()
-
+            refresh_markets_and_pairs(); _last_rules_refresh = time.time()
         try:
             strategy_scan()
         except Exception as e:
             msg = f"{ist_now()} | scan_loop error: {e}"
-            scan_log.append(msg)
-            scan_log.append(traceback.format_exc().splitlines()[-1])
-
+            scan_log.append(msg); scan_log.append(traceback.format_exc().splitlines()[-1])
         status["msg"], status["last"] = "Running", ist_now()
         status_epoch = int(time.time())
         time.sleep(POLL_SEC)
-
     status["msg"] = "Idle"
 
 # -------------------- Routes --------------------
 @app.route("/")
-def index():
-    return render_template("index.html")
+def index(): return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
 def start():
@@ -780,64 +788,80 @@ def start():
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    global running
-    running = False
+    global running; running = False
     return jsonify({"status": "stopped"})
 
 @app.route("/status")
 def get_status():
     balances = get_wallet_balances()
     usdt_total = balances.get("USDT", 0.0)
-
-    # current positions snapshot
-    pos = {}
-    for p, v in positions.items():
-        pos[p] = {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]}
-
-    # keepalive status
-    now_real = time.time()
-    last_age = now_real - (last_keepalive or 0)
+    pos = {p: {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]} for p, v in positions.items()}
+    now_real = time.time(); last_age = now_real - (last_keepalive or 0)
     keepalive_info = {
-        "enabled": bool(KEEPALIVE_TOKEN),
-        "interval_sec": KEEPALIVE_SEC,
+        "enabled": bool(KEEPALIVE_TOKEN), "interval_sec": KEEPALIVE_SEC,
         "last_ping_epoch": int(last_keepalive or 0),
         "last_ping_age_sec": (max(0, int(last_age)) if last_keepalive else None),
         "next_due_sec": (max(0, int(KEEPALIVE_SEC - last_age)) if last_keepalive else None),
         "app_base_url": APP_BASE_URL,
     }
-
     return jsonify({
-        "status": status["msg"],
-        "last": status["last"],
-        "status_epoch": status_epoch,
-        "usdt": usdt_total,
-        "balances_age_sec": balances_age_sec(),
-        "positions": pos,
-        "profit_today": compute_realized_pnl_today(),
+        "status": status["msg"], "last": status["last"], "status_epoch": status_epoch,
+        "usdt": usdt_total, "balances_age_sec": balances_age_sec(),
+        "positions": pos, "profit_today": compute_realized_pnl_today(),
         "pnl_cumulative": round(profit_state.get("cumulative_pnl", 0.0), 6),
-        "trades": trade_log[-50:][::-1],
-        "scans": scan_log[-120:][::-1],
-        "keepalive": keepalive_info
+        "trades": trade_log[-70:][::-1], "scans": scan_log[-180:][::-1],
+        "keepalive": keepalive_info,
+        "flags": {"ignore_balance_age": IGNORE_BAL_AGE, "paper_trade": PAPER_TRADE, "strategy_mode": STRATEGY_MODE}
     })
 
 @app.route("/io")
-def get_io():
-    # Return last N raw I/O lines
-    return jsonify({"io": list(io_log)})
+def get_io(): return jsonify({"io": list(io_log)})
 
-@app.route("/ping", methods=["GET", "HEAD"])
+@app.route("/toggle", methods=["POST"])
+def toggle():
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        key   = str(data.get("key",""))
+        name  = str(data.get("name","")).strip().lower()
+        state = data.get("state", None)
+        if not ADMIN_TOGGLE_KEY or key != ADMIN_TOGGLE_KEY:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+
+        def parse_state(x):
+            if isinstance(x, bool): return x
+            if isinstance(x, str):
+                x = x.strip().lower()
+                if x in ("1","true","on","yes","y"): return True
+                if x in ("0","false","off","no","n"): return False
+            return x
+
+        global IGNORE_BAL_AGE, PAPER_TRADE, STRATEGY_MODE
+        if name == "ignore_balance_age":
+            val = bool(parse_state(state)); IGNORE_BAL_AGE = val
+        elif name == "paper_trade":
+            val = bool(parse_state(state)); PAPER_TRADE = val
+        elif name == "strategy_mode":
+            if state not in ("aggressive","balanced","conservative","turbo"):
+                return jsonify({"ok": False, "error": "invalid mode"}), 400
+            STRATEGY_MODE = state; apply_profile()
+            val = STRATEGY_MODE
+        else:
+            return jsonify({"ok": False, "error": "unknown toggle"}), 400
+
+        scan_log.append(f"{ist_now()} | TOGGLE {name} -> {val}")
+        return jsonify({"ok": True, "name": name, "state": val})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/ping", methods=["GET","HEAD"])
 def ping():
     token = os.environ.get("KEEPALIVE_TOKEN", "")
-    provided = (request.args.get("t") or
-                request.headers.get("X-Keepalive-Token") or "")
+    provided = (request.args.get("t") or request.headers.get("X-Keepalive-Token") or "")
     if token and provided != token:
         print(f"[{ist_now()}] /ping forbidden (bad token) method={request.method}")
         return "forbidden", 403
-
     print(f"[{ist_now()}] /ping ok method={request.method}")
-    if request.method == "HEAD":
-        return ("", 200)
-    return ("pong", 200)
+    return ("", 200) if request.method == "HEAD" else ("pong", 200)
 
 # -------------------- Boot helpers --------------------
 def _start_loop_once():
@@ -851,18 +875,22 @@ def _start_loop_once():
 def _boot_kick():
     try:
         load_profit_state()
-        fetch_pair_precisions()
+        refresh_markets_and_pairs()
         time.sleep(0.5)
+        if START_WITH_USDT:
+            liquidate_all_non_usdt(reason="boot")
         _start_loop_once()
     except Exception as e:
         print("boot kick failed:", e)
 
 if os.environ.get("AUTOSTART", "1") == "1":
+    apply_profile()
     threading.Thread(target=_boot_kick, daemon=True).start()
 
 if __name__ == "__main__":
     load_profit_state()
-    fetch_pair_precisions()
+    refresh_markets_and_pairs()
+    if START_WITH_USDT: liquidate_all_non_usdt(reason="boot")
     _start_loop_once()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
