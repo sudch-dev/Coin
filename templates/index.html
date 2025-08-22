@@ -1,51 +1,138 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title> Dashboard</title>
+  <meta charset="utf-8">
+  <title>HFT Dashboard</title>
   <style>
-    body { font-family: Arial; background:#f4f4f4; }
-    .card { background:white; margin:10px; padding:10px; border-radius:6px; box-shadow:0 2px 4px rgba(0,0,0,.1);}
-    pre { background:#eee; padding:6px; height:200px; overflow:auto;}
-    button { margin:5px; padding:8px 12px; }
-    .row{display:flex; justify-content:space-between;}
+    :root{--bg:#0b1220;--card:#121a2b;--ink:#e7ecff;--muted:#9bb0ff33;--accent:#4da3ff;}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 system-ui,Segoe UI,Arial}
+    header{padding:18px 22px;border-bottom:1px solid var(--muted);display:flex;gap:12px;align-items:center}
+    h1{margin:0;font-size:18px}
+    button{background:var(--accent);color:#00152e;border:none;padding:8px 14px;border-radius:8px;font-weight:600;cursor:pointer}
+    button.secondary{background:#24324f;color:var(--ink)}
+    .grid{display:grid;gap:14px;padding:14px;grid-template-columns:repeat(12,1fr)}
+    .card{background:var(--card);border:1px solid var(--muted);border-radius:12px;padding:12px}
+    .span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px dashed var(--muted);padding:8px 6px;text-align:left}
+    th{color:#9bb0ff}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1a2847}
+    .log{height:280px;overflow:auto;background:#0d172c;border-radius:10px;padding:10px;border:1px solid var(--muted)}
+    .muted{color:#b8c6ff99}
   </style>
 </head>
 <body>
-  <h1>Trading Bot Dashboard</h1>
-  <button onclick="start()">Start</button>
-  <button onclick="stop()">Stop</button>
+  <header>
+    <h1>HFT / Maker Dashboard</h1>
+    <button onclick="start()">Start</button>
+    <button class="secondary" onclick="stop()">Stop</button>
+    <span id="status-pill" class="pill">Idle</span>
+    <span class="muted" id="last">—</span>
+  </header>
 
-  <div class="card"><h2>Status</h2><div id="status">—</div><div id="last">—</div></div>
-  <div class="card"><h2>Keep-Alive</h2>
-    <div class="row"><span>Enabled</span><span id="ka-enabled">—</span></div>
-    <div class="row"><span>Interval</span><span id="ka-interval">—</span></div>
-    <div class="row"><span>Last Ping Age</span><span id="ka-last-age">—</span></div>
-    <div class="row"><span>Next Due</span><span id="ka-next-due">—</span></div>
-    <div class="row"><span>Base URL</span><span id="ka-base-url">—</span></div>
+  <div class="grid">
+    <div class="card span4">
+      <h3>Status</h3>
+      <div class="muted">Engine</div>
+      <div class="mono" id="status">—</div>
+      <div class="muted" style="margin-top:8px">Positions</div>
+      <table id="positions"><thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Since</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card span4">
+      <h3>Keep-Alive</h3>
+      <table>
+        <tr><th>Enabled</th><td id="ka-enabled">—</td></tr>
+        <tr><th>Interval</th><td id="ka-interval">—</td></tr>
+        <tr><th>Last Ping Age</th><td id="ka-last-age">—</td></tr>
+        <tr><th>Next Due</th><td id="ka-next-due">—</td></tr>
+        <tr><th>Base URL</th><td class="mono" id="ka-base-url">—</td></tr>
+      </table>
+    </div>
+
+    <div class="card span4">
+      <h3>Balances</h3>
+      <table id="balances"><thead><tr><th>Asset</th><th>Balance</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card span6">
+      <h3>Order Book (recent)</h3>
+      <table id="orders"><thead><tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>ID</th><th>State</th></tr></thead><tbody></tbody></table>
+    </div>
+
+    <div class="card span6">
+      <h3>Trades (recent)</h3>
+      <div class="log mono" id="trades"></div>
+    </div>
+
+    <div class="card span12">
+      <h3>Scan Logs (live)</h3>
+      <div class="log mono" id="logs"></div>
+    </div>
   </div>
-  <div class="card"><h2>Orders</h2><pre id="orders"></pre></div>
-  <div class="card"><h2>Trades</h2><pre id="trades"></pre></div>
-  <div class="card"><h2>Scan Logs</h2><pre id="logs"></pre></div>
 
 <script>
-async function refresh(){
-  let r=await fetch("/status"); let d=await r.json();
-  document.getElementById("status").textContent="Status: "+d.status;
-  document.getElementById("last").textContent="Last: "+d.last;
-  // keepalive
-  document.getElementById("ka-enabled").textContent=d.keepalive.enabled;
-  document.getElementById("ka-interval").textContent=d.keepalive.interval_sec+"s";
-  document.getElementById("ka-last-age").textContent=d.keepalive.last_ping_age_sec;
-  document.getElementById("ka-next-due").textContent=d.keepalive.next_due_sec;
-  document.getElementById("ka-base-url").textContent=d.keepalive.app_base_url;
-  // orders/trades/logs
-  document.getElementById("orders").textContent=JSON.stringify(d.order_book,null,2);
-  document.getElementById("trades").textContent=d.trades.join("\n");
-  document.getElementById("logs").textContent=d.scans.join("\n");
+async function start(){ await fetch('/start',{method:'POST'}); }
+async function stop(){ await fetch('/stop',{method:'POST'}); }
+
+function setText(id, v){ document.getElementById(id).textContent = (v ?? '—'); }
+
+function fillTable(tbody, rows){
+  tbody.innerHTML='';
+  rows.forEach(r=>{
+    const tr=document.createElement('tr');
+    r.forEach(c=>{ const td=document.createElement('td'); td.textContent=c; tr.appendChild(td); });
+    tbody.appendChild(tr);
+  });
 }
-function start(){fetch("/start",{method:"POST"})}
-function stop(){fetch("/stop",{method:"POST"})}
-setInterval(refresh,2000);
+
+async function refresh(){
+  const r = await fetch('/status');
+  const d = await r.json();
+
+  setText('status', d.status);
+  setText('last', 'Last: '+(d.last||'—'));
+  document.getElementById('status-pill').textContent = d.status || '—';
+
+  // Keepalive
+  setText('ka-enabled', d.keepalive?.enabled);
+  setText('ka-interval', (d.keepalive?.interval_sec||'—')+'s');
+  setText('ka-last-age', d.keepalive?.last_ping_age_sec);
+  setText('ka-next-due', d.keepalive?.next_due_sec);
+  setText('ka-base-url', d.keepalive?.app_base_url);
+
+  // Balances
+  const b = d.balances || {};
+  const bRows = Object.keys(b).sort().map(k=>[k, String(b[k])]);
+  fillTable(document.querySelector('#balances tbody'), bRows);
+
+  // Positions
+  const p = d.positions || {};
+  const pRows = Object.keys(p).map(k=>[k, p[k].qty, p[k].entry, new Date(p[k].ts*1000).toLocaleTimeString()]);
+  fillTable(document.querySelector('#positions tbody'), pRows);
+
+  // Orders
+  const ob = d.order_book || [];
+  const oRows = ob.map(o=>[o.time, o.pair, o.side, o.qty, o.id, o.state]);
+  fillTable(document.querySelector('#orders tbody'), oRows);
+
+  // Trades
+  const tr = d.trades || [];
+  const tradesEl = document.getElementById('trades');
+  tradesEl.textContent = tr.join('\n');
+  tradesEl.scrollTop = tradesEl.scrollHeight;
+
+  // Scan logs
+  const logs = d.scans || [];
+  const logEl = document.getElementById('logs');
+  logEl.textContent = logs.join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+setInterval(refresh, 1000); // refresh every 1s to match tick
+refresh();
 </script>
 </body>
 </html>
