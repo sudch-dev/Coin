@@ -44,22 +44,14 @@ PAIR_RULES = {
 }
 
 # -------------------- Strategy knobs --------------------
-CANDLE_INTERVAL = 5     # seconds (5s candles)
-POLL_SEC        = 1.0
-TP_TARGET_PCT   = 0.010  # 1% target
-BUY_FRACTION_USDT = 0.30
-SELL_ALL_COIN     = True
+CANDLE_INTERVAL    = 5     # seconds (5s candles)
+POLL_SEC           = 1.0
+BUY_FRACTION_USDT  = 0.30  # cap notional per trade (also used by risk-based sizing cap)
+SELL_ALL_COIN      = True
 
-# EMA & MACD
-EMA_FAST = 5
-EMA_SLOW = 10
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-
-# Fees and safety
+# Fees and safety headroom
 FEE_PCT_PER_SIDE = 0.0010
-BUY_HEADROOM     = 1.0005
+BUY_HEADROOM     = 1.0005  # 5bp cushion so rounding fits
 
 # Keepalive
 KEEPALIVE_SEC = 240
@@ -68,6 +60,18 @@ KEEPALIVE_SEC = 240
 RULES_REFRESH_SEC = 1800
 _last_rules_refresh = 0
 
+# ===== Fast Momentum Breakout knobs =====
+HTF_EMA_LEN        = 12      # trend filter on closes (~1 min EMA over 5s bars)
+ATR_N              = 36      # ATR window (~3 min)
+BRK_LOOKBACK       = 36      # breakout lookback (~3 min high/low)
+MIN_ATR_PCT        = 0.0008  # require ATR >= 0.08% of price (avoid chop)
+RISK_PER_TRADE     = 0.01    # risk 1% of free USDT per trade
+ATR_SL_MULT        = 0.8     # initial stop = entry - 0.8*ATR
+ATR_TP_MULT        = 1.6     # take profit  = entry + 1.6*ATR (≈2R)
+TRAIL_MULT         = 0.8     # trailing stop = highest - 0.8*ATR
+COOLDOWN_SEC       = 30      # cooldown after exit/failure
+MAX_CONCURRENT_POS = 1       # throttle: at most N open pairs
+
 # -------------------- Time helpers --------------------
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -75,20 +79,21 @@ def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
 def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # -------------------- State --------------------
-tick_logs     = {p: [] for p in PAIRS}
-candle_logs   = {p: [] for p in PAIRS}
-scan_log      = []
-trade_log     = []
+tick_logs     = {p: [] for p in PAIRS}   # (ts, price) ticks
+candle_logs   = {p: [] for p in PAIRS}   # {open,high,low,close,start}
+scan_log      = []                       # decisions + signals
+trade_log     = []                       # execution + pnl lines
 running       = False
 status        = {"msg": "Idle", "last": ""}
 status_epoch  = 0
 error_message = ""
 last_keepalive = 0
 
-# Positions
+# Position tracking per pair
 positions = {
-    # pair: {"qty": float, "entry": float, "ts": int}
+    # pair: {"qty": float, "entry": float, "ts": int, "stop": float, "trail": float, "highest": float, "atr": float}
 }
+cooldown_until = {}  # pair -> epoch until entries are blocked
 
 # P&L persistence
 PROFIT_STATE_FILE = "profit_state.json"
@@ -393,6 +398,9 @@ def _fee_multiplier(side):
     return 1.0 + FEE_PCT_PER_SIDE if side.upper() == "BUY" else 1.0 - FEE_PCT_PER_SIDE
 
 def normalize_qty_for_buy(pair, price, usdt_avail):
+    """
+    Turn a USDT notional into a precision/min-qty safe quantity that fits fees.
+    """
     if price <= 0:
         return 0.0
     denom = max(price * _fee_multiplier("BUY") * BUY_HEADROOM, 1e-12)
@@ -476,7 +484,7 @@ def aggregate_candles(pair, interval=CANDLE_INTERVAL):
             candle["volume"] += 1
     if candle:
         candles.append(candle)
-    candle_logs[pair] = candles[-300:]
+    candle_logs[pair] = candles[-300:]  # ~25 minutes of 5s bars
 
 def _ema_series(vals, n):
     if len(vals) == 0:
@@ -490,6 +498,9 @@ def _ema_series(vals, n):
     return ema_vals
 
 def _macd_series(closes):
+    MACD_FAST = 12
+    MACD_SLOW = 26
+    MACD_SIGNAL = 9
     if len(closes) < MACD_SLOW + MACD_SIGNAL:
         return [], [], []
     ema_fast = _ema_series(closes, MACD_FAST)
@@ -499,12 +510,6 @@ def _macd_series(closes):
     hist = [m - s for m, s in zip(macd[-len(signal):], signal)]
     macd_al = macd[-len(signal):]
     return macd_al, signal, hist
-
-def _cross_up(a_prev, a_now, b_prev, b_now):
-    return a_prev is not None and b_prev is not None and a_prev <= b_prev and a_now > b_now
-
-def _cross_dn(a_prev, a_now, b_prev, b_now):
-    return a_prev is not None and b_prev is not None and a_prev >= b_prev and a_now < b_now
 
 def _swing_highs(vals, look=5):
     idx = []
@@ -546,11 +551,63 @@ def _macd_convergence_divergence(closes, macd_line):
     agree = (p_slope >= 0 and m_slope >= 0) or (p_slope <= 0 and m_slope <= 0)
     return f"Convergence ({'agree' if agree else 'mixed'}; {slope_note})"
 
+# ---- ATR, breakout, risk sizing helpers ----
+def _atr_from_candles(cs, n=ATR_N):
+    """Wilder-style ATR approx on 5s candles."""
+    if len(cs) < n + 2:
+        return 0.0
+    trs = []
+    prev_close = cs[-(n+1)]["close"]
+    for c in cs[-n:]:
+        high, low, close = c["high"], c["low"], c["close"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+    # simple EMA of TR for speed
+    k = 2 / (n + 1)
+    atr = trs[0]
+    for tr in trs:
+        atr = tr * k + atr * (1 - k)
+    return float(atr)
+
+def _recent_hl(cs, lb=BRK_LOOKBACK):
+    if len(cs) < lb:
+        return None, None
+    highs = [c["high"] for c in cs[-lb:]]
+    lows  = [c["low"]  for c in cs[-lb:]]
+    return max(highs), min(lows)
+
+def _size_by_risk(usdt_free, price, atr):
+    """
+    Risk per trade = RISK_PER_TRADE * usdt_free.
+    Stop distance = ATR_SL_MULT * atr  -> qty_risk = risk / stop_distance.
+    Clamp by BUY_FRACTION_USDT notional cap.
+    """
+    if atr <= 0 or price <= 0:
+        return 0.0
+    stop_dist = ATR_SL_MULT * atr
+    if stop_dist <= 0:
+        return 0.0
+    risk_amt = max(0.0, RISK_PER_TRADE * usdt_free)
+    if risk_amt <= 0:
+        return 0.0
+    qty_risk = risk_amt / stop_dist                 # quantity in coins
+    notional_cap = BUY_FRACTION_USDT * usdt_free
+    qty_cap = (notional_cap / price) if notional_cap > 0 else qty_risk
+    qty = min(qty_risk, qty_cap)
+    return max(0.0, qty)
+
+def _pnl_after_fees(entry, exit_px, qty):
+    buy_cost  = entry * (1 + FEE_PCT_PER_SIDE) * qty
+    sell_recv = exit_px * (1 - FEE_PCT_PER_SIDE) * qty
+    return sell_recv - buy_cost
+
 # -------------------- Strategy core --------------------
 def strategy_scan():
     prices = fetch_all_prices()
     now_ts = int(time.time())
 
+    # build ticks and candles
     for pair in PAIRS:
         if pair in prices:
             px = prices[pair]["price"]
@@ -566,103 +623,116 @@ def strategy_scan():
     if not buys_allowed:
         scan_log.append(f"{ist_now()} | NOTE: buys paused (balances stale age={bal_age}s)")
 
+    # throttle concurrent positions
+    open_count = sum(1 for v in positions.values() if v.get("qty", 0.0) > 0)
+    can_open_more = open_count < MAX_CONCURRENT_POS
+
     for pair in PAIRS:
         cs = candle_logs.get(pair) or []
-        if len(cs) < max(EMA_SLOW, MACD_SLOW + MACD_SIGNAL) + 3:
+        if len(cs) < max(HTF_EMA_LEN, ATR_N, BRK_LOOKBACK) + 3:
             continue
 
         closes = [c["close"] for c in cs]
-        last = closes[-1]
+        last   = closes[-1]
+        high_b, low_b = _recent_hl(cs, BRK_LOOKBACK)
+        atr    = _atr_from_candles(cs, ATR_N)
+        atr_pct = (atr / last) if last > 0 else 0.0
 
-        ema5_series = _ema_series(closes, EMA_FAST)
-        ema10_series = _ema_series(closes, EMA_SLOW)
-        e5_prev, e5_now = (ema5_series[-2], ema5_series[-1]) if len(ema5_series) >= 2 else (None, None)
-        e10_prev, e10_now = (ema10_series[-2], ema10_series[-1]) if len(ema10_series) >= 2 else (None, None)
-
-        macd_line, macd_signal, macd_hist = _macd_series(closes)
+        # trend & momentum filters
+        ema_htf = _ema_series(closes, HTF_EMA_LEN)[-1] if len(closes) >= HTF_EMA_LEN else last
+        macd_line, macd_signal, _ = _macd_series(closes)
         if not macd_line or not macd_signal:
             continue
-        m_prev, m_now = (macd_line[-2], macd_line[-1])
-        s_prev, s_now = (macd_signal[-2], macd_signal[-1])
+        m_now, s_now = macd_line[-1], macd_signal[-1]
 
-        macd_state = "bullish" if m_now > s_now else "bearish" if m_now < s_now else "flat"
-        macd_xup   = _cross_up(m_prev, m_now, s_prev, s_now)
-        macd_xdn   = _cross_dn(m_prev, m_now, s_prev, s_now)
-
-        m_for_cd = [None]*(len(closes)-len(macd_line)) + macd_line
-        m_for_cd = [x for x in m_for_cd if x is not None]
-        cd_note  = _macd_convergence_divergence(closes, m_for_cd)
-
-        buy_gate  = (e5_now is not None and e10_now is not None and e5_now > e10_now) and (m_now > s_now)
-        sell_gate = (e5_now is not None and e10_now is not None and e5_now < e10_now) and (m_now < s_now)
-
+        # log snapshot for transparency
         scan_log.append(
-            f"{ist_now()} | {pair} | "
-            f"EMA5={round(e5_now,6)} EMA10={round(e10_now,6)} | "
-            f"MACD={round(m_now,6)} SIG={round(s_now,6)} "
-            f"(state={macd_state}, xup={macd_xup}, xdn={macd_xdn}) | "
-            f"CD={cd_note} | Gates: Buy={buy_gate} Sell={sell_gate} | Px={last}"
+            f"{ist_now()} | {pair} | last={last} ATR={round(atr,6)} ({round(100*atr_pct,3)}%) "
+            f"| EMA{HTF_EMA_LEN}={round(ema_htf,6)} | MACD={round(m_now,6)} SIG={round(s_now,6)} "
+            f"| HL[{BRK_LOOKBACK}] hi={high_b} lo={low_b}"
         )
 
+        # ENTRY (LONG)
         have_pos = pair in positions and positions[pair].get("qty", 0.0) > 0.0
-        if (not have_pos) and buy_gate and buys_allowed:
-            notional = BUY_FRACTION_USDT * usdt_free
-            rules = _rules(pair)
-            min_notional = float(rules.get("min_notional", 0.0) or 0.0)
-            floor = max(1.0, min_notional)
-            if notional >= floor:
-                qty = normalize_qty_for_buy(pair, last, notional)
-                _tlog(f"{pair} | BUY-CALC usdt_free={usdt_free} notional={notional} floor={floor} qty_norm={qty}")
-                if qty > 0:
-                    res = place_market(pair, "BUY", qty)
-                    oid = _extract_order_id(res)
-                    if oid:
-                        st = get_order_status(order_id=oid)
-                        _tlog(f"{pair} | BUY STATUS oid={oid} => {st}")
-                        filled, avg_px = _filled_avg_from_status(st)
-                        _tlog(f"{pair} | BUY PARSED filled={filled} avg_px={avg_px}")
-                        if filled > 0 and avg_px > 0:
-                            positions[pair] = {"qty": filled, "entry": avg_px, "ts": now_ts}
-                            _tlog(f"{pair} | BUY FILLED {filled} @ {avg_px} | oid={oid}")
-                        else:
-                            _tlog(f"{pair} | BUY NO-FILL | oid={oid}")
-                    else:
-                        _tlog(f"{pair} | BUY FAILED (no oid) | res={res}")
-                else:
-                    _tlog(f"{pair} | BUY qty=0 (precision/min-qty/fee)")
-            else:
-                _tlog(f"{pair} | BUY SKIP notional<{floor} (notional={round(notional,6)})")
-            continue
+        cooled   = now_ts >= int(cooldown_until.get(pair, 0))
+        breakout_up   = (high_b is not None) and (last > high_b)
+        volatility_ok = atr_pct >= MIN_ATR_PCT
+        trend_ok      = last > ema_htf
+        momentum_ok   = m_now > s_now
 
-        if have_pos:
-            entry = positions[pair]["entry"]
-            qty   = positions[pair]["qty"]
-            take_profit = (last >= entry * (1.0 + TP_TARGET_PCT))
-            sell_signal = sell_gate
-
-            scan_log.append(
-                f"{ist_now()} | {pair} | EXIT-CHECK entry={entry} last={last} "
-                f"TP@{round(100*TP_TARGET_PCT,2)}% hit={take_profit} | SellSignal={sell_signal}"
-            )
-
-            if take_profit or sell_signal:
-                sell_qty = qty
-                res = place_market(pair, "SELL", sell_qty)
+        if (not have_pos) and cooled and buys_allowed and can_open_more and breakout_up and volatility_ok and trend_ok and momentum_ok:
+            # risk-based size -> quantity; normalize via notional for fees/precision
+            raw_qty = _size_by_risk(usdt_free, last, atr)
+            target_notional = raw_qty * last
+            qty = normalize_qty_for_buy(pair, last, target_notional)
+            scan_log.append(f"{ist_now()} | {pair} | ENTRY-CALC raw_qty={raw_qty} norm_qty={qty} usdt_free={usdt_free}")
+            if qty > 0:
+                res = place_market(pair, "BUY", qty)
                 oid = _extract_order_id(res)
                 if oid:
                     st = get_order_status(order_id=oid)
-                    _tlog(f"{pair} | SELL STATUS oid={oid} => {st}")
                     filled, avg_px = _filled_avg_from_status(st)
-                    _tlog(f"{pair} | SELL PARSED filled={filled} avg_px={avg_px}")
                     if filled > 0 and avg_px > 0:
-                        pnl = (avg_px - entry) * min(filled, qty)
-                        record_realized_pnl(pnl)
-                        _tlog(f"{pair} | SELL FILLED {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
-                        positions.pop(pair, None)
+                        stop = max(0.0, avg_px - ATR_SL_MULT * atr)
+                        positions[pair] = {
+                            "qty": filled, "entry": avg_px, "ts": now_ts,
+                            "stop": stop, "trail": stop, "highest": avg_px, "atr": atr
+                        }
+                        trade_log.append(f"{ist_now()} | {pair} | BUY {filled} @ {avg_px} | stop={round(stop,6)} | oid={oid}")
+                        open_count += 1
+                        can_open_more = open_count < MAX_CONCURRENT_POS
                     else:
-                        _tlog(f"{pair} | SELL NO-FILL | oid={oid}")
+                        scan_log.append(f"{ist_now()} | {pair} | BUY no fill | oid={oid}")
+                        cooldown_until[pair] = now_ts + COOLDOWN_SEC
                 else:
-                    _tlog(f"{pair} | SELL FAILED (no oid) | res={res}")
+                    scan_log.append(f"{ist_now()} | {pair} | BUY failed (no oid) | res={res}")
+                    cooldown_until[pair] = now_ts + COOLDOWN_SEC
+            else:
+                scan_log.append(f"{ist_now()} | {pair} | BUY qty=0 (risk/min-qty/fees)")
+            continue  # after buy attempt, skip exit branch this tick
+
+        # EXIT / MANAGEMENT
+        if have_pos:
+            p = positions[pair]
+            qty   = p["qty"]
+            entry = p["entry"]
+            atr_p = p.get("atr", atr) or atr
+
+            # trailing update
+            p["highest"] = max(p.get("highest", entry), last)
+            new_trail = p["highest"] - TRAIL_MULT * atr_p
+            if new_trail > p.get("trail", p["stop"]):
+                p["trail"] = new_trail
+            active_stop = max(p.get("stop", entry - ATR_SL_MULT*atr_p), p.get("trail", 0.0))
+
+            take_profit = last >= entry + ATR_TP_MULT * atr_p
+            hard_stop   = last <= active_stop
+            give_up     = (m_now < s_now) and (last < ema_htf)  # momentum loss + below trend
+
+            scan_log.append(
+                f"{ist_now()} | {pair} | MANAGE entry={entry} last={last} "
+                f"stop={round(active_stop,6)} tp@{round(entry + ATR_TP_MULT*atr_p,6)} "
+                f"| TP={take_profit} SL={hard_stop} giveup={give_up}"
+            )
+
+            if hard_stop or take_profit or give_up:
+                res = place_market(pair, "SELL", qty)
+                oid = _extract_order_id(res)
+                if oid:
+                    st = get_order_status(order_id=oid)
+                    filled, avg_px = _filled_avg_from_status(st)
+                    if filled > 0 and avg_px > 0:
+                        pnl = _pnl_after_fees(entry, avg_px, min(filled, qty))
+                        record_realized_pnl(pnl)
+                        trade_log.append(f"{ist_now()} | {pair} | SELL {filled} @ {avg_px} | PNL={round(pnl,6)} | oid={oid}")
+                        positions.pop(pair, None)
+                        cooldown_until[pair] = now_ts + COOLDOWN_SEC
+                        open_count -= 1
+                        can_open_more = open_count < MAX_CONCURRENT_POS
+                    else:
+                        scan_log.append(f"{ist_now()} | {pair} | SELL no fill | oid={oid}")
+                else:
+                    scan_log.append(f"{ist_now()} | {pair} | SELL failed (no oid) | res={res}")
 
 # -------------------- Main loop --------------------
 _autostart_lock = threading.Lock()
@@ -675,10 +745,12 @@ def scan_loop():
     while running:
         now_real = time.time()
 
+        # keepalive
         if now_real - last_keepalive >= KEEPALIVE_SEC:
             _keepalive_ping()
             last_keepalive = now_real
 
+        # refresh pair rules periodically
         if (time.time() - _last_rules_refresh) >= RULES_REFRESH_SEC:
             fetch_pair_precisions()
             _last_rules_refresh = time.time()
@@ -716,8 +788,13 @@ def stop():
 def get_status():
     balances = get_wallet_balances()
     usdt_total = balances.get("USDT", 0.0)
-    pos = {p: {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]} for p, v in positions.items()}
 
+    # current positions snapshot
+    pos = {}
+    for p, v in positions.items():
+        pos[p] = {"qty": v["qty"], "entry": v["entry"], "ts": v["ts"]}
+
+    # keepalive status
     now_real = time.time()
     last_age = now_real - (last_keepalive or 0)
     keepalive_info = {
