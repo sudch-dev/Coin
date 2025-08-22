@@ -1,296 +1,51 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html>
 <head>
-  <meta charset="utf-8"/>
-  <title>Dashboard</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title> Dashboard</title>
   <style>
-    :root{
-      --bg:#0f1220; --panel:#171a2b; --text:#e7e9ee; --muted:#aab; --accent:#27c3a6; --warn:#ffca28; --bad:#ff6b6b;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif}
-    header{padding:14px 16px;border-bottom:1px solid #222;background:#0b0e1a;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
-    h1{margin:0;font-size:18px}
-    .pill{padding:4px 10px;border-radius:999px;background:#111;color:var(--muted);border:1px solid #222}
-    .wrap{padding:16px;display:grid;grid-template-columns:1fr;gap:16px}
-    @media (min-width:1100px){ .wrap{grid-template-columns: 1.2fr 1fr} }
-    .card{background:var(--panel);border:1px solid #222;border-radius:10px;padding:14px}
-    .card h2{margin:0 0 10px 0;font-size:16px}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    button{background:#1e233b;border:1px solid #2b3358;color:#cfefff;border-radius:8px;padding:8px 12px;cursor:pointer}
-    button:hover{border-color:#3f4a7f}
-    button.danger{background:#2b1920;border-color:#5c2233;color:#ffd7d7}
-    .grid{display:grid;grid-template-columns: repeat(auto-fit,minmax(160px,1fr));gap:8px}
-    .kv{background:#121528;border:1px solid #222;border-radius:8px;padding:8px}
-    .kv b{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-    table{width:100%;border-collapse:collapse;font-size:13px}
-    th,td{border-bottom:1px solid #20243b;padding:6px 8px;text-align:left;vertical-align:top}
-    th{color:#b9c;position:sticky;top:0;background:#171a2b}
-    .mono{font-family:var(--mono);font-size:12px}
-    .ok{color:var(--accent)}
-    .warn{color:var(--warn)}
-    .bad{color:var(--bad)}
-    .log{height:320px;overflow:auto;background:#0c0f1f;border:1px solid #1a1f37;border-radius:8px;padding:10px;font-family:var(--mono);font-size:12px;white-space:pre-wrap}
-    .muted{color:var(--muted)}
-    .tiny{font-size:12px}
-    .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    .sep{height:1px;background:#20243b;margin:10px 0}
-    .badge{padding:2px 6px;border:1px solid #2b3358;border-radius:6px;background:#121528;color:#cfefff;font-size:12px}
+    body { font-family: Arial; background:#f4f4f4; }
+    .card { background:white; margin:10px; padding:10px; border-radius:6px; box-shadow:0 2px 4px rgba(0,0,0,.1);}
+    pre { background:#eee; padding:6px; height:200px; overflow:auto;}
+    button { margin:5px; padding:8px 12px; }
+    .row{display:flex; justify-content:space-between;}
   </style>
 </head>
 <body>
-  <header>
-    <h1>EMA(5/20) + MACD Bot</h1>
-    <span id="status-pill" class="pill">status: …</span>
-    <span class="pill tiny">autorefresh:
-      <select id="intervalSel">
-        <option value="1500">1.5s</option>
-        <option value="2500" selected>2.5s</option>
-        <option value="5000">5s</option>
-        <option value="10000">10s</option>
-      </select>
-    </span>
-    <div class="flex">
-      <button id="btnStart">Start</button>
-      <button id="btnStop" class="danger">Stop (stop the run)</button>
-      <span id="lastUpdated" class="muted tiny">updated: —</span>
-    </div>
-  </header>
+  <h1>Trading Bot Dashboard</h1>
+  <button onclick="start()">Start</button>
+  <button onclick="stop()">Stop</button>
 
-  <div class="wrap">
-    <!-- LEFT COLUMN -->
-    <div class="col">
-      <div class="card">
-        <h2>Account & PnL</h2>
-        <div class="grid">
-          <div class="kv"><b>USDT</b><div id="usdt">—</div></div>
-          <div class="kv"><b>PNL Today</b><div id="pnlToday">—</div></div>
-          <div class="kv"><b>PNL Yesterday</b><div id="pnlYday">—</div></div>
-          <div class="kv"><b>PNL Cumulative</b><div id="pnlCum">—</div></div>
-        </div>
-        <div class="sep"></div>
-        <h3 class="tiny muted" style="margin:0 0 6px 0;">Coin Balances</h3>
-        <table id="tblCoins">
-          <thead><tr><th>Coin</th><th>Balance</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>Positions</h2>
-        <table id="tblPos">
-          <thead>
-            <tr>
-              <th>Pair</th><th>Units</th><th>Avg Entry</th><th>TP Order ID</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>Trades</h2>
-        <div id="trades" class="log">Loading…</div>
-      </div>
-
-      <div class="card">
-        <h2>Scan & Signal Log</h2>
-        <div class="tiny muted" style="margin-bottom:6px">Shows EMA cross, MACD state, divergence, gates (allowBUY/allowSELLsig) per pair.</div>
-        <div id="scans" class="log">Loading…</div>
-      </div>
-    </div>
-
-    <!-- RIGHT COLUMN -->
-    <div class="col">
-      <div class="card">
-        <h2>Order Book — Open</h2>
-        <table id="obOpen">
-          <thead>
-            <tr>
-              <th>ID</th><th>Pair</th><th>Side</th><th>Type</th><th>Price</th><th>Qty</th><th>Updated</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>Order Book — Filled</h2>
-        <table id="obFilled">
-          <thead>
-            <tr>
-              <th>ID</th><th>Pair</th><th>Side</th><th>Type</th><th>Price</th><th>Qty</th><th>Updated</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>Order Book — Cancelled / Rejected</h2>
-        <table id="obCancelled">
-          <thead>
-            <tr>
-              <th>ID</th><th>Pair</th><th>Status</th><th>Reason</th><th>Updated</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card">
-        <h2>Keep-Alive</h2>
-        <div class="grid">
-          <div class="kv"><b>Enabled</b><div id="kaEnabled">—</div></div>
-          <div class="kv"><b>Interval (s)</b><div id="kaInt">—</div></div>
-          <div class="kv"><b>Last ping age (s)</b><div id="kaAge">—</div></div>
-          <div class="kv"><b>Next due (s)</b><div id="kaNext">—</div></div>
-        </div>
-        <div class="tiny muted" style="margin-top:8px">
-          Base URL: <span id="kaUrl" class="mono">—</span>
-        </div>
-      </div>
-    </div>
+  <div class="card"><h2>Status</h2><div id="status">—</div><div id="last">—</div></div>
+  <div class="card"><h2>Keep-Alive</h2>
+    <div class="row"><span>Enabled</span><span id="ka-enabled">—</span></div>
+    <div class="row"><span>Interval</span><span id="ka-interval">—</span></div>
+    <div class="row"><span>Last Ping Age</span><span id="ka-last-age">—</span></div>
+    <div class="row"><span>Next Due</span><span id="ka-next-due">—</span></div>
+    <div class="row"><span>Base URL</span><span id="ka-base-url">—</span></div>
   </div>
+  <div class="card"><h2>Orders</h2><pre id="orders"></pre></div>
+  <div class="card"><h2>Trades</h2><pre id="trades"></pre></div>
+  <div class="card"><h2>Scan Logs</h2><pre id="logs"></pre></div>
 
 <script>
-(function(){
-  const $ = s=>document.querySelector(s);
-  const fmt = n => (typeof n==='number' ? (Math.abs(n)>=1? n.toFixed(4): n.toPrecision(6)) : n);
-  const ts = t => t ? new Date(t*1000).toLocaleTimeString() : '—';
-
-  let timer=null, interval=2500;
-
-  $("#intervalSel").addEventListener("change", e=>{
-    interval = +e.target.value;
-    startAuto();
-  });
-
-  $("#btnStart").addEventListener("click", async ()=>{
-    try{
-      await fetch("/start", {method:"POST"});
-      flashStatus("Starting…");
-    }catch(e){}
-  });
-  $("#btnStop").addEventListener("click", async ()=>{
-    try{
-      await fetch("/stop", {method:"POST"});
-      flashStatus("Stopping…");
-    }catch(e){}
-  });
-
-  function flashStatus(msg){
-    const el = $("#status-pill");
-    el.textContent = "status: " + msg;
-    setTimeout(()=>{}, 400);
-  }
-
-  async function refresh(){
-    try{
-      const r = await fetch("/status");
-      const j = await r.json();
-      $("#status-pill").textContent = "status: " + j.status + " • " + j.last;
-      $("#lastUpdated").textContent = "updated: " + new Date().toLocaleTimeString();
-
-      // PnL + USDT
-      $("#usdt").textContent = fmt(j.usdt);
-      $("#pnlToday").textContent = fmt(j.profit_today);
-      $("#pnlYday").textContent = fmt(j.profit_yesterday);
-      $("#pnlCum").textContent = fmt(j.pnl_cumulative);
-
-      // Coins
-      const coinTbody = $("#tblCoins tbody");
-      coinTbody.innerHTML = "";
-      Object.entries(j.coins || {}).forEach(([c,b])=>{
-        const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${c}</td><td class="mono">${fmt(b)}</td>`;
-        coinTbody.appendChild(tr);
-      });
-
-      // Positions
-      const posTbody = $("#tblPos tbody");
-      posTbody.innerHTML = "";
-      Object.entries(j.positions || {}).forEach(([pair, p])=>{
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${pair}</td>
-          <td class="mono">${fmt(p.units)}</td>
-          <td class="mono">${fmt(p.avg_entry)}</td>
-          <td class="mono">${p.tp_order ? p.tp_order : '<span class="muted">—</span>'}</td>
-        `;
-        posTbody.appendChild(tr);
-      });
-
-      // Trades
-      $("#trades").textContent = (j.trades||[]).join("\n") || "—";
-
-      // Scans (signals + gates)
-      $("#scans").textContent = (j.scans||[]).join("\n") || "—";
-
-      // Order book
-      fillOrders("#obOpen tbody", (j.order_book && j.order_book.open) || []);
-      fillOrders("#obFilled tbody", (j.order_book && j.order_book.filled) || []);
-      fillCancelled("#obCancelled tbody", [
-        ...((j.order_book && j.order_book.cancelled) || []),
-        ...((j.order_book && j.order_book.rejected) || [])
-      ]);
-
-      // Keepalive
-      const ka = j.keepalive || {};
-      $("#kaEnabled").textContent = ka.enabled ? "true" : "false";
-      $("#kaInt").textContent = ka.interval_sec ?? "—";
-      $("#kaAge").textContent = ka.last_ping_age_sec ?? "—";
-      $("#kaNext").textContent = ka.next_due_sec ?? "—";
-      $("#kaUrl").textContent = ka.app_base_url || "—";
-
-    }catch(e){
-      $("#status-pill").textContent = "status: error fetching /status";
-    }
-  }
-
-  function fillOrders(sel, rows){
-    const tb = document.querySelector(sel);
-    tb.innerHTML = "";
-    rows.forEach(o=>{
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono">${o.id||'—'}</td>
-        <td>${o.pair||'—'}</td>
-        <td>${(o.side||'').toUpperCase()}</td>
-        <td>${(o.type||'').toUpperCase()}</td>
-        <td class="mono">${o.px!=null? o.px : '—'}</td>
-        <td class="mono">${o.qty!=null? o.qty : '—'}</td>
-        <td class="tiny muted">${o.updated? new Date(o.updated*1000).toLocaleTimeString(): '—'}</td>
-      `;
-      tb.appendChild(tr);
-    });
-  }
-
-  function fillCancelled(sel, rows){
-    const tb = document.querySelector(sel);
-    tb.innerHTML = "";
-    rows.forEach(o=>{
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td class="mono">${o.id||'—'}</td>
-        <td>${o.pair||'—'}</td>
-        <td>${(o.status||'').toUpperCase()}</td>
-        <td class="tiny">${o.reason||'—'}</td>
-        <td class="tiny muted">${o.updated? new Date(o.updated*1000).toLocaleTimeString(): '—'}</td>
-      `;
-      tb.appendChild(tr);
-    });
-  }
-
-  function startAuto(){
-    if (timer) clearInterval(timer);
-    refresh();
-    timer = setInterval(refresh, interval);
-  }
-  startAuto();
-})();
+async function refresh(){
+  let r=await fetch("/status"); let d=await r.json();
+  document.getElementById("status").textContent="Status: "+d.status;
+  document.getElementById("last").textContent="Last: "+d.last;
+  // keepalive
+  document.getElementById("ka-enabled").textContent=d.keepalive.enabled;
+  document.getElementById("ka-interval").textContent=d.keepalive.interval_sec+"s";
+  document.getElementById("ka-last-age").textContent=d.keepalive.last_ping_age_sec;
+  document.getElementById("ka-next-due").textContent=d.keepalive.next_due_sec;
+  document.getElementById("ka-base-url").textContent=d.keepalive.app_base_url;
+  // orders/trades/logs
+  document.getElementById("orders").textContent=JSON.stringify(d.order_book,null,2);
+  document.getElementById("trades").textContent=d.trades.join("\n");
+  document.getElementById("logs").textContent=d.scans.join("\n");
+}
+function start(){fetch("/start",{method:"POST"})}
+function stop(){fetch("/stop",{method:"POST"})}
+setInterval(refresh,2000);
 </script>
 </body>
 </html>
