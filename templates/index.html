@@ -4,142 +4,97 @@
   <meta charset="UTF-8">
   <title>Dashboard</title>
   <style>
-    body { background:#000; color:#eee; font-family:monospace; margin:0; }
-    header { background:#111; padding:10px; font-size:20px; text-align:center; color:#00e000; font-weight:bold; }
-    .wrap { padding:10px; }
-    .btns { margin-bottom:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-    button { background:#222; color:#0f0; border:1px solid #0f0; padding:6px 10px; cursor:pointer; border-radius:4px; }
-    button:hover { background:#0f0; color:#000; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    @media (max-width:800px){ .grid { grid-template-columns:1fr; } }
-    .card { background:#111; border:1px solid #333; border-radius:6px; padding:10px; }
-    h2 { margin:0 0 8px 0; color:#0f0; font-size:16px; }
-    .pos{ color:#0f0; } .neg{ color:#f33; }
-    .logline:nth-child(odd){ background:#181818; } .logline:nth-child(even){ background:#101010; }
-    table{ width:100%; border-collapse:collapse; } td{ padding:2px 4px; border-bottom:1px solid #222; }
-    .err{ color:#f33; padding:6px 0; }
-    .muted{ color:#aaa; }
+    body { background-color: #000; color: #0f0; font-family: monospace; margin:0; padding:0; }
+    h1 { color:#0f0; text-align:center; padding:10px; background:#111; margin:0; }
+    .section { margin:10px; padding:10px; background:#111; border-radius:6px; }
+    .title { color:#f44; font-weight:bold; margin-bottom:5px; }
+    .green { color:#0f0; } .red { color:#f44; }
+    button { margin:2px; padding:4px 10px; font-family: monospace; }
+    #scanlog div:nth-child(odd) { color:#0f0; }
+    #scanlog div:nth-child(even) { color:#f44; }
+    #iolist div:nth-child(odd) { color:#0f0; }
+    #iolist div:nth-child(even) { color:#f44; }
   </style>
 </head>
 <body>
-  <header>Dashboard</header>
-  <div class="wrap">
-    <div class="btns">
-      <button onclick="postJSON('/start')">Start</button>
-      <button onclick="postJSON('/stop')">Stop</button>
-      <button onclick="loadStatus()">Refresh</button>
-      <span id="statusLine" class="muted"></span>
-    </div>
+  <h1>Dashboard</h1>
 
-    <div class="grid">
-      <div class="card">
-        <h2>Balances</h2>
-        <div>USDT: <span id="usdt" class="pos">0</span></div>
-        <table id="balances"></table>
-      </div>
+  <div class="section">
+    <button onclick="start()">Start</button>
+    <button onclick="stop()">Stop</button>
+    <button onclick="refresh()">Refresh</button>
+    <span>Status: <span id="status" class="red">Idle</span></span> | 
+    <span>Last: <span id="last" class="green">-</span></span> | 
+    <span>Keepalive: <span id="keepalive" class="green">-</span></span>
+  </div>
 
-      <div class="card">
-        <h2>Recent Trades</h2>
-        <div id="trades"></div>
-      </div>
+  <div class="section">
+    <div class="title">Balances</div>
+    USDT: <span id="usdt" class="green">-</span><br>
+    Profit Today: <span id="profit_today">-</span><br>
+    Profit Yesterday: <span id="profit_yesterday">-</span><br>
+    Cumulative P&L: <span id="pnl_cumulative">-</span>
+  </div>
 
-      <div class="card">
-        <h2>Open Positions</h2>
-        <div id="positions" class="muted">no open positions</div>
-      </div>
+  <div class="section">
+    <div class="title">Open Positions</div>
+    <pre id="positions">no open positions</pre>
+  </div>
 
-      <div class="card">
-        <h2>Scan Log</h2>
-        <div id="scans"></div>
-      </div>
+  <div class="section">
+    <div class="title">Recent Trades</div>
+    <pre id="trades">no data yet</pre>
+  </div>
 
-      <div class="card" style="grid-column:1 / -1;">
-        <h2>Raw I/O</h2>
-        <div id="iolog" style="max-height:220px; overflow:auto;"></div>
-      </div>
-    </div>
+  <div class="section">
+    <div class="title">Scan Log</div>
+    <div id="scanlog" style="max-height:250px; overflow:auto;"></div>
+  </div>
 
-    <div id="err" class="err"></div>
+  <div class="section">
+    <div class="title">Raw I/O</div>
+    <div id="iolist" style="max-height:200px; overflow:auto;"></div>
   </div>
 
   <script>
-    async function loadStatus(){
-      try{
-        const res = await fetch('/status');
-        const data = await res.json();
-
-        document.getElementById('statusLine').textContent =
-          (data.status || 'Idle') + ' | Last: ' + (data.last || '');
-
-        document.getElementById('usdt').textContent =
-          (Number(data.usdt||0)).toFixed(6);
-
-        // Balances (null-safe)
-        const coins = data.coins || {};
-        let tbl = "";
-        for (const [coin, bal] of Object.entries(coins)) {
-          tbl += `<tr><td>${coin}</td><td>${Number(bal||0)}</td></tr>`;
-        }
-        document.getElementById('balances').innerHTML = tbl || "<tr><td class='muted'>no data</td><td></td></tr>";
-
-        // Positions (null-safe)
-        const posDiv = document.getElementById('positions');
-        posDiv.innerHTML = "";
-        const pos = data.positions || {};
-        if (Object.keys(pos).length === 0) {
-          posDiv.textContent = "no open positions";
-        } else {
-          for (const [pair, v] of Object.entries(pos)) {
-            const d = document.createElement('div');
-            d.textContent = `${pair} | qty=${v.qty} entry=${v.entry} stop=${v.stop} tp=${v.tp}`;
-            posDiv.appendChild(d);
-          }
-        }
-
-        // Trades (null-safe)
-        const tdiv = document.getElementById('trades');
-        tdiv.innerHTML = "";
-        (data.trades || []).forEach(line => {
-          const d = document.createElement('div'); d.className = 'logline';
-          const cls = line.includes('BUY') ? 'pos' : (line.includes('SELL') ? 'neg' : '');
-          d.innerHTML = `<span class="${cls}">${line}</span>`;
-          tdiv.appendChild(d);
-        });
-
-        // Scans (null-safe)
-        const sdiv = document.getElementById('scans');
-        sdiv.innerHTML = "";
-        (data.scans || []).forEach(line => {
-          const d = document.createElement('div'); d.className = 'logline';
-          if (line.includes('BUY')) d.innerHTML = `<span class="pos">${line}</span>`;
-          else if (line.includes('SELL')) d.innerHTML = `<span class="neg">${line}</span>`;
-          else d.textContent = line;
-          sdiv.appendChild(d);
-        });
-
-        // Raw I/O (optional; null-safe)
-        try {
-          const ioRes = await fetch('/io');
-          const ioData = await ioRes.json();
-          const iodiv = document.getElementById('iolog'); iodiv.innerHTML = "";
-          (ioData || []).forEach(l => {
-            const d = document.createElement('div'); d.className='logline'; d.textContent = l;
-            iodiv.appendChild(d);
-          });
-        } catch(_) {}
-        document.getElementById('err').textContent = "";
-      }catch(e){
-        document.getElementById('err').textContent = "Error fetching /status: " + e;
-      }
+    async function api(path, opts={}) {
+      const r = await fetch(path, opts).catch(e => null);
+      if (!r) return null;
+      try { return await r.json(); } catch { return null; }
     }
 
-    async function postJSON(url){
-      try{ await fetch(url,{method:'POST'}); loadStatus(); }
-      catch(e){ document.getElementById('err').textContent = "Error: " + e; }
+    async function refresh() {
+      const st = await api("/status");
+      if (!st) return;
+      document.getElementById("status").textContent = st.status || "Idle";
+      document.getElementById("last").textContent = st.last || "-";
+      document.getElementById("usdt").textContent = st.usdt || 0;
+      document.getElementById("profit_today").textContent = st.profit_today || 0;
+      document.getElementById("profit_yesterday").textContent = st.profit_yesterday || 0;
+      document.getElementById("pnl_cumulative").textContent = st.pnl_cumulative || 0;
+      document.getElementById("positions").textContent = JSON.stringify(st.positions,null,2) || "none";
+      document.getElementById("trades").textContent = JSON.stringify(st.trades,null,2) || "none";
+
+      const scans = document.getElementById("scanlog");
+      scans.innerHTML = (st.scans||[]).map(x=>"<div>"+x+"</div>").join("");
+
+      const io = await api("/io");
+      const ioBox = document.getElementById("iolist");
+      ioBox.innerHTML = (io||[]).map(x=>"<div>"+x+"</div>").join("");
     }
 
-    setInterval(loadStatus, 5000);
-    loadStatus();
+    async function keepaliveStatus() {
+      const r = await fetch("/ping").catch(e=>null);
+      document.getElementById("keepalive").textContent = r && r.ok ? "OK" : "FAIL";
+      document.getElementById("keepalive").className = r && r.ok ? "green" : "red";
+    }
+
+    async function start(){ await api("/start",{method:"POST"}); refresh(); }
+    async function stop(){ await api("/stop",{method:"POST"}); refresh(); }
+
+    setInterval(refresh, 5000);
+    setInterval(keepaliveStatus, 60000); // ping every 60s
+    refresh(); keepaliveStatus();
   </script>
 </body>
 </html>
