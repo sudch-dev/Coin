@@ -1,7 +1,8 @@
-# app.py — EMA/Donchian bot with live CoinDCX rules, keep-alive, TP-only
-# TP = Entry ± 10 * risk_unit, No SL, precision-safe quantities
+# app.py — EMA/Donchian bot (15m candles), TP-only at ±1%, learns precision/min-qty from errors,
+# live CoinDCX rules once at boot, keep-alive self-ping, real trades, P&L persistence
 
 import os
+import re
 import time
 import threading
 import hmac
@@ -39,8 +40,8 @@ PAIRS = [
 ]
 
 # ================== Time & State ==================
-CANDLE_INTERVAL = 30                # seconds
-TRADE_COOLDOWN_SEC = 300            # cooldown after an exit
+CANDLE_INTERVAL = 15 * 60          # 15 minutes (in seconds)
+TRADE_COOLDOWN_SEC = 300           # cooldown after an exit
 
 IST = timezone('Asia/Kolkata')
 def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
@@ -186,6 +187,44 @@ def fmt_qty_floor(pair, qty):
     q = int(q / step) * step
     return float(f"{q:.{qp}f}")
 
+# --- Learn from order errors: adjust qty precision / min qty for next time ---
+def learn_from_order_error(pair, res):
+    """
+    Inspects CoinDCX error messages and updates PAIR_RULES so the next order conforms.
+    Examples we handle:
+      - "AERO precision should be 2"         -> qty_precision = 2
+      - "DOGE precision should be 4"         -> qty_precision = 4
+      - "Quantity should be greater than 10" -> min_qty = 10
+    """
+    try:
+        if not isinstance(res, dict):
+            return
+        msg = res.get("message") or res.get("error") or ""
+        if not isinstance(msg, str) or not msg:
+            return
+
+        # precision adjustment
+        m = re.search(r'precision\s+should\s+be\s+(\d+)', msg, re.I)
+        if m:
+            new_qp = int(m.group(1))
+            if pair in PAIR_RULES:
+                old = _qp(pair)
+                if new_qp != old:
+                    PAIR_RULES[pair]["qty_precision"] = new_qp
+                    scan_log.append(f"{ist_now()} | learned qty_precision for {pair}: {old} -> {new_qp}")
+
+        # min quantity bump
+        m2 = re.search(r'Quantity\s+should\s+be\s+greater\s+than\s+([0-9]*\.?[0-9]+)', msg, re.I)
+        if m2:
+            new_min = float(m2.group(1))
+            if pair in PAIR_RULES:
+                old_min = _min_qty(pair)
+                if new_min > old_min + 1e-18:
+                    PAIR_RULES[pair]["min_qty"] = new_min
+                    scan_log.append(f"{ist_now()} | learned min_qty for {pair}: {old_min} -> {new_min}")
+    except Exception:
+        pass
+
 def adjusted_trade_qty(pair, side, desired_qty, price, balances):
     """
     Returns a viable qty that satisfies:
@@ -283,7 +322,7 @@ def place_order(pair, side, qty):
     qty = fmt_qty_floor(pair, qty)
     if qty <= 0:
         scan_log.append(f"{ist_now()} | {pair} | ABORT {side}: qty too small")
-        return {"error": "qty_too_small"}
+        return {"status": "error", "code": 400, "message": "qty <= 0 after precision floor"}
     payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
                "timestamp": int(time.time() * 1000)}
     try:
@@ -293,9 +332,15 @@ def place_order(pair, side, qty):
             headers={"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": hmac_signature(body), "Content-Type": "application/json"},
             data=body, timeout=10
         )
-        return r.json()
+        res = r.json() if r is not None else {}
+        # Learn from errors if present
+        if isinstance(res, dict) and (res.get("status") == "error" or res.get("code") == 400 or "message" in res):
+            learn_from_order_error(pair, res)
+        return res
     except Exception as e:
-        return {"error": str(e)}
+        err = {"status": "error", "message": str(e)}
+        learn_from_order_error(pair, err)
+        return err
 
 def get_order_status(order_id=None, client_order_id=None):
     body = {"timestamp": int(time.time() * 1000)}
@@ -351,22 +396,12 @@ def _compute_ema(values, n):
         ema = v * k + ema * (1 - k)
     return ema
 
-def _atr_14(candles):
-    if len(candles) < 15: return None
-    trs = []
-    prev_close = candles[-15]["close"]
-    for c in candles[-14:]:
-        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
-        trs.append(tr)
-        prev_close = c["close"]
-    return sum(trs) / len(trs) if trs else None
-
 # ================== Signal (Donchian + EMA5/13) ==================
 def pa_buy_sell_signal(pair, live_price=None):
     """
     - Trend: EMA5 > EMA13 (bull) or EMA5 < EMA13 (bear)
     - Breakout: cross Donchian(5) high/low using completed candles
-    - Risk unit later uses max(0.9*ATR14, 0.15% of price)
+    - We do NOT require ATR/risk here (TP fixed at 1%)
     """
     candles = candle_logs[pair]
     if len(candles) < 25:
@@ -387,16 +422,15 @@ def pa_buy_sell_signal(pair, live_price=None):
     closes_plus_live = closes[-30:] + [curr_price]
     ema_fast = _compute_ema(closes_plus_live, 5)
     ema_slow = _compute_ema(closes_plus_live, 13)
-    atr14 = _atr_14(completed)
 
-    if ema_fast is None or ema_slow is None or atr14 is None:
+    if ema_fast is None or ema_slow is None:
         return None
 
     if curr_price > don_high and ema_fast > ema_slow:
-        return {"side": "BUY", "entry": curr_price, "atr": atr14,
+        return {"side": "BUY", "entry": curr_price,
                 "msg": f"BUY: live breakout > Donchian({N}) & EMA5>EMA13"}
     if curr_price < don_low and ema_fast < ema_slow:
-        return {"side": "SELL", "entry": curr_price, "atr": atr14,
+        return {"side": "SELL", "entry": curr_price,
                 "msg": f"SELL: live breakdown < Donchian({N}) & EMA5<EMA13"}
     return None
 
@@ -418,6 +452,8 @@ def monitor_exits(prices):
         if side == "BUY" and price >= tp:
             res = place_order(pair, "SELL", qx)
             scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qx} @ {price} | {res}")
+            if isinstance(res, dict) and (res.get("status") == "error" or "message" in res):
+                learn_from_order_error(pair, res)
             order_id = ((res.get("orders") or [{}])[0].get("id")) if isinstance(res, dict) else None
             if order_id:
                 st = get_order_status(order_id=order_id)
@@ -429,6 +465,8 @@ def monitor_exits(prices):
         elif side == "SELL" and price <= tp:
             res = place_order(pair, "BUY", qx)
             scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qx} @ {price} | {res}")
+            if isinstance(res, dict) and (res.get("status") == "error" or "message" in res):
+                learn_from_order_error(pair, res)
             order_id = ((res.get("orders") or [{}])[0].get("id")) if isinstance(res, dict) else None
             if order_id:
                 st = get_order_status(order_id=order_id)
@@ -469,8 +507,8 @@ def scan_loop():
 
             price = prices[pair]["price"]
             tick_logs[pair].append((now, price))
-            if len(tick_logs[pair]) > 1000:
-                tick_logs[pair] = tick_logs[pair][-1000:]
+            if len(tick_logs[pair]) > 5000:
+                tick_logs[pair] = tick_logs[pair][-5000:]
 
             # build/refresh candles
             aggregate_candles(pair, interval)
@@ -485,20 +523,17 @@ def scan_loop():
                     if signal:
                         error_message = ""
                         entry = float(signal["entry"])
-                        atr = signal.get("atr", None)
 
                         usdt_bal = float(balances.get("USDT", 0.0))
-                        min_tick_risk = entry * 0.0015              # 0.15% as min distance
-                        risk_unit = max((0.9 * atr) if atr else 0, min_tick_risk)
 
-                        # ---- TP-only (no SL); TP = entry ± 10 * risk_unit ----
+                        # ---- TP-only (fixed ±1% of entry) ----
                         if signal["side"] == "BUY":
-                            tp = fmt_price(pair, entry + 10 * risk_unit)
-                            pre_qty = (0.3 * usdt_bal) / entry          # 30% notional cap
+                            tp = fmt_price(pair, entry * 1.01)             # +1%
+                            pre_qty = (0.3 * usdt_bal) / entry             # 30% notional cap
                         else:
-                            tp = fmt_price(pair, entry - 10 * risk_unit)
+                            tp = fmt_price(pair, entry * 0.99)             # -1%
                             coin = pair[:-4]
-                            pre_qty = float(balances.get(coin, 0.0))    # inventory-based shorts only
+                            pre_qty = float(balances.get(coin, 0.0))       # inventory-based shorts only
 
                         # Adjust qty to exchange rules and funds
                         qty = adjusted_trade_qty(pair, signal["side"], pre_qty, entry, balances)
@@ -506,11 +541,13 @@ def scan_loop():
                         if qty <= 0:
                             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} skipped: cannot meet min rules/funds")
                         else:
-                            # precision-floor again (belt & suspenders)
-                            qty = fmt_qty_floor(pair, qty)
+                            qty = fmt_qty_floor(pair, qty)  # belt & suspenders
 
                             res = place_order(pair, signal["side"], qty)
                             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | TP {tp} | {res}")
+                            if isinstance(res, dict) and (res.get("status") == "error" or "message" in res):
+                                learn_from_order_error(pair, res)
+
                             trade_log.append({
                                 "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
                                 "msg": signal["msg"], "tp": tp, "qty": qty, "order_result": res
@@ -572,7 +609,7 @@ def get_status():
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
-        "status_epoch": status_epoch,
+        "status_epoch": status_epoch,  # for frontend heartbeat
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
