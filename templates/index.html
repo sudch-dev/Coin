@@ -1,218 +1,297 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title> Live Monitor</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  :root{
-    --bg:#0f1115; --card:#151922; --muted:#8ea0b3; --fg:#e6edf3;
-    --good:#15c47e; --bad:#ff6b6b; --warn:#e6b800; --accent:#5aa7ff;
-  }
-  *{box-sizing:border-box}
-  body{margin:0; font:14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Arial; background:var(--bg); color:var(--fg)}
-  header{display:flex; gap:16px; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #202534}
-  h1{margin:0; font-size:18px}
-  .small{color:var(--muted); font-size:12px}
-  .row{display:flex; flex-wrap:wrap; gap:16px; padding:16px}
-  .card{background:var(--card); border:1px solid #202534; border-radius:10px; padding:14px; flex:1 1 320px; min-width:280px}
-  .kvs{display:grid; grid-template-columns: 160px 1fr; gap:8px 12px}
-  .kvs div:nth-child(odd){color:var(--muted)}
-  .pill{display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; border:1px solid #2a3144; background:#0f1320}
-  .ok{color:var(--good)} .err{color:var(--bad)} .warn{color:var(--warn)}
-  button{all:unset; background:#1b2335; border:1px solid #2a3144; color:#dce7f7; padding:8px 12px; border-radius:8px; cursor:pointer}
-  button:hover{outline:1px solid #3a485f}
-  .btns{display:flex; gap:10px; flex-wrap:wrap}
-  table{width:100%; border-collapse:collapse}
-  th,td{padding:8px 10px; border-bottom:1px solid #22283a; text-align:left}
-  th{color:#a7b6c8; font-weight:600}
-  .num{text-align:right; font-variant-numeric:tabular-nums}
-  .logs{height:260px; overflow:auto; background:#0f1320; border:1px solid #22283a; border-radius:8px; padding:10px; font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px; white-space:pre-wrap}
-  footer{padding:10px 16px; color:var(--muted); border-top:1px solid #202534; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap}
-  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:12px}
-  @media (max-width:840px){ .grid2{grid-template-columns:1fr} }
-</style>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
+  />
+  <title>Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1218;
+      --panel: #171b23;
+      --text: #dfe6f1;
+      --muted: #9aa4b2;
+      --ok: #41d392;
+      --warn: #ffcc66;
+      --err: #ff6b6b;
+      --accent: #5aa9ff;
+      --border: #2a3140;
+      --badge-buy: #2ecc71;
+      --badge-sell: #ff7675;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --round: 12px;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin:0; padding:0; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 960px; margin: 24px auto; padding: 0 14px; }
+    h1 { font-size: 22px; margin: 0 0 16px; color: #8be887; letter-spacing: .5px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    @media (min-width:900px){ .row { grid-template-columns: 1fr 1fr; } }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--round); padding: 14px; }
+    .title { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+    .btns button {
+      background:#232a36; color: var(--text); border:1px solid var(--border);
+      padding:8px 10px; border-radius:8px; margin-right:8px; cursor:pointer;
+    }
+    .btns button:hover{ border-color:#3b4558; }
+    .status-line { margin-top:8px; font-family: var(--mono); font-size:13px; }
+    .status-chip{ display:inline-block; padding:3px 8px; border-radius:999px; font-weight:600; }
+    .ok{ background: rgba(65,211,146,.15); color: var(--ok); border:1px solid rgba(65,211,146,.3); }
+    .idle{ background: rgba(255,204,102,.15); color: var(--warn); border:1px solid rgba(255,204,102,.35); }
+    .dead{ background: rgba(255,107,107,.15); color: var(--err); border:1px solid rgba(255,107,107,.35); }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align:left; padding:10px; border-bottom:1px solid var(--border); }
+    th { color: var(--muted); font-weight:600; }
+    .mono { font-family: var(--mono); }
+    .muted { color: var(--muted); }
+    .badge {
+      display:inline-block; padding:3px 8px; border-radius:6px; font-weight:700; font-size:12px;
+      color:#111; background:#999;
+    }
+    .buy { background: var(--badge-buy); }
+    .sell{ background: var(--badge-sell); }
+    .flex { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+    .small { font-size: 12px; }
+    pre.log {
+      background:#0b0e13; border:1px solid var(--border); border-radius:10px;
+      padding:12px; max-height: 260px; overflow:auto; font-family: var(--mono); font-size: 12px; line-height:1.45;
+    }
+    .pill { background:#202736; border:1px solid var(--border); border-radius:999px; padding:6px 10px; }
+    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width:520px){ .grid-2 { grid-template-columns: 1fr; } }
+    .kv { display:flex; justify-content:space-between; background:#10141c; border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+  </style>
 </head>
 <body>
-
-<header>
-  <div>
-    <h1>CoinDCX Bot — Live Monitor</h1>
-    <div class="small">EMA/Donchian strategy · Asia/Kolkata time</div>
-  </div>
-  <div class="pill" id="hbPill">
-    <span>Heartbeat:</span><strong id="hbText">—</strong>
-  </div>
-</header>
-
-<div class="row">
-  <div class="card">
-    <h3>Status</h3>
-    <div class="kvs">
-      <div>Engine</div><div id="st"></div>
-      <div>Last Update</div><div id="last"></div>
-      <div>USDT Balance</div><div class="num" id="usdt">0.0</div>
-      <div>Error</div><div id="err" class="small">—</div>
+  <div class="wrap">
+    <div class="title">
+      <h1>Dashboard</h1>
+      <div class="btns">
+        <button id="btnStart">Start</button>
+        <button id="btnStop">Stop</button>
+        <button id="btnRefresh">Refresh</button>
+      </div>
     </div>
-    <div style="height:8px"></div>
-    <div class="btns">
-      <button id="startBtn">▶ Start</button>
-      <button id="stopBtn">■ Stop</button>
-      <button id="refreshBtn">↻ Refresh</button>
-      <span class="small" id="nextPingNote"></span>
+
+    <div class="card" id="statusCard">
+      <div class="flex">
+        <div>Service:</div>
+        <div id="statusChip" class="status-chip idle">—</div>
+      </div>
+      <div class="status-line">
+        <span class="muted">Last:</span> <span id="last"></span>
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        <span class="muted">Heartbeat:</span> <span id="hbAge">—</span>
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        <span class="muted">Now:</span> <span id="now"></span>
+      </div>
+      <div class="status-line small">
+        <span class="muted">Error:</span> <span id="err" class="mono"></span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h3 style="margin:0 0 8px;">Balances</h3>
+        <div class="grid-2" style="margin-bottom:8px;">
+          <div class="kv"><div>USDT</div><div class="mono" id="usdt">—</div></div>
+          <div class="kv"><div>Profit Today</div><div class="mono" id="pToday">—</div></div>
+          <div class="kv"><div>Profit Yesterday</div><div class="mono" id="pYday">—</div></div>
+          <div class="kv"><div>Cumulative P&amp;L</div><div class="mono" id="pCum">—</div></div>
+        </div>
+        <table id="coinTable">
+          <thead><tr><th>Coin</th><th class="mono">Balance</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 8px;">Open Positions</h3>
+        <div id="positions" class="muted">none</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="card">
+        <h3 style="margin:0 0 8px;">Trade Log</h3>
+        <div id="tradeLog"></div>
+      </div>
+      <div class="card">
+        <h3 style="margin:0 0 8px;">Scan Log</h3>
+        <pre id="scanLog" class="log"></pre>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <h3>P&amp;L</h3>
-    <div class="kvs">
-      <div>Today</div><div class="num" id="pnlToday">0.000000</div>
-      <div>Yesterday</div><div class="num" id="pnlYday">0.000000</div>
-      <div>Cumulative</div><div class="num" id="pnlCum">0.000000</div>
-    </div>
-  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmtNum = (n, d=6) => {
+      const x = Number(n);
+      if (!isFinite(x)) return '0';
+      return x.toFixed(d).replace(/\.?0+$/,'');
+    };
+    const since = (unix) => {
+      if(!unix) return '—';
+      const s = Math.max(0, Math.floor(Date.now()/1000 - unix));
+      if (s < 60) return `${s}s ago`;
+      const m = Math.floor(s/60), r = s%60;
+      if (m < 60) return `${m}m ${r}s ago`;
+      const h = Math.floor(m/60), mm = m%60;
+      return `${h}h ${mm}m ago`;
+    };
 
-  <div class="card">
-    <h3>Open Positions</h3>
-    <table id="posTbl">
-      <thead><tr><th>Pair</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">TP</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-</div>
-
-<div class="row">
-  <div class="card">
-    <h3>Coin Balances</h3>
-    <table id="balTbl">
-      <thead><tr><th>Coin</th><th class="num">Balance</th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h3>Trade Log</h3>
-    <div class="logs" id="trades">loading…</div>
-  </div>
-
-  <div class="card">
-    <h3>Scan Log</h3>
-    <div class="logs" id="scans">loading…</div>
-  </div>
-</div>
-
-<footer>
-  <div>Keep-alive: pings <code>/ping</code> from the server loop. This page also polls <code>/status</code> every <span id="pollSecs">3</span>s.</div>
-  <div>Local time: <span id="localNow">—</span></div>
-</footer>
-
-<script>
-const $ = (s)=>document.querySelector(s);
-const fmt = (n, d=6)=> (typeof n==='number') ? n.toFixed(d) : n;
-const POLL_MS = 3000;  // front-end polling for this dashboard
-let lastStatusEpoch = 0;
-
-async function postJSON(url){
-  try{
-    const r = await fetch(url, {method:'POST'});
-    return await r.json();
-  }catch(e){ return {error:String(e)} }
-}
-function setHeartbeat(epoch){
-  // epoch is server-side UNIX seconds; show age and color
-  if(!epoch){ $("#hbText").textContent = "—"; return; }
-  const age = Math.max(0, Math.floor(Date.now()/1000 - epoch));
-  $("#hbText").textContent = age + "s ago";
-  const pill = $("#hbPill");
-  pill.classList.remove("ok","warn","err");
-  if(age <= 6) pill.classList.add("ok");
-  else if(age <= 15) pill.classList.add("warn");
-  else pill.classList.add("err");
-}
-
-function renderStatus(data){
-  $("#st").textContent   = data.status || "—";
-  $("#last").textContent = data.last || "—";
-  $("#usdt").textContent = (data.usdt ?? 0).toFixed(6);
-  $("#pnlToday").textContent = fmt(data.profit_today ?? 0);
-  $("#pnlYday").textContent  = fmt(data.profit_yesterday ?? 0);
-  $("#pnlCum").textContent   = fmt(data.pnl_cumulative ?? 0);
-  $("#err").textContent  = data.error || "—";
-
-  // positions
-  const posT = $("#posTbl tbody");
-  posT.innerHTML = "";
-  const pos = data.positions || {};
-  Object.keys(pos).forEach(pair=>{
-    const p = pos[pair] || {};
-    const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${pair}</td>
-                    <td>${p.side||"—"}</td>
-                    <td class="num">${fmt(parseFloat(p.qty||0),6)}</td>
-                    <td class="num">${fmt(parseFloat(p.entry||0),6)}</td>
-                    <td class="num">${fmt(parseFloat(p.tp||0),6)}</td>`;
-    posT.appendChild(tr);
-  });
-  if(!Object.keys(pos).length){
-    const tr=document.createElement("tr"); tr.innerHTML=`<td colspan="5" class="small">No open positions</td>`;
-    posT.appendChild(tr);
-  }
-
-  // balances
-  const balT = $("#balTbl tbody");
-  balT.innerHTML = "";
-  const coins = data.coins || {};
-  const entries = Object.entries(coins).filter(([c,v])=> v && v>0).sort((a,b)=>b[1]-a[1]);
-  if(entries.length===0){
-    const tr=document.createElement("tr"); tr.innerHTML=`<td colspan="2" class="small">No coin balances</td>`;
-    balT.appendChild(tr);
-  }else{
-    for(const [c,v] of entries){
-      const tr=document.createElement("tr");
-      tr.innerHTML = `<td>${c}</td><td class="num">${fmt(v,8)}</td>`;
-      balT.appendChild(tr);
+    async function call(path, opts={}) {
+      const r = await fetch(path, opts);
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json().catch(() => ({}));
     }
-  }
 
-  // logs
-  $("#trades").textContent = (data.trades || []).join("\n") || "—";
-  $("#scans").textContent  = (data.scans  || []).join("\n") || "—";
+    function setStatusChip(status, hbAgeSec) {
+      const chip = $("statusChip");
+      chip.textContent = status || "—";
+      chip.className = "status-chip";
+      // choose class based on heartbeat + status
+      if (hbAgeSec > 45 || status === "Idle") chip.classList.add("dead");
+      else chip.classList.add("ok");
+    }
 
-  // heartbeat
-  if(typeof data.status_epoch === "number"){
-    lastStatusEpoch = data.status_epoch;
-    setHeartbeat(lastStatusEpoch);
-  }
-}
+    function renderCoins(coins) {
+      const tbody = $("coinTable").querySelector("tbody");
+      tbody.innerHTML = "";
+      const entries = Object.entries(coins || {}).sort((a,b) => (b[1]-a[1]));
+      if (!entries.length) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td"); td.colSpan=2; td.className="muted"; td.textContent="—";
+        tr.appendChild(td); tbody.appendChild(tr); return;
+      }
+      for (const [c, bal] of entries) {
+        const tr = document.createElement("tr");
+        const td1 = document.createElement("td"); td1.textContent = c; tr.appendChild(td1);
+        const td2 = document.createElement("td"); td2.className="mono"; td2.textContent = fmtNum(bal, 8); tr.appendChild(td2);
+        tbody.appendChild(tr);
+      }
+    }
 
-async function loadStatus(){
-  try{
-    const r = await fetch("/status", {cache:"no-store"});
-    const data = await r.json();
-    renderStatus(data);
-  }catch(e){
-    $("#err").textContent = "Dashboard fetch error: " + e;
-  }
-}
+    function renderTrades(trades) {
+      const box = $("tradeLog");
+      box.innerHTML = "";
+      (trades || []).forEach(t => {
+        const row = document.createElement("div");
+        row.className = "card";
+        row.style.background = "#11151d";
+        row.style.border = "1px solid var(--border)";
+        row.style.marginBottom = "8px";
+        const head = document.createElement("div");
+        head.className = "flex";
+        const side = document.createElement("span");
+        side.className = "badge " + (t.side === "BUY" ? "buy":"sell");
+        side.textContent = t.side || "?";
+        const time = document.createElement("span");
+        time.className = "mono muted small";
+        time.textContent = t.time || "";
+        const pair = document.createElement("span");
+        pair.className = "pill mono";
+        pair.textContent = t.pair || "";
+        head.appendChild(side); head.appendChild(pair); head.appendChild(time);
+        row.appendChild(head);
 
-$("#startBtn").onclick = async ()=>{
-  const res = await postJSON("/start");
-  await loadStatus();
-};
-$("#stopBtn").onclick = async ()=>{
-  const res = await postJSON("/stop");
-  await loadStatus();
-};
-$("#refreshBtn").onclick = loadStatus;
+        const info = document.createElement("div");
+        info.className = "mono small";
+        info.style.marginTop = "6px";
+        info.textContent = `Entry: ${fmtNum(t.entry)}  |  TP: ${fmtNum(t.tp)}  |  Qty: ${fmtNum(t.qty)}`;
+        row.appendChild(info);
 
-function tick(){
-  $("#localNow").textContent = new Date().toLocaleString();
-}
-setInterval(tick, 1000); tick();
+        if (t.msg) {
+          const m = document.createElement("div");
+          m.className = "small muted"; m.style.marginTop="6px";
+          m.textContent = t.msg; row.appendChild(m);
+        }
 
-$("#pollSecs").textContent = (POLL_MS/1000).toFixed(0);
-setInterval(loadStatus, POLL_MS);
-loadStatus();
-</script>
+        const res = document.createElement("div");
+        res.className = "mono small";
+        res.style.marginTop="6px";
+        const or = t.order_result || {};
+        // Show compact error/success line
+        const status = (or.status || (or.code ? "error" : "ok"));
+        const code = (or.code !== undefined ? ` code=${or.code}` : "");
+        const msg = (or.message ? ` msg="${or.message}"` : "");
+        res.textContent = `Result: ${status}${code}${msg}`;
+        row.appendChild(res);
+
+        box.appendChild(row);
+      });
+      if (!box.children.length) {
+        const none = document.createElement("div");
+        none.className="muted"; none.textContent="(no trades yet)";
+        box.appendChild(none);
+      }
+    }
+
+    function renderScans(scans) {
+      const pre = $("scanLog");
+      pre.textContent = (scans || []).join("\n");
+    }
+
+    function renderPositions(exitOrders) {
+      const box = $("positions");
+      if (!exitOrders || !exitOrders.length) { box.textContent = "none"; return; }
+      const tbl = document.createElement("table");
+      const thead = document.createElement("thead");
+      thead.innerHTML = "<tr><th>Pair</th><th>Side</th><th class='mono'>Qty</th><th class='mono'>Entry</th><th class='mono'>TP</th></tr>";
+      tbl.appendChild(thead);
+      const tb = document.createElement("tbody");
+      exitOrders.forEach(p => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${p.pair||""}</td>
+                        <td><span class="badge ${p.side==='BUY'?'buy':'sell'}">${p.side||""}</span></td>
+                        <td class="mono">${fmtNum(p.qty)}</td>
+                        <td class="mono">${fmtNum(p.entry)}</td>
+                        <td class="mono">${fmtNum(p.tp)}</td>`;
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb);
+      box.innerHTML = ""; box.appendChild(tbl);
+    }
+
+    async function refresh() {
+      try {
+        const data = await call("/status");
+        // status + heartbeat
+        $("last").textContent = data.last || "—";
+        $("now").textContent  = new Date().toLocaleString();
+        const hbAgeSec = Math.max(0, Math.floor(Date.now()/1000 - (data.status_epoch || 0)));
+        $("hbAge").textContent = since(data.status_epoch || 0);
+        setStatusChip(data.status || "Idle", hbAgeSec);
+        $("err").textContent = data.error || "—";
+
+        // balances / pnl
+        $("usdt").textContent  = fmtNum(data.usdt, 6);
+        $("pToday").textContent= fmtNum(data.profit_today, 6);
+        $("pYday").textContent = fmtNum(data.profit_yesterday, 6);
+        $("pCum").textContent  = fmtNum(data.pnl_cumulative, 6);
+
+        renderCoins(data.coins || {});
+        renderTrades(data.trades || []);
+        renderScans(data.scans || []);
+        // We derive "open positions" from /status? not provided; reuse last trades that are pending exits if you expose them.
+        // If you decide to include exit_orders in /status, call renderPositions(data.exit_orders);
+      } catch (e) {
+        $("err").textContent = e.message;
+        setStatusChip("Idle", 9999);
+      }
+    }
+
+    // buttons
+    $("btnStart").onclick = async () => { try { await call("/start", {method:"POST"}); } catch(e){}; refresh(); };
+    $("btnStop").onclick  = async () => { try { await call("/stop",  {method:"POST"}); } catch(e){}; refresh(); };
+    $("btnRefresh").onclick = refresh;
+
+    // poll
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
 </body>
 </html>
