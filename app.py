@@ -1,5 +1,5 @@
-# app.py — EMA/Donchian bot with live CoinDCX rules (precision, min_qty, min_notional),
-# keep-alive self-ping, real trades, P&L persistence, TP-only (no SL)
+# app.py — EMA/Donchian bot with live CoinDCX rules, keep-alive, TP-only
+# TP = Entry ± 10 * risk_unit, No SL, precision-safe quantities
 
 import os
 import time
@@ -48,10 +48,10 @@ def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
 def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
 tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
-scan_log, trade_log, exit_orders = [], [], []   # exit_orders has no SL now
+scan_log, trade_log, exit_orders = [], [], []   # TP-only (no SL)
 running = False
 status = {"msg": "Idle", "last": ""}
-status_epoch = 0         # heartbeat for the UI watchdog
+status_epoch = 0
 error_message = ""
 pair_cooldown_until = {p: 0 for p in PAIRS}
 
@@ -146,10 +146,7 @@ def compute_realized_pnl_today():
 PAIR_RULES = {}
 
 def refresh_pair_rules():
-    """
-    Load live market rules once: price/qty precision, min_qty, min_notional.
-    Keeps only PAIRS.
-    """
+    """Load live market rules once: price/qty precision, min_qty, min_notional. Keeps only PAIRS."""
     try:
         r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=15)
         if not r.ok:
@@ -159,7 +156,6 @@ def refresh_pair_rules():
             pair = (it.get("pair") or it.get("market") or it.get("coindcx_name") or "").strip()
             if not pair:
                 continue
-            # Keep or filter later
             rules[pair] = {
                 "price_precision": int(it.get("target_currency_precision", 6)),
                 "qty_precision":   int(it.get("base_currency_precision", 6)),
@@ -193,8 +189,7 @@ def fmt_qty_floor(pair, qty):
 def adjusted_trade_qty(pair, side, desired_qty, price, balances):
     """
     Returns a viable qty that satisfies:
-      - min_qty
-      - min_notional (price * qty)
+      - min_qty, min_notional
       - caps by funds (USDT for BUY) or coin inventory (SELL)
     Floors to precision. Returns 0.0 if not feasible.
     """
@@ -284,18 +279,20 @@ def _signed_post(url, body):
     return {}
 
 def place_order(pair, side, qty):
-    qty = fmt_qty_floor(pair, qty)  # precision-safe
+    # ALWAYS precision-floor qty before sending order
+    qty = fmt_qty_floor(pair, qty)
     if qty <= 0:
         scan_log.append(f"{ist_now()} | {pair} | ABORT {side}: qty too small")
         return {"error": "qty_too_small"}
     payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
                "timestamp": int(time.time() * 1000)}
     try:
-        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create",
-                          headers={"X-AUTH-APIKEY": API_KEY,
-                                   "X-AUTH-SIGNATURE": hmac_signature(json.dumps(payload, separators=(',', ':'))),
-                                   "Content-Type": "application/json"},
-                          data=json.dumps(payload, separators=(',', ':')), timeout=10)
+        body = json.dumps(payload, separators=(',', ':'))
+        r = requests.post(
+            f"{BASE_URL}/exchange/v1/orders/create",
+            headers={"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": hmac_signature(body), "Content-Type": "application/json"},
+            data=body, timeout=10
+        )
         return r.json()
     except Exception as e:
         return {"error": str(e)}
@@ -364,12 +361,12 @@ def _atr_14(candles):
         prev_close = c["close"]
     return sum(trs) / len(trs) if trs else None
 
-# ================== Signal (Donchian + EMA5/13, ATR distance) ==================
+# ================== Signal (Donchian + EMA5/13) ==================
 def pa_buy_sell_signal(pair, live_price=None):
     """
     - Trend: EMA5 > EMA13 (bull) or EMA5 < EMA13 (bear)
     - Breakout: cross Donchian(5) high/low using completed candles
-    - Risk unit = max(0.9*ATR14, 0.15% of price) for TP distance
+    - Risk unit later uses max(0.9*ATR14, 0.15% of price)
     """
     candles = candle_logs[pair]
     if len(candles) < 25:
@@ -416,7 +413,7 @@ def monitor_exits(prices):
         if price is None:
             continue
 
-        qx = fmt_qty_floor(pair, qty)
+        qx = fmt_qty_floor(pair, qty)  # precision-safe on exit too
 
         if side == "BUY" and price >= tp:
             res = place_order(pair, "SELL", qx)
@@ -494,14 +491,14 @@ def scan_loop():
                         min_tick_risk = entry * 0.0015              # 0.15% as min distance
                         risk_unit = max((0.9 * atr) if atr else 0, min_tick_risk)
 
-                        # ---- TP-only (no SL) ----
+                        # ---- TP-only (no SL); TP = entry ± 10 * risk_unit ----
                         if signal["side"] == "BUY":
-                            tp = fmt_price(pair, entry + 10 * risk_unit)   # 2:1 vs implicit risk_unit
-                            pre_qty = (0.3 * usdt_bal) / entry            # cap-based sizing
+                            tp = fmt_price(pair, entry + 10 * risk_unit)
+                            pre_qty = (0.3 * usdt_bal) / entry          # 30% notional cap
                         else:
                             tp = fmt_price(pair, entry - 10 * risk_unit)
                             coin = pair[:-4]
-                            pre_qty = float(balances.get(coin, 0.0))      # inventory-based shorts only
+                            pre_qty = float(balances.get(coin, 0.0))    # inventory-based shorts only
 
                         # Adjust qty to exchange rules and funds
                         qty = adjusted_trade_qty(pair, signal["side"], pre_qty, entry, balances)
@@ -509,13 +506,16 @@ def scan_loop():
                         if qty <= 0:
                             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} skipped: cannot meet min rules/funds")
                         else:
+                            # precision-floor again (belt & suspenders)
+                            qty = fmt_qty_floor(pair, qty)
+
                             res = place_order(pair, signal["side"], qty)
                             scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | TP {tp} | {res}")
                             trade_log.append({
                                 "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
                                 "msg": signal["msg"], "tp": tp, "qty": qty, "order_result": res
                             })
-                            # Note: no SL stored, only TP
+                            # store floored qty in exit orders to prevent precision errors on exit
                             exit_orders.append({
                                 "pair": pair, "side": signal["side"], "qty": qty,
                                 "tp": tp, "entry": entry
@@ -572,7 +572,7 @@ def get_status():
     return jsonify({
         "status": status["msg"],
         "last": status["last"],
-        "status_epoch": status_epoch,  # for frontend watchdog/heartbeat
+        "status_epoch": status_epoch,
         "usdt": balances.get("USDT", 0.0),
         "profit_today": profit_today,
         "profit_yesterday": profit_yesterday,
@@ -590,5 +590,5 @@ def ping():
 # ================== Boot ==================
 if __name__ == "__main__":
     load_profit_state()
-    refresh_pair_rules()   # <-- fetch live precision/min rules once at boot
+    refresh_pair_rules()   # fetch live precision/min rules once at boot
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
