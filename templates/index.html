@@ -2,101 +2,88 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta
-    name="viewport"
-    content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
-  />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Dashboard</title>
   <style>
-    :root {
-      --bg: #0f1218;
-      --panel: #171b23;
-      --text: #dfe6f1;
-      --muted: #9aa4b2;
-      --ok: #41d392;
-      --warn: #ffcc66;
-      --err: #ff6b6b;
-      --accent: #5aa9ff;
-      --border: #2a3140;
-      --badge-buy: #2ecc71;
-      --badge-sell: #ff7675;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      --round: 12px;
+    :root{
+      --bg:#0f1218; --panel:#171b23; --text:#e8eef7; --muted:#a1adbd;
+      --border:#2a3140; --ok:#41d392; --err:#ff6b6b; --badge-buy:#2ecc71; --badge-sell:#ff7675;
+      --mono: ui-monospace, Menlo, Consolas, "Courier New", monospace;
     }
-    * { box-sizing: border-box; }
-    html, body { margin:0; padding:0; background:var(--bg); color:var(--text); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    .wrap { max-width: 960px; margin: 24px auto; padding: 0 14px; }
-    h1 { font-size: 22px; margin: 0 0 16px; color: #8be887; letter-spacing: .5px; }
-    .row { display: grid; grid-template-columns: 1fr; gap: 14px; }
-    @media (min-width:900px){ .row { grid-template-columns: 1fr 1fr; } }
-    .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--round); padding: 14px; }
-    .title { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
-    .btns button {
-      background:#232a36; color: var(--text); border:1px solid var(--border);
-      padding:8px 10px; border-radius:8px; margin-right:8px; cursor:pointer;
-    }
-    .btns button:hover{ border-color:#3b4558; }
-    .status-line { margin-top:8px; font-family: var(--mono); font-size:13px; }
-    .status-chip{ display:inline-block; padding:3px 8px; border-radius:999px; font-weight:600; }
-    .ok{ background: rgba(65,211,146,.15); color: var(--ok); border:1px solid rgba(65,211,146,.3); }
-    .idle{ background: rgba(255,204,102,.15); color: var(--warn); border:1px solid rgba(255,204,102,.35); }
-    .dead{ background: rgba(255,107,107,.15); color: var(--err); border:1px solid rgba(255,107,107,.35); }
-
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align:left; padding:10px; border-bottom:1px solid var(--border); }
-    th { color: var(--muted); font-weight:600; }
-    .mono { font-family: var(--mono); }
-    .muted { color: var(--muted); }
-    .badge {
-      display:inline-block; padding:3px 8px; border-radius:6px; font-weight:700; font-size:12px;
-      color:#111; background:#999;
-    }
-    .buy { background: var(--badge-buy); }
-    .sell{ background: var(--badge-sell); }
-    .flex { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
-    .small { font-size: 12px; }
-    pre.log {
-      background:#0b0e13; border:1px solid var(--border); border-radius:10px;
-      padding:12px; max-height: 260px; overflow:auto; font-family: var(--mono); font-size: 12px; line-height:1.45;
-    }
-    .pill { background:#202736; border:1px solid var(--border); border-radius:999px; padding:6px 10px; }
-    .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    @media (max-width:520px){ .grid-2 { grid-template-columns: 1fr; } }
-    .kv { display:flex; justify-content:space-between; background:#10141c; border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    html,body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif}
+    .wrap{max-width:960px;margin:20px auto;padding:0 14px}
+    h1{margin:0 0 12px;color:#8be887}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px}
+    .row{display:grid;grid-template-columns:1fr;gap:12px}
+    @media(min-width:900px){.row{grid-template-columns:1fr 1fr}}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid var(--border);text-align:left}
+    th{color:var(--muted)}
+    .mono{font-family:var(--mono)}
+    .muted{color:var(--muted)}
+    .btn{background:#222a36;color:var(--text);border:1px solid var(--border);padding:8px 10px;border-radius:8px;cursor:pointer;margin-right:8px}
+    .badge{display:inline-block;padding:3px 8px;border-radius:6px;font-weight:700;font-size:12px;color:#111}
+    .buy{background:var(--badge-buy)} .sell{background:var(--badge-sell)}
+    pre.log{background:#0b0e13;border:1px solid var(--border);border-radius:10px;padding:10px;max-height:260px;overflow:auto;font-family:var(--mono);font-size:12px}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    @media(max-width:520px){.grid2{grid-template-columns:1fr}}
+    .kv{display:flex;justify-content:space-between;background:#10141c;border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+    .status{display:flex;gap:10px;align-items:center}
+    .chip{padding:3px 8px;border-radius:999px;border:1px solid #355;color:#aee}
+    .ok{background:rgba(65,211,146,.15);color:var(--ok)}
+    .dead{background:rgba(255,107,107,.15);color:var(--err)}
+    .pill{background:#202736;border:1px solid var(--border);border-radius:999px;padding:3px 8px}
+    .small{font-size:12px}
+    .ctl input,.ctl select{background:#0f141d;border:1px solid var(--border);color:var(--text);padding:7px 8px;border-radius:8px}
+    .ctl label{display:block;margin-bottom:6px}
+    .ctl-row{display:flex;gap:10px;flex-wrap:wrap}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="title">
-      <h1>Dashboard</h1>
-      <div class="btns">
-        <button id="btnStart">Start</button>
-        <button id="btnStop">Stop</button>
-        <button id="btnRefresh">Refresh</button>
+    <div class="card">
+      <div class="status">
+        <h1 style="margin:0;">Dashboard</h1>
+        <span id="chip" class="chip">—</span>
+        <button class="btn" id="btnStart">Start</button>
+        <button class="btn" id="btnStop">Stop</button>
+        <button class="btn" id="btnRefresh">Refresh</button>
       </div>
+      <div class="small mono">
+        Last: <span id="last">—</span> | Heartbeat: <span id="hb">—</span> | Now: <span id="now">—</span>
+      </div>
+      <div class="small mono">Error: <span id="err" class="muted">—</span></div>
     </div>
 
-    <div class="card" id="statusCard">
-      <div class="flex">
-        <div>Service:</div>
-        <div id="statusChip" class="status-chip idle">—</div>
+    <!-- Settings -->
+    <div class="card">
+      <h3 style="margin:0 0 8px;">Settings</h3>
+      <div class="ctl-row">
+        <div class="ctl">
+          <label for="candle">Candle Interval</label>
+          <select id="candle">
+            <option value="60">1 min</option>
+            <option value="300">5 min</option>
+            <option value="900">15 min</option>
+            <option value="1800">30 min</option>
+            <option value="3600">1 hour</option>
+          </select>
+        </div>
+        <div class="ctl">
+          <label for="tp">TP Percent (e.g. 1 = 1%)</label>
+          <input id="tp" type="number" step="0.01" min="0.1" max="5" value="1" />
+        </div>
+        <div class="ctl" style="align-self:flex-end;">
+          <button class="btn" id="btnSave">Save</button>
+        </div>
       </div>
-      <div class="status-line">
-        <span class="muted">Last:</span> <span id="last"></span>
-        &nbsp;&nbsp;|&nbsp;&nbsp;
-        <span class="muted">Heartbeat:</span> <span id="hbAge">—</span>
-        &nbsp;&nbsp;|&nbsp;&nbsp;
-        <span class="muted">Now:</span> <span id="now"></span>
-      </div>
-      <div class="status-line small">
-        <span class="muted">Error:</span> <span id="err" class="mono"></span>
-      </div>
+      <div class="small muted">Note: TP is applied as ±TP% of entry. Example: 1 → +1% for BUY, −1% for SELL.</div>
     </div>
 
     <div class="row">
       <div class="card">
         <h3 style="margin:0 0 8px;">Balances</h3>
-        <div class="grid-2" style="margin-bottom:8px;">
+        <div class="grid2" style="margin-bottom:8px;">
           <div class="kv"><div>USDT</div><div class="mono" id="usdt">—</div></div>
           <div class="kv"><div>Profit Today</div><div class="mono" id="pToday">—</div></div>
           <div class="kv"><div>Profit Yesterday</div><div class="mono" id="pYday">—</div></div>
@@ -107,10 +94,9 @@
           <tbody></tbody>
         </table>
       </div>
-
       <div class="card">
         <h3 style="margin:0 0 8px;">Open Positions</h3>
-        <div id="positions" class="muted">none</div>
+        <div id="positions" class="muted">Derived from active exit orders (not exposed).</div>
       </div>
     </div>
 
@@ -127,11 +113,9 @@
   </div>
 
   <script>
-    const $ = (id) => document.getElementById(id);
-    const fmtNum = (n, d=6) => {
-      const x = Number(n);
-      if (!isFinite(x)) return '0';
-      return x.toFixed(d).replace(/\.?0+$/,'');
+    const $ = id => document.getElementById(id);
+    const fmt = (n, d=6) => {
+      const x = Number(n); if(!isFinite(x)) return "0"; return x.toFixed(d).replace(/\.?0+$/,'');
     };
     const since = (unix) => {
       if(!unix) return '—';
@@ -142,156 +126,119 @@
       const h = Math.floor(m/60), mm = m%60;
       return `${h}h ${mm}m ago`;
     };
+    const setChip = (alive) => {
+      const c = $("chip");
+      c.className = "chip " + (alive ? "ok" : "dead");
+      c.textContent = alive ? "Running" : "Idle/No Heartbeat";
+    };
 
-    async function call(path, opts={}) {
+    async function api(path, opts={}) {
       const r = await fetch(path, opts);
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      return r.json().catch(() => ({}));
-    }
-
-    function setStatusChip(status, hbAgeSec) {
-      const chip = $("statusChip");
-      chip.textContent = status || "—";
-      chip.className = "status-chip";
-      // choose class based on heartbeat + status
-      if (hbAgeSec > 45 || status === "Idle") chip.classList.add("dead");
-      else chip.classList.add("ok");
+      return r.json().catch(()=>({}));
     }
 
     function renderCoins(coins) {
       const tbody = $("coinTable").querySelector("tbody");
       tbody.innerHTML = "";
-      const entries = Object.entries(coins || {}).sort((a,b) => (b[1]-a[1]));
-      if (!entries.length) {
+      const rows = Object.entries(coins||{}).sort((a,b)=>b[1]-a[1]);
+      if (!rows.length) { const tr=document.createElement("tr"); tr.innerHTML=`<td colspan=2 class="muted">—</td>`; tbody.appendChild(tr); return; }
+      rows.forEach(([c,bal])=>{
         const tr = document.createElement("tr");
-        const td = document.createElement("td"); td.colSpan=2; td.className="muted"; td.textContent="—";
-        tr.appendChild(td); tbody.appendChild(tr); return;
-      }
-      for (const [c, bal] of entries) {
-        const tr = document.createElement("tr");
-        const td1 = document.createElement("td"); td1.textContent = c; tr.appendChild(td1);
-        const td2 = document.createElement("td"); td2.className="mono"; td2.textContent = fmtNum(bal, 8); tr.appendChild(td2);
+        tr.innerHTML = `<td>${c}</td><td class="mono">${fmt(bal, 8)}</td>`;
         tbody.appendChild(tr);
-      }
+      });
     }
 
-    function renderTrades(trades) {
+    function renderTrades(list) {
       const box = $("tradeLog");
       box.innerHTML = "";
-      (trades || []).forEach(t => {
-        const row = document.createElement("div");
-        row.className = "card";
-        row.style.background = "#11151d";
-        row.style.border = "1px solid var(--border)";
-        row.style.marginBottom = "8px";
-        const head = document.createElement("div");
-        head.className = "flex";
-        const side = document.createElement("span");
-        side.className = "badge " + (t.side === "BUY" ? "buy":"sell");
-        side.textContent = t.side || "?";
-        const time = document.createElement("span");
-        time.className = "mono muted small";
-        time.textContent = t.time || "";
-        const pair = document.createElement("span");
-        pair.className = "pill mono";
-        pair.textContent = t.pair || "";
-        head.appendChild(side); head.appendChild(pair); head.appendChild(time);
-        row.appendChild(head);
-
-        const info = document.createElement("div");
-        info.className = "mono small";
-        info.style.marginTop = "6px";
-        info.textContent = `Entry: ${fmtNum(t.entry)}  |  TP: ${fmtNum(t.tp)}  |  Qty: ${fmtNum(t.qty)}`;
-        row.appendChild(info);
-
-        if (t.msg) {
-          const m = document.createElement("div");
-          m.className = "small muted"; m.style.marginTop="6px";
-          m.textContent = t.msg; row.appendChild(m);
-        }
-
-        const res = document.createElement("div");
-        res.className = "mono small";
-        res.style.marginTop="6px";
-        const or = t.order_result || {};
-        // Show compact error/success line
-        const status = (or.status || (or.code ? "error" : "ok"));
-        const code = (or.code !== undefined ? ` code=${or.code}` : "");
-        const msg = (or.message ? ` msg="${or.message}"` : "");
-        res.textContent = `Result: ${status}${code}${msg}`;
-        row.appendChild(res);
-
-        box.appendChild(row);
+      (list||[]).forEach(t=>{
+        const el = document.createElement("div");
+        el.className = "card";
+        el.style.background = "#11151d"; el.style.border = "1px solid var(--border)"; el.style.marginBottom = "8px";
+        el.innerHTML = `
+          <div class="small mono">
+            <span class="badge ${t.side==='BUY'?'buy':'sell'}">${t.side||''}</span>
+            <span class="pill mono">${t.pair||''}</span>
+            <span class="muted">${t.time||''}</span>
+          </div>
+          <div class="mono small" style="margin-top:6px;">
+            Entry: ${fmt(t.entry)} &nbsp;|&nbsp; TP: ${fmt(t.tp)} &nbsp;|&nbsp; Qty: ${fmt(t.qty)}
+          </div>
+          ${t.msg ? `<div class="small muted" style="margin-top:6px;">${t.msg}</div>` : ""}
+          <div class="mono small" style="margin-top:6px;">
+            ${(() => {
+              const or = t.order_result || {};
+              const st = (or.status || (or.code ? "error" : "ok"));
+              const code = (or.code !== undefined ? ` code=${or.code}` : "");
+              const msg = (or.message ? ` msg="${or.message}"` : "");
+              return `Result: ${st}${code}${msg}`;
+            })()}
+          </div>
+        `;
+        box.appendChild(el);
       });
-      if (!box.children.length) {
-        const none = document.createElement("div");
-        none.className="muted"; none.textContent="(no trades yet)";
-        box.appendChild(none);
-      }
+      if (!box.children.length) box.innerHTML = `<div class="muted">(no trades yet)</div>`;
     }
 
     function renderScans(scans) {
-      const pre = $("scanLog");
-      pre.textContent = (scans || []).join("\n");
+      $("scanLog").textContent = (scans||[]).join("\n");
     }
 
-    function renderPositions(exitOrders) {
-      const box = $("positions");
-      if (!exitOrders || !exitOrders.length) { box.textContent = "none"; return; }
-      const tbl = document.createElement("table");
-      const thead = document.createElement("thead");
-      thead.innerHTML = "<tr><th>Pair</th><th>Side</th><th class='mono'>Qty</th><th class='mono'>Entry</th><th class='mono'>TP</th></tr>";
-      tbl.appendChild(thead);
-      const tb = document.createElement("tbody");
-      exitOrders.forEach(p => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${p.pair||""}</td>
-                        <td><span class="badge ${p.side==='BUY'?'buy':'sell'}">${p.side||""}</span></td>
-                        <td class="mono">${fmtNum(p.qty)}</td>
-                        <td class="mono">${fmtNum(p.entry)}</td>
-                        <td class="mono">${fmtNum(p.tp)}</td>`;
-        tb.appendChild(tr);
-      });
-      tbl.appendChild(tb);
-      box.innerHTML = ""; box.appendChild(tbl);
-    }
-
-    async function refresh() {
+    async function loadStatus() {
       try {
-        const data = await call("/status");
-        // status + heartbeat
-        $("last").textContent = data.last || "—";
+        const d = await api("/status");
+        $("last").textContent = d.last || "—";
         $("now").textContent  = new Date().toLocaleString();
-        const hbAgeSec = Math.max(0, Math.floor(Date.now()/1000 - (data.status_epoch || 0)));
-        $("hbAge").textContent = since(data.status_epoch || 0);
-        setStatusChip(data.status || "Idle", hbAgeSec);
-        $("err").textContent = data.error || "—";
+        $("err").textContent  = d.error || "—";
 
-        // balances / pnl
-        $("usdt").textContent  = fmtNum(data.usdt, 6);
-        $("pToday").textContent= fmtNum(data.profit_today, 6);
-        $("pYday").textContent = fmtNum(data.profit_yesterday, 6);
-        $("pCum").textContent  = fmtNum(data.pnl_cumulative, 6);
+        const hbAge = Math.max(0, Math.floor(Date.now()/1000 - (d.status_epoch||0)));
+        $("hb").textContent = since(d.status_epoch||0);
+        setChip(hbAge <= 45 && d.status === "Running");
 
-        renderCoins(data.coins || {});
-        renderTrades(data.trades || []);
-        renderScans(data.scans || []);
-        // We derive "open positions" from /status? not provided; reuse last trades that are pending exits if you expose them.
-        // If you decide to include exit_orders in /status, call renderPositions(data.exit_orders);
-      } catch (e) {
+        $("usdt").textContent   = fmt(d.usdt, 6);
+        $("pToday").textContent = fmt(d.profit_today, 6);
+        $("pYday").textContent  = fmt(d.profit_yesterday, 6);
+        $("pCum").textContent   = fmt(d.pnl_cumulative, 6);
+
+        renderCoins(d.coins);
+        renderTrades(d.trades);
+        renderScans(d.scans);
+
+        // populate settings
+        const s = d.settings || {};
+        const ci = Number(s.candle_interval_sec || 900);
+        const tp = Number((s.tp_pct || 0.01) * 100);
+        $("candle").value = String(ci);
+        $("tp").value = (tp*1).toFixed(2).replace(/\.?0+$/,'');
+      } catch(e) {
         $("err").textContent = e.message;
-        setStatusChip("Idle", 9999);
+        setChip(false);
       }
     }
 
-    // buttons
-    $("btnStart").onclick = async () => { try { await call("/start", {method:"POST"}); } catch(e){}; refresh(); };
-    $("btnStop").onclick  = async () => { try { await call("/stop",  {method:"POST"}); } catch(e){}; refresh(); };
-    $("btnRefresh").onclick = refresh;
+    async function saveSettings() {
+      try {
+        const ci = Number($("candle").value || 900);
+        const tp_input_pct = Number($("tp").value || 1); // user enters "1" for 1%
+        const body = { candle_interval_sec: ci, tp_pct: tp_input_pct/100 };
+        const r = await api("/config", {method:"POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body)});
+        if (!r.ok && r.error) throw new Error(r.error);
+        // refresh after save
+        await loadStatus();
+      } catch(e) {
+        $("err").textContent = "Save failed: " + e.message;
+      }
+    }
 
-    // poll
-    refresh();
-    setInterval(refresh, 5000);
+    $("btnStart").onclick = async () => { try { await api("/start", {method:"POST"}); } catch(e){}; loadStatus(); };
+    $("btnStop").onclick  = async () => { try { await api("/stop",  {method:"POST"}); } catch(e){}; loadStatus(); };
+    $("btnRefresh").onclick = loadStatus;
+    $("btnSave").onclick = saveSettings;
+
+    loadStatus();
+    setInterval(loadStatus, 5000);
   </script>
 </body>
 </html>
