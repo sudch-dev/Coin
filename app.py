@@ -1,36 +1,40 @@
-# app.py — ERX-HYBRID BOT (NO WSGI, NO GUNICORN, PURE FLASK)
-# Trend + Sideways Regime Adaptive Strategy
-# Render-safe, Bot-safe, Single-process architecture
+# app.py — ERX-HYBRID LIVE TRADING BOT
+# CoinDCX + Flask + Render
+# NO WSGI | NO GUNICORN | NO UVICORN
+# Single-process | Single-loop | Production-safe
 
-import os, time, json, math, threading, requests
-from flask import Flask, jsonify, request
-from datetime import datetime, timedelta
+import os, time, json, math, threading, requests, hmac, hashlib
+from flask import Flask, jsonify
+from datetime import datetime
 from pytz import timezone
+
+# =========================
+# ===== FLASK APP =========
+# =========================
 
 app = Flask(__name__)
 
 # =========================
-# ===== BASIC CONFIG ======
+# ===== CONFIG ============
 # =========================
 
-API_KEY = os.environ.get("API_KEY", "")
-API_SECRET = os.environ.get("API_SECRET", "")
+API_KEY = os.environ.get("API_KEY","")
+API_SECRET = (os.environ.get("API_SECRET","") or "").encode()
 BASE_URL = "https://api.coindcx.com"
 
-APP_BASE_URL  = os.environ.get("APP_BASE_URL", "").rstrip("/")
-KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "240"))
+APP_BASE_URL  = os.environ.get("APP_BASE_URL","").rstrip("/")
+KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC","240"))
 
-IST = timezone('Asia/Kolkata')
+PORT = int(os.environ.get("PORT","10000"))
 
-def ist_now():
-    return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+IST = timezone("Asia/Kolkata")
 
 # =========================
 # ===== BOT STATE =========
 # =========================
 
 running = True
-status = {"msg": "Running"}
+status = {"msg":"BOOTING"}
 status_epoch = 0
 
 # =========================
@@ -56,158 +60,189 @@ PAIR_RULES = {
 }
 
 SETTINGS = {
-    "candle_interval_sec": 15 * 60,
+    "candle_interval_sec": 15*60,
     "tp_pct": 0.01
 }
 
 TRADE_COOLDOWN_SEC = 300
 
-tick_logs = {p: [] for p in PAIRS}
-candle_logs = {p: [] for p in PAIRS}
+# =========================
+# ===== DATA STORES =======
+# =========================
+
+tick_logs = {p:[] for p in PAIRS}
+candle_logs = {p:[] for p in PAIRS}
+open_positions = {}
 exit_orders = []
-pair_cooldown_until = {p: 0 for p in PAIRS}
+pair_cooldown_until = {p:0 for p in PAIRS}
 
 # =========================
-# ===== HTTP ROUTES =======
+# ===== UTILITIES =========
 # =========================
 
-@app.route("/")
-def home():
-    return jsonify({
-        "service": "ERX-HYBRID BOT",
-        "status": "RUNNING",
-        "time": ist_now()
-    })
-
-@app.route("/status")
-def status_api():
-    return jsonify({
-        "running": running,
-        "pairs": PAIRS,
-        "time": ist_now(),
-        "mode": "ERX-HYBRID",
-        "message": status.get("msg", "OK")
-    })
-
-@app.route("/ping")
-def ping():
-    return "OK", 200
-
-# =========================
-# ===== HELPERS ===========
-# =========================
+def ist_now():
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 def _pp(pair): return int(PAIR_RULES[pair]["precision"])
 def _min_qty(pair): return float(PAIR_RULES[pair]["min_qty"])
 
-def fmt_qty_floor(pair, qty):
-    qp = _pp(pair)
-    step = 10 ** (-qp)
+def fmt_qty(pair, qty):
+    step = 10**(-_pp(pair))
     q = int(float(qty)/step)*step
-    return float(f"{q:.{qp}f}")
+    return float(f"{q:.{_pp(pair)}f}")
+
+def hmac_sig(payload):
+    return hmac.new(API_SECRET,payload.encode(),hashlib.sha256).hexdigest()
 
 # =========================
-# ===== CANDLES ===========
+# ===== EXCHANGE ==========
 # =========================
 
-def aggregate_candles(pair, interval_sec):
-    t = tick_logs[pair]
-    if not t: return
-    candles, candle, lastw = [], None, None
-    for ts, px in sorted(t, key=lambda x: x[0]):
-        w = ts - (ts % interval_sec)
-        if w != lastw:
-            if candle: candles.append(candle)
-            candle = {"open": px,"high": px,"low": px,"close": px,"start": w}
-            lastw = w
-        else:
-            candle["high"] = max(candle["high"], px)
-            candle["low"] = min(candle["low"], px)
-            candle["close"] = px
-    if candle: candles.append(candle)
-    candle_logs[pair] = candles[-120:]
+def get_prices():
+    try:
+        r=requests.get(f"{BASE_URL}/exchange/ticker",timeout=10)
+        if r.ok:
+            data={}
+            for it in r.json():
+                if it["market"] in PAIRS:
+                    data[it["market"]] = float(it["last_price"])
+            return data
+    except: pass
+    return {}
+
+def get_balances():
+    payload=json.dumps({"timestamp":int(time.time()*1000)})
+    headers={
+        "X-AUTH-APIKEY":API_KEY,
+        "X-AUTH-SIGNATURE":hmac_sig(payload),
+        "Content-Type":"application/json"
+    }
+    try:
+        r=requests.post(f"{BASE_URL}/exchange/v1/users/balances",headers=headers,data=payload,timeout=10)
+        if r.ok:
+            return {b["currency"]:float(b["balance"]) for b in r.json()}
+    except: pass
+    return {}
+
+def place_order(pair, side, qty):
+    qty = fmt_qty(pair,qty)
+    if qty<=0: return None
+    body={
+        "market":pair,
+        "side":side.lower(),
+        "order_type":"market_order",
+        "total_quantity":str(qty),
+        "timestamp":int(time.time()*1000)
+    }
+    payload=json.dumps(body,separators=(',',':'))
+    headers={
+        "X-AUTH-APIKEY":API_KEY,
+        "X-AUTH-SIGNATURE":hmac_sig(payload),
+        "Content-Type":"application/json"
+    }
+    try:
+        r=requests.post(f"{BASE_URL}/exchange/v1/orders/create",headers=headers,data=payload,timeout=10)
+        if r.ok:
+            return r.json()
+    except: pass
+    return None
 
 # =========================
 # ===== INDICATORS ========
 # =========================
 
-def ema(values, n):
-    if len(values) < n: return None
-    k = 2/(n+1)
-    e = sum(values[:n])/n
-    for v in values[n:]:
-        e = v*k + e*(1-k)
+def ema(v,n):
+    if len(v)<n: return None
+    k=2/(n+1)
+    e=sum(v[:n])/n
+    for x in v[n:]:
+        e=x*k+e*(1-k)
     return e
 
-def rsi(values, n=14):
-    if len(values) < n+1: return None
-    gains, losses = 0, 0
+def rsi(v,n=14):
+    if len(v)<n+1: return None
+    g,l=0,0
     for i in range(-n,0):
-        d = values[i]-values[i-1]
-        if d>0: gains+=d
-        else: losses+=abs(d)
-    if losses == 0: return 100
-    rs = gains/losses
+        d=v[i]-v[i-1]
+        if d>0: g+=d
+        else: l+=abs(d)
+    if l==0: return 100
+    rs=g/l
     return 100-(100/(1+rs))
 
-def atr(candles, n=14):
-    if len(candles)<n+1: return None
+def atr(c,n=14):
+    if len(c)<n+1: return None
     trs=[]
     for i in range(-n,0):
-        h=candles[i]["high"]; l=candles[i]["low"]; pc=candles[i-1]["close"]
+        h=c[i]["high"]; l=c[i]["low"]; pc=c[i-1]["close"]
         trs.append(max(h-l,abs(h-pc),abs(l-pc)))
     return sum(trs)/n
 
-def bb_width(values,n=20):
-    if len(values)<n: return None
-    v=values[-n:]
-    ma=sum(v)/n
-    var=sum((x-ma)**2 for x in v)/n
+def bb_width(v,n=20):
+    if len(v)<n: return None
+    x=v[-n:]; ma=sum(x)/n
+    var=sum((i-ma)**2 for i in x)/n
     std=math.sqrt(var)
     return (ma+2*std)-(ma-2*std)
 
 # =========================
-# ===== ERX-HYBRID LOGIC ==
+# ===== CANDLES ===========
+# =========================
+
+def aggregate(pair):
+    t=tick_logs[pair]
+    if not t: return
+    candles=[]; candle=None; lastw=None
+    for ts,px in sorted(t,key=lambda x:x[0]):
+        w=ts-(ts%SETTINGS["candle_interval_sec"])
+        if w!=lastw:
+            if candle: candles.append(candle)
+            candle={"open":px,"high":px,"low":px,"close":px,"start":w}
+            lastw=w
+        else:
+            candle["high"]=max(candle["high"],px)
+            candle["low"]=min(candle["low"],px)
+            candle["close"]=px
+    if candle: candles.append(candle)
+    candle_logs[pair]=candles[-120:]
+
+# =========================
+# ===== STRATEGY ==========
 # =========================
 
 def erx_signal(pair, price):
-    candles = candle_logs[pair]
-    if len(candles)<60: return None
+    c=candle_logs[pair]
+    if len(c)<60: return None
+    comp=c[:-1]
+    closes=[x["close"] for x in comp]
+    highs=[x["high"] for x in comp]
+    lows=[x["low"] for x in comp]
 
-    completed=candles[:-1]
-    closes=[c["close"] for c in completed]
-    highs=[c["high"] for c in completed]
-    lows=[c["low"] for c in completed]
+    ema20=ema(closes,20); ema50=ema(closes,50)
+    r=rsi(closes,14)
+    a=atr(comp,14)
+    bw=bb_width(closes,20)
 
-    ema20=ema(closes,20)
-    ema50=ema(closes,50)
-    rsi14=rsi(closes,14)
-    atr14=atr(completed,14)
-    bbw=bb_width(closes,20)
+    if None in [ema20,ema50,r,a,bw]: return None
 
-    if None in [ema20,ema50,rsi14,atr14,bbw]: return None
+    pbw=bb_width(closes[:-1],20)
+    pa=atr(comp[:-1],14)
 
-    prev_bbw=bb_width(closes[:-1],20)
-    prev_atr=atr(completed[:-1],14)
+    TREND = bw>pbw and a>pa
+    RANGE = bw<pbw and a<=pa and abs(ema20-ema50)<0.002*price
 
-    TREND_MODE = (bbw>prev_bbw and atr14>prev_atr)
-    SIDEWAYS_MODE = (bbw<prev_bbw and atr14<=prev_atr and abs(ema20-ema50)<0.002*price)
+    if TREND:
+        if ema20>ema50 and price>ema20 and 50<=r<=65:
+            return "BUY"
+        if ema20<ema50 and price<ema20 and 35<=r<=50:
+            return "SELL"
 
-    # ===== TREND =====
-    if TREND_MODE:
-        if ema20>ema50 and price>ema20 and 50<=rsi14<=65 and lows[-1]<=ema20:
-            return {"side":"BUY","msg":"ERX TREND BUY"}
-        if ema20<ema50 and price<ema20 and 35<=rsi14<=50 and highs[-1]>=ema20:
-            return {"side":"SELL","msg":"ERX TREND SELL"}
-
-    # ===== RANGE =====
-    if SIDEWAYS_MODE:
-        rh=max(highs[-20:])
-        rl=min(lows[-20:])
-        if price<=rl*1.002 and rsi14<35:
-            return {"side":"BUY","msg":"ERX RANGE BUY"}
-        if price>=rh*0.998 and rsi14>65:
-            return {"side":"SELL","msg":"ERX RANGE SELL"}
+    if RANGE:
+        rh=max(highs[-20:]); rl=min(lows[-20:])
+        if price<=rl*1.002 and r<35:
+            return "BUY"
+        if price>=rh*0.998 and r>65:
+            return "SELL"
 
     return None
 
@@ -218,22 +253,72 @@ def erx_signal(pair, price):
 def monitor_exits(prices):
     rem=[]
     for ex in exit_orders:
-        pair=ex["pair"]; side=ex["side"]; tp=ex["tp"]; qty=ex["qty"]
+        pair=ex["pair"]; side=ex["side"]; tp=ex["tp"]
         px=prices.get(pair)
         if not px: continue
-        if side=="BUY" and px>=tp:
-            rem.append(ex)
-        if side=="SELL" and px<=tp:
-            rem.append(ex)
+        if side=="BUY" and px>=tp: rem.append(ex)
+        if side=="SELL" and px<=tp: rem.append(ex)
     for r in rem:
         exit_orders.remove(r)
-        pair_cooldown_until[r["pair"]] = int(time.time())+TRADE_COOLDOWN_SEC
+        pair_cooldown_until[r["pair"]]=int(time.time())+TRADE_COOLDOWN_SEC
+        open_positions.pop(r["pair"],None)
+
+# =========================
+# ===== MAIN LOOP =========
+# =========================
+
+def trade_loop():
+    global status_epoch
+    while True:
+        prices=get_prices()
+        now=int(time.time())
+
+        for pair,px in prices.items():
+            tick_logs[pair].append((now,px))
+            if len(tick_logs[pair])>5000:
+                tick_logs[pair]=tick_logs[pair][-5000:]
+
+            aggregate(pair)
+
+        monitor_exits(prices)
+
+        balances=get_balances()
+
+        for pair,px in prices.items():
+            if pair in open_positions: continue
+            if now<pair_cooldown_until[pair]: continue
+
+            sig=erx_signal(pair,px)
+            if not sig: continue
+
+            usdt=float(balances.get("USDT",0))
+            if sig=="BUY":
+                qty=(0.25*usdt)/px
+                qty=max(qty,_min_qty(pair))
+                res=place_order(pair,"BUY",qty)
+                if res:
+                    tp=px*(1+SETTINGS["tp_pct"])
+                    open_positions[pair]="BUY"
+                    exit_orders.append({"pair":pair,"side":"BUY","tp":tp})
+            elif sig=="SELL":
+                coin=pair[:-4]
+                bal=float(balances.get(coin,0))
+                if bal<=0: continue
+                qty=max(bal,_min_qty(pair))
+                res=place_order(pair,"SELL",qty)
+                if res:
+                    tp=px*(1-SETTINGS["tp_pct"])
+                    open_positions[pair]="SELL"
+                    exit_orders.append({"pair":pair,"side":"SELL","tp":tp})
+
+        status_epoch=int(time.time())
+        time.sleep(5)
 
 # =========================
 # ===== KEEPALIVE =========
 # =========================
 
-def keepalive_loop():
+def keepalive():
     while True:
         try:
             if APP_BASE_URL:
@@ -242,9 +327,36 @@ def keepalive_loop():
         time.sleep(KEEPALIVE_SEC)
 
 # =========================
+# ===== ROUTES ============
+# =========================
+
+@app.route("/")
+def home():
+    return jsonify({
+        "service":"ERX-HYBRID BOT",
+        "status":"RUNNING",
+        "time":ist_now()
+    })
+
+@app.route("/status")
+def status_api():
+    return jsonify({
+        "running":True,
+        "positions":open_positions,
+        "cooldowns":pair_cooldown_until,
+        "exit_orders":exit_orders,
+        "time":ist_now()
+    })
+
+@app.route("/ping")
+def ping():
+    return "OK",200
+
+# =========================
 # ===== BOOT ==============
 # =========================
 
-if __name__ == "__main__":
-    threading.Thread(target=keepalive_loop,daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","10000")))
+if __name__=="__main__":
+    threading.Thread(target=trade_loop,daemon=True).start()
+    threading.Thread(target=keepalive,daemon=True).start()
+    app.run(host="0.0.0.0",port=PORT)
