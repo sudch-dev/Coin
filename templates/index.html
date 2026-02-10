@@ -1,51 +1,42 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Algo Bot Terminal</title>
-<style>
-body{margin:0;font-family:Segoe UI;background:#0b0f14;color:#e6edf3}
-.header{display:flex;justify-content:space-between;padding:10px;background:#0f1720}
-button{padding:8px 12px;border:none;border-radius:5px;font-weight:600}
-.start{background:#00c853}.stop{background:#ff1744;color:#fff}
-.card{background:#0f1720;margin:8px;padding:10px;border-radius:8px}
-.grid{display:grid;grid-template-columns:repeat(3,1fr)}
-pre{font-size:11px}
-</style>
+    <title>Crypto Breakout Bot</title>
+    <style>
+        body{font-family:Arial;background:#0f172a;color:#e5e7eb;padding:20px}
+        button{padding:10px 20px;margin:5px;font-size:16px}
+        pre{background:#020617;padding:10px;height:300px;overflow:auto}
+    </style>
 </head>
 <body>
 
-<div class="header">
-<div>🤖 Algo Bot Terminal</div>
-<div>
-<button class="start" onclick="start()">START</button>
-<button class="stop" onclick="stop()">STOP</button>
-</div>
-</div>
+<h2>🚀 Live Breakout Spot Trading Bot</h2>
 
-<div class="grid">
-<div class="card"><h3>Status</h3><div id="status"></div></div>
-<div class="card"><h3>Balances</h3><pre id="balances"></pre></div>
-<div class="card"><h3>Health</h3><pre id="health"></pre></div>
-<div class="card"><h3>Orders</h3><pre id="orders"></pre></div>
-<div class="card"><h3>Trades</h3><pre id="trades"></pre></div>
-<div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
-</div>
+<button onclick="start()">Start Bot</button>
+<button onclick="stop()">Stop Bot</button>
+
+<h3>Status</h3>
+<pre id="status"></pre>
+
+<h3>Logs</h3>
+<pre id="logs"></pre>
 
 <script>
-function start(){fetch("/start",{method:"POST"})}
-function stop(){fetch("/stop",{method:"POST"})}
-
-async function refresh(){
- let r=await fetch("/status"); let d=await r.json();
- document.getElementById("status").innerText=d.status+" | "+d.last;
- document.getElementById("balances").innerText=JSON.stringify(d.balances,null,2);
- document.getElementById("health").innerText=JSON.stringify(d.health,null,2);
- document.getElementById("orders").innerText=JSON.stringify(d.orders.slice(-10),null,2);
- document.getElementById("trades").innerText=JSON.stringify(d.trades.slice(-10),null,2);
- document.getElementById("logs").innerText=d.logs.slice(-15).join("\n");
+function start(){
+    fetch('/start',{method:'POST'});
 }
-setInterval(refresh,2000); refresh();
+function stop(){
+    fetch('/stop',{method:'POST'});
+}
+
+function refresh(){
+    fetch('/status').then(r=>r.json()).then(d=>{
+        document.getElementById("status").innerText=JSON.stringify(d,null,2);
+        document.getElementById("logs").innerText=(d.logs||[]).slice(-30).join("\n");
+    })
+}
+
+setInterval(refresh,2000);
 </script>
 
 </body>
