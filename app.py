@@ -33,7 +33,7 @@ def init_db():
 init_db()
 
 # ========== BOT STATE ==========
-bot_running=False
+bot_running=True
 bot_thread=None
 
 STATE={
