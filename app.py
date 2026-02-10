@@ -124,7 +124,7 @@ def breakout_engine(price, high, low, vol, avg_vol):
 
 # ================== RISK ENGINE ==================
 def size(usdt, price):
-    risk_cap = usdt * 0.02   # 2% capital risk
+    risk_cap = usdt * 0.1   # 10% capital risk
     if price<=0: return 0
     return round(risk_cap/price,6)
 
