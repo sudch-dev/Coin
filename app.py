@@ -18,7 +18,7 @@ BASE_URL = "https://api.coindcx.com"
 
 PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT"]
 
-LIVE_TRADING = False     # 🔴 Set True for real orders
+LIVE_TRADING = True     # 🔴 Set True for real orders
 SPOT_ONLY = True
 
 MAX_RISK_PER_TRADE = 0.02
