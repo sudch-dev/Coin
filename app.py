@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, request, render_template
 import threading, time, requests, hmac, hashlib, json, os, sqlite3
-from datetime import datetime
+from datetime import datetime, date
 from pytz import timezone
 
 # ================== APP ==================
@@ -10,6 +10,9 @@ app = Flask(__name__)
 IST = timezone("Asia/Kolkata")
 def ist_now():
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+def today():
+    return date.today().isoformat()
 
 # ================== CONFIG ==================
 API_KEY = os.getenv("API_KEY","")
@@ -24,25 +27,36 @@ def db():
 
 def init_db():
     con=db();cur=con.cursor()
-    cur.execute("create table if not exists trades(time,pair,side,qty,price,mode,order_id,status)")
+    cur.execute("""create table if not exists trades(
+        time,pair,side,qty,price,mode,order_id,status,pnl,day)""")
     cur.execute("create table if not exists logs(time,msg)")
     con.commit();con.close()
 
 init_db()
 
-# ================== STATE MACHINE ==================
+# ================== GLOBAL STATE ==================
 bot_running=False
 bot_thread=None
+KILL_SWITCH=False
 
 STATE={
  "status":"Idle",
- "mode":"PAPER",          # PAPER | LIVE
+ "mode":"PAPER",
  "last":None,
  "balances":{},
  "positions":{},
  "orders":[],
  "logs":[],
- "health":{"api":"--","exchange":"--"}
+ "health":{"api":"--","exchange":"--"},
+ "risk":{
+    "daily_pnl":0.0,
+    "loss_streak":0,
+    "trades_today":0,
+    "max_dd":-0.05,          # -5%
+    "max_trades":10,
+    "max_loss_streak":3,
+    "max_exposure":0.2      # 20% capital
+ }
 }
 
 # ================== UTILS ==================
@@ -92,7 +106,7 @@ def prices():
         STATE["health"]["exchange"]="ERROR"
     return []
 
-# ================== DATA ENGINE ==================
+# ================== MARKET DATA ==================
 MARKET_DATA={}
 
 def update_market(t):
@@ -101,10 +115,8 @@ def update_market(t):
     vol=float(t.get("volume",0))
     if pair not in MARKET_DATA:
         MARKET_DATA[pair]={
-            "high":price,
-            "low":price,
-            "avg_vol":vol,
-            "last":price
+            "high":price,"low":price,
+            "avg_vol":vol,"last":price
         }
     d=MARKET_DATA[pair]
     d["high"]=max(d["high"],price)
@@ -113,9 +125,12 @@ def update_market(t):
     d["last"]=price
     return d
 
-# ================== INSTITUTIONAL BREAKOUT ENGINE ==================
+# ================== VOLATILITY FILTER ==================
+def vol_filter(vol, avg_vol):
+    return vol > avg_vol*0.8   # avoid dead markets
+
+# ================== BREAKOUT ENGINE ==================
 def breakout_engine(price, high, low, vol, avg_vol):
-    # Structure break + volume expansion + momentum continuation
     if price > high*1.001 and vol > avg_vol*1.7:
         return "BUY"
     if price < low*0.999 and vol > avg_vol*1.7:
@@ -123,56 +138,53 @@ def breakout_engine(price, high, low, vol, avg_vol):
     return None
 
 # ================== RISK ENGINE ==================
-def size(usdt, price):
-    risk_cap = usdt * 0.1   # 10% capital risk
-    if price<=0: return 0
-    return round(risk_cap/price,6)
+def capital_allocator(usdt):
+    return usdt * 0.02   # 2% per trade
 
-# ================== EXECUTION ROUTER ==================
+def size(usdt, price):
+    cap = capital_allocator(usdt)
+    if price<=0: return 0
+    return round(cap/price,6)
+
+def risk_firewall():
+    r=STATE["risk"]
+    if r["daily_pnl"] <= r["max_dd"]*10000:
+        return False
+    if r["loss_streak"] >= r["max_loss_streak"]:
+        return False
+    if r["trades_today"] >= r["max_trades"]:
+        return False
+    return True
+
+# ================== EXECUTION ==================
 def execute(pair, side, qty, price):
-    mode = STATE["mode"]
+    mode=STATE["mode"]
 
     order={
-        "time":ist_now(),
-        "pair":pair,
-        "side":side,
-        "qty":qty,
-        "price":price,
-        "mode":mode,
-        "order_id":None,
-        "status":"FILLED" if mode=="PAPER" else "SENT"
+        "time":ist_now(),"pair":pair,"side":side,
+        "qty":qty,"price":price,"mode":mode,
+        "order_id":None,"status":"FILLED" if mode=="PAPER" else "SENT"
     }
 
-    # ===== LIVE ORDER ROUTING =====
     if mode=="LIVE":
         payload={
-          "side": side.lower(),
+          "side":side.lower(),
           "order_type":"market",
-          "market": pair,
-          "quantity": qty,
-          "timestamp": int(time.time()*1000)
+          "market":pair,
+          "quantity":qty,
+          "timestamp":int(time.time()*1000)
         }
         try:
             r=api_post("/exchange/v1/orders/create",payload)
             if r.ok:
-                j=r.json()
-                order["order_id"]=j.get("id")
+                order["order_id"]=r.json().get("id")
                 order["status"]="LIVE"
-                log(f"LIVE ORDER {side} {pair} {qty}")
             else:
                 order["status"]="REJECTED"
-                log(f"ORDER REJECTED {pair}")
         except:
             order["status"]="FAILED"
-            log(f"ORDER FAILED {pair}")
 
     STATE["orders"].append(order)
-
-    con=db();cur=con.cursor()
-    cur.execute("insert into trades values(?,?,?,?,?,?,?,?)",
-        (order["time"],pair,side,qty,price,mode,order["order_id"],order["status"]))
-    con.commit();con.close()
-
     update_position(pair,side,qty,price)
 
 # ================== POSITION ENGINE ==================
@@ -181,42 +193,110 @@ def update_position(pair, side, qty, price):
         STATE["positions"][pair]={
             "entry":price,
             "qty":qty,
-            "sl": round(price*0.985,4),
-            "tp": round(price*1.03,4)
+            "sl":round(price*0.985,4),
+            "tp":round(price*1.03,4),
+            "peak":price
         }
-    if side=="SELL":
-        STATE["positions"].pop(pair,None)
+
+# ================== EXIT ENGINE ==================
+def exit_engine(pair, price, vol, avg_vol):
+    if pair not in STATE["positions"]:
+        return
+
+    pos=STATE["positions"][pair]
+    entry,sl,tp,qty=pos["entry"],pos["sl"],pos["tp"],pos["qty"]
+
+    # Stop loss
+    if price<=sl:
+        exit_trade(pair,qty,price,"SL"); return
+
+    # Take profit
+    if price>=tp:
+        exit_trade(pair,qty,price,"TP"); return
+
+    # Break-even
+    if price>=entry*1.015:
+        pos["sl"]=max(pos["sl"],entry)
+
+    # Trailing stop
+    if price>pos["peak"]:
+        pos["peak"]=price
+        pos["sl"]=max(pos["sl"],round(price*0.992,4))
+
+    # Fake breakout
+    if price<entry*0.995 and vol<avg_vol*0.6:
+        exit_trade(pair,qty,price,"FAKE_BREAKOUT")
+
+# ================== EXIT EXECUTOR ==================
+def exit_trade(pair, qty, price, reason):
+    mode=STATE["mode"]
+    order={
+        "time":ist_now(),"pair":pair,"side":"SELL",
+        "qty":qty,"price":price,"mode":mode,
+        "order_id":None,"status":"EXIT_"+reason
+    }
+
+    if mode=="LIVE":
+        payload={
+          "side":"sell","order_type":"market",
+          "market":pair,"quantity":qty,
+          "timestamp":int(time.time()*1000)
+        }
+        try:
+            r=api_post("/exchange/v1/orders/create",payload)
+            if r.ok:
+                order["order_id"]=r.json().get("id")
+                order["status"]="LIVE_EXIT_"+reason
+        except:
+            order["status"]="FAILED_EXIT"
+
+    STATE["orders"].append(order)
+    STATE["positions"].pop(pair,None)
+    STATE["risk"]["loss_streak"]=0 if "TP" in reason else STATE["risk"]["loss_streak"]+1
+    log(f"EXIT {pair} {reason}")
 
 # ================== BOT LOOP ==================
 def bot_loop():
     global bot_running
     log("ENGINE STARTED")
     while bot_running:
+        if KILL_SWITCH:
+            time.sleep(1); continue
+
         STATE["last"]=ist_now()
         STATE["balances"]=balances()
         tickers=prices()
-
         usdt=STATE["balances"].get("USDT",0)
 
         for t in tickers:
             if t["market"] in PAIRS:
                 d=update_market(t)
                 price=d["last"]
-                sig = breakout_engine(price,d["high"],d["low"],float(t.get("volume",0)),d["avg_vol"])
+                vol=float(t.get("volume",0))
 
-                if sig:
-                    qty=size(usdt,price)
-                    if qty>0:
-                        execute(t["market"],sig,qty,price)
+                # EXIT FIRST
+                exit_engine(t["market"],price,vol,d["avg_vol"])
+
+                # ENTRY
+                if t["market"] not in STATE["positions"]:
+                    if not risk_firewall(): 
+                        continue
+                    if not vol_filter(vol,d["avg_vol"]):
+                        continue
+
+                    sig=breakout_engine(price,d["high"],d["low"],vol,d["avg_vol"])
+                    if sig:
+                        qty=size(usdt,price)
+                        if qty>0:
+                            execute(t["market"],sig,qty,price)
+                            STATE["risk"]["trades_today"]+=1
 
         time.sleep(5)
-
     log("ENGINE STOPPED")
 
 # ================== ROUTES ==================
 @app.route("/")
-def home():
-    return render_template("index.html")
+def home(): return render_template("index.html")
 
 @app.route("/start",methods=["POST"])
 def start():
@@ -241,23 +321,25 @@ def set_mode():
     if data["mode"] in ["PAPER","LIVE"]:
         STATE["mode"]=data["mode"]
         log(f"MODE SET TO {data['mode']}")
-    return jsonify({"ok":True,"mode":STATE["mode"]})
+    return jsonify({"ok":True})
+
+@app.route("/kill",methods=["POST"])
+def kill():
+    global KILL_SWITCH
+    KILL_SWITCH=True
+    log("KILL SWITCH ACTIVATED")
+    return jsonify({"ok":True})
+
+@app.route("/flatten",methods=["POST"])
+def flatten():
+    for pair,pos in list(STATE["positions"].items()):
+        exit_trade(pair,pos["qty"],pos["entry"],"EMERGENCY")
+    log("EMERGENCY FLATTEN")
+    return jsonify({"ok":True})
 
 @app.route("/status")
-def status():
-    return jsonify(STATE)
-
-@app.route("/diagnostics")
-def diagnostics():
-    return jsonify({
-        "time":ist_now(),
-        "api_key_loaded":bool(API_KEY),
-        "api_secret_loaded":bool(API_SECRET),
-        "bot_running":bot_running,
-        "mode":STATE["mode"],
-        "health":STATE["health"]
-    })
+def status(): return jsonify(STATE)
 
 # ================== MAIN ==================
 if __name__=="__main__":
-    app.run(host="0.0.0.0",port=5000,debug=False)
+    app.run(host="0.0.0.0",port=5000)
