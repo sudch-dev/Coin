@@ -48,15 +48,15 @@ STATE={
  "positions":{},
  "orders":[],
  "logs":[],
- "health":{"api":"--","exchange":"--"},
+ "health":{"api":"--","exchange":"--","heartbeat":"--"},
  "risk":{
     "daily_pnl":0.0,
     "loss_streak":0,
     "trades_today":0,
-    "max_dd":-0.05,          
+    "max_dd":-0.05,
     "max_trades":10,
     "max_loss_streak":3,
-    "max_exposure":0.2      
+    "max_exposure":0.2
  }
 }
 
@@ -64,9 +64,12 @@ STATE={
 def log(msg):
     entry=f"{ist_now()} | {msg}"
     STATE["logs"].append(entry)
-    con=db();cur=con.cursor()
-    cur.execute("insert into logs values(?,?)",(ist_now(),msg))
-    con.commit();con.close()
+    try:
+        con=db();cur=con.cursor()
+        cur.execute("insert into logs values(?,?)",(ist_now(),msg))
+        con.commit();con.close()
+    except:
+        pass
 
 def sign(payload):
     return hmac.new(API_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest()
@@ -78,7 +81,7 @@ def api_post(path,payload):
         "X-AUTH-SIGNATURE":sign(body),
         "Content-Type":"application/json"
     }
-    return requests.post(BASE_URL+path,headers=headers,data=body,timeout=15)
+    return requests.post(BASE_URL+path,headers=headers,data=body,timeout=10)
 
 # ================== EXCHANGE ==================
 def balances():
@@ -97,7 +100,7 @@ def balances():
 
 def prices():
     try:
-        r=requests.get(BASE_URL+"/exchange/ticker",timeout=10)
+        r=requests.get(BASE_URL+"/exchange/ticker",timeout=8)
         if r.ok:
             STATE["health"]["exchange"]="OK"
             return r.json()
@@ -126,7 +129,7 @@ def update_market(t):
     d["last"]=price
     return d
 
-# ================== FILTERS & ENGINES ==================
+# ================== ENGINES ==================
 def vol_filter(vol, avg_vol):
     return vol > avg_vol*0.8
 
@@ -283,20 +286,28 @@ def bot_loop():
         time.sleep(5)
     log("ENGINE STOPPED")
 
-# ================== KEEPALIVE ENGINE ==================
+# ================== SAFE KEEPALIVE ==================
 def keepalive_loop():
-    while KEEPALIVE:
+    while True:
+        STATE["health"]["heartbeat"]=ist_now()
+        time.sleep(15)
+
+# ================== WATCHDOG ==================
+def watchdog_loop():
+    global bot_running, bot_thread
+    while True:
         try:
-            api_post("/exchange/v1/users/balances",{"timestamp":int(time.time()*1000)})
-            STATE["health"]["api"]="OK"
+            if bot_running:
+                if bot_thread is None or not bot_thread.is_alive():
+                    log("WATCHDOG | Engine thread died — restarting")
+                    bot_thread=threading.Thread(target=bot_loop,daemon=True)
+                    bot_thread.start()
         except:
-            STATE["health"]["api"]="ERROR"
+            pass
+        time.sleep(10)
 
-        log("HEARTBEAT | System Alive")
-        time.sleep(60)
-
-keepalive_thread = threading.Thread(target=keepalive_loop, daemon=True)
-keepalive_thread.start()
+threading.Thread(target=keepalive_loop, daemon=True).start()
+threading.Thread(target=watchdog_loop, daemon=True).start()
 
 # ================== ROUTES ==================
 @app.route("/")
@@ -347,12 +358,14 @@ def ping():
         "status":"alive",
         "time":ist_now(),
         "engine":STATE["status"],
-        "mode":STATE["mode"]
+        "mode":STATE["mode"],
+        "heartbeat":STATE["health"]["heartbeat"]
     })
 
 @app.route("/status")
-def status(): return jsonify(STATE)
+def status(): 
+    return jsonify(STATE)
 
 # ================== MAIN ==================
 if __name__=="__main__":
-    app.run(host="0.0.0.0",port=5000)
+    app.run(host="0.0.0.0",port=5000,threaded=True)
