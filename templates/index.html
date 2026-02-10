@@ -1,41 +1,106 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Crypto Breakout Bot</title>
-    <style>
-        body{font-family:Arial;background:#0f172a;color:#e5e7eb;padding:20px}
-        button{padding:10px 20px;margin:5px;font-size:16px}
-        pre{background:#020617;padding:10px;height:300px;overflow:auto}
-    </style>
+<title>Institutional Breakout Engine</title>
+<style>
+body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px}
+button{padding:10px 16px;margin:5px;font-size:15px}
+.toggle{border:1px solid #334155;color:white}
+.live{background:#7f1d1d}
+.paper{background:#064e3b}
+.panel{background:#020617;border:1px solid #1e293b;padding:10px;margin-top:10px}
+pre{max-height:220px;overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{border:1px solid #1e293b;padding:6px;text-align:center}
+th{background:#0f172a}
+</style>
 </head>
 <body>
 
-<h2>🚀 Live Breakout Spot Trading Bot</h2>
+<h2>🏦 Institutional Breakout Trading Terminal</h2>
 
-<button onclick="start()">Start Bot</button>
-<button onclick="stop()">Stop Bot</button>
+<button onclick="start()">Start</button>
+<button onclick="stop()">Stop</button>
 
+<br><br>
+
+<button class="toggle paper" onclick="setMode('PAPER')">Paper Trade</button>
+<button class="toggle live" onclick="setMode('LIVE')">Live Deploy</button>
+
+<div class="panel">
 <h3>Status</h3>
 <pre id="status"></pre>
+</div>
 
+<div class="panel">
+<h3>Open Positions</h3>
+<table id="positions">
+<tr><th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th></tr>
+</table>
+</div>
+
+<div class="panel">
+<h3>Orders (Exchange)</h3>
+<table id="orders">
+<tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Mode</th><th>Order ID</th><th>Status</th></tr>
+</table>
+</div>
+
+<div class="panel">
 <h3>Logs</h3>
 <pre id="logs"></pre>
+</div>
 
 <script>
-function start(){
-    fetch('/start',{method:'POST'});
-}
-function stop(){
-    fetch('/stop',{method:'POST'});
+function start(){ fetch('/start',{method:'POST'}); }
+function stop(){ fetch('/stop',{method:'POST'}); }
+
+function setMode(mode){
+    fetch('/set_mode',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({mode:mode})
+    });
 }
 
 function refresh(){
     fetch('/status').then(r=>r.json()).then(d=>{
-        document.getElementById("status").innerText=JSON.stringify(d,null,2);
-        document.getElementById("logs").innerText=(d.logs||[]).slice(-30).join("\n");
+        document.getElementById("status").innerText = JSON.stringify({
+            status:d.status,
+            mode:d.mode,
+            last:d.last,
+            balances:d.balances,
+            health:d.health
+        },null,2);
+
+        // positions
+        let ptable = `<tr><th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th></tr>`;
+        for(let k in d.positions){
+            let p=d.positions[k];
+            ptable+=`<tr><td>${k}</td><td>${p.entry}</td><td>${p.qty}</td><td>${p.sl}</td><td>${p.tp}</td></tr>`;
+        }
+        document.getElementById("positions").innerHTML=ptable;
+
+        // orders
+        let otable = `<tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Mode</th><th>Order ID</th><th>Status</th></tr>`;
+        (d.orders||[]).slice(-50).forEach(o=>{
+            otable+=`<tr>
+            <td>${o.time}</td>
+            <td>${o.pair}</td>
+            <td>${o.side}</td>
+            <td>${o.qty}</td>
+            <td>${o.price}</td>
+            <td>${o.mode}</td>
+            <td>${o.order_id}</td>
+            <td>${o.status}</td>
+            </tr>`;
+        });
+        document.getElementById("orders").innerHTML=otable;
+
+        document.getElementById("logs").innerText =
+            (d.logs||[]).slice(-40).join("\n");
     })
 }
-
 setInterval(refresh,2000);
 </script>
 
