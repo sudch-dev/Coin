@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Institutional Breakout Trading Terminal</title>
+<title>Institutional Trading Terminal</title>
 <style>
 body{font-family:Arial;background:#020617;color:#e5e7eb;padding:20px}
 h2{margin-bottom:10px}
@@ -9,6 +9,10 @@ button{padding:10px 16px;margin:4px;font-size:14px;border-radius:4px;border:none
 .toggle{border:1px solid #334155;color:white}
 .live{background:#7f1d1d}
 .paper{background:#064e3b}
+.start{background:#1d4ed8}
+.stop{background:#475569}
+.kill{background:#7c2d12}
+.flatten{background:#991b1b}
 .panel{background:#020617;border:1px solid #1e293b;padding:12px;margin-top:12px;border-radius:6px}
 pre{max-height:220px;overflow:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
@@ -18,55 +22,45 @@ th{background:#0f172a}
 .status-ok{color:#22c55e}
 .status-bad{color:#ef4444}
 .status-warn{color:#eab308}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 </style>
 </head>
 
 <body>
 
-<h2>🏦 Institutional Breakout Trading Terminal</h2>
+<h2>🏦 Institutional Autonomous Trading Terminal</h2>
 
-<!-- ================= CONTROLLER PANEL ================= -->
+<!-- ================= CONTROLLER ================= -->
 <div class="panel">
-<h3>🎛️ Trading Controller</h3>
+<h3>🎛️ System Controller</h3>
 
-<table style="width:100%;border-collapse:collapse">
+<table style="width:100%">
 <tr>
-<td class="ctrl-label">Engine Control</td>
+<td class="ctrl-label">Engine</td>
 <td>
-<button onclick="start()">▶ Start Engine</button>
-<button onclick="stop()">⏹ Stop Engine</button>
+<button class="start" onclick="start()">▶ Start</button>
+<button class="stop" onclick="stop()">⏹ Stop</button>
+<button class="kill" onclick="kill()">🛑 Kill Switch</button>
+<button class="flatten" onclick="flatten()">🔥 Emergency Flatten</button>
 </td>
 </tr>
 
 <tr>
-<td class="ctrl-label">Deployment Mode</td>
+<td class="ctrl-label">Deployment</td>
 <td>
-<button class="toggle paper" onclick="setMode('PAPER')">🧪 Paper Trade</button>
-<button class="toggle live" onclick="setMode('LIVE')">🚀 Live Deploy</button>
+<button class="toggle paper" onclick="setMode('PAPER')">🧪 Paper</button>
+<button class="toggle live" onclick="setMode('LIVE')">🚀 Live</button>
 </td>
 </tr>
 
-<tr>
-<td class="ctrl-label">System State</td>
-<td id="sys_state" class="status-warn">--</td>
-</tr>
-
-<tr>
-<td class="ctrl-label">Trade Mode</td>
-<td id="trade_mode" class="status-warn">--</td>
-</tr>
-
-<tr>
-<td class="ctrl-label">API Health</td>
-<td id="api_health" class="status-warn">--</td>
-</tr>
-
-<tr>
-<td class="ctrl-label">Exchange Health</td>
-<td id="ex_health" class="status-warn">--</td>
-</tr>
+<tr><td class="ctrl-label">System State</td><td id="sys_state">--</td></tr>
+<tr><td class="ctrl-label">Trade Mode</td><td id="trade_mode">--</td></tr>
+<tr><td class="ctrl-label">API Health</td><td id="api_health">--</td></tr>
+<tr><td class="ctrl-label">Exchange Health</td><td id="ex_health">--</td></tr>
 </table>
 </div>
+
+<div class="grid">
 
 <!-- ================= STATUS ================= -->
 <div class="panel">
@@ -74,17 +68,27 @@ th{background:#0f172a}
 <pre id="status"></pre>
 </div>
 
+<!-- ================= RISK ================= -->
+<div class="panel">
+<h3>Risk Engine</h3>
+<pre id="risk"></pre>
+</div>
+
+</div>
+
 <!-- ================= POSITIONS ================= -->
 <div class="panel">
 <h3>Open Positions</h3>
 <table id="positions">
-<tr><th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th></tr>
+<tr>
+<th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Peak</th>
+</tr>
 </table>
 </div>
 
 <!-- ================= ORDERS ================= -->
 <div class="panel">
-<h3>Exchange Orders</h3>
+<h3>Orders & Executions</h3>
 <table id="orders">
 <tr>
 <th>Time</th><th>Pair</th><th>Side</th><th>Qty</th>
@@ -102,6 +106,8 @@ th{background:#0f172a}
 <script>
 function start(){ fetch('/start',{method:'POST'}); }
 function stop(){ fetch('/stop',{method:'POST'}); }
+function kill(){ fetch('/kill',{method:'POST'}); }
+function flatten(){ fetch('/flatten',{method:'POST'}); }
 
 function setMode(mode){
     fetch('/set_mode',{
@@ -112,79 +118,86 @@ function setMode(mode){
 }
 
 function refresh(){
-    fetch('/status').then(r=>r.json()).then(d=>{
+fetch('/status').then(r=>r.json()).then(d=>{
 
-        // ===== Controller =====
-        document.getElementById("sys_state").innerText = d.status;
-        document.getElementById("trade_mode").innerText = d.mode;
-        document.getElementById("api_health").innerText = d.health.api;
-        document.getElementById("ex_health").innerText = d.health.exchange;
+    // Controller
+    document.getElementById("sys_state").innerText=d.status;
+    document.getElementById("trade_mode").innerText=d.mode;
+    document.getElementById("api_health").innerText=d.health.api;
+    document.getElementById("ex_health").innerText=d.health.exchange;
 
-        // Color coding
-        setColor("api_health", d.health.api);
-        setColor("ex_health", d.health.exchange);
-        setStateColor("sys_state", d.status);
+    setColor("api_health",d.health.api);
+    setColor("ex_health",d.health.exchange);
+    setStateColor("sys_state",d.status);
 
-        // ===== Status Panel =====
-        document.getElementById("status").innerText = JSON.stringify({
-            status:d.status,
-            mode:d.mode,
-            last:d.last,
-            balances:d.balances,
-            health:d.health
-        },null,2);
+    // Status
+    document.getElementById("status").innerText=
+    JSON.stringify({
+        status:d.status,
+        mode:d.mode,
+        last:d.last,
+        balances:d.balances,
+        health:d.health
+    },null,2);
 
-        // ===== Positions =====
-        let ptable = `<tr><th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th></tr>`;
-        for(let k in d.positions){
-            let p=d.positions[k];
-            ptable+=`<tr>
-            <td>${k}</td>
-            <td>${p.entry}</td>
-            <td>${p.qty}</td>
-            <td>${p.sl}</td>
-            <td>${p.tp}</td>
-            </tr>`;
-        }
-        document.getElementById("positions").innerHTML=ptable;
+    // Risk
+    document.getElementById("risk").innerText=
+    JSON.stringify(d.risk,null,2);
 
-        // ===== Orders =====
-        let otable = `<tr>
-        <th>Time</th><th>Pair</th><th>Side</th><th>Qty</th>
-        <th>Price</th><th>Mode</th><th>Order ID</th><th>Status</th>
+    // Positions
+    let ptable=`<tr>
+    <th>Pair</th><th>Entry</th><th>Qty</th><th>SL</th><th>TP</th><th>Peak</th>
+    </tr>`;
+    for(let k in d.positions){
+        let p=d.positions[k];
+        ptable+=`<tr>
+        <td>${k}</td>
+        <td>${p.entry}</td>
+        <td>${p.qty}</td>
+        <td>${p.sl}</td>
+        <td>${p.tp}</td>
+        <td>${p.peak}</td>
         </tr>`;
-        (d.orders||[]).slice(-50).forEach(o=>{
-            otable+=`<tr>
-            <td>${o.time}</td>
-            <td>${o.pair}</td>
-            <td>${o.side}</td>
-            <td>${o.qty}</td>
-            <td>${o.price}</td>
-            <td>${o.mode}</td>
-            <td>${o.order_id}</td>
-            <td>${o.status}</td>
-            </tr>`;
-        });
-        document.getElementById("orders").innerHTML=otable;
+    }
+    document.getElementById("positions").innerHTML=ptable;
 
-        // ===== Logs =====
-        document.getElementById("logs").innerText =
-            (d.logs||[]).slice(-50).join("\n");
-    })
+    // Orders
+    let otable=`<tr>
+    <th>Time</th><th>Pair</th><th>Side</th><th>Qty</th>
+    <th>Price</th><th>Mode</th><th>Order ID</th><th>Status</th>
+    </tr>`;
+    (d.orders||[]).slice(-50).forEach(o=>{
+        otable+=`<tr>
+        <td>${o.time}</td>
+        <td>${o.pair}</td>
+        <td>${o.side}</td>
+        <td>${o.qty}</td>
+        <td>${o.price}</td>
+        <td>${o.mode}</td>
+        <td>${o.order_id||"--"}</td>
+        <td>${o.status}</td>
+        </tr>`;
+    });
+    document.getElementById("orders").innerHTML=otable;
+
+    // Logs
+    document.getElementById("logs").innerText=
+        (d.logs||[]).slice(-80).join("\n");
+});
 }
 
 function setColor(id,val){
     let el=document.getElementById(id);
-    if(val=="OK"){ el.className="status-ok"; }
-    else if(val=="ERROR"){ el.className="status-bad"; }
-    else{ el.className="status-warn"; }
+    if(val=="OK") el.className="status-ok";
+    else if(val=="ERROR") el.className="status-bad";
+    else el.className="status-warn";
 }
 
 function setStateColor(id,val){
     let el=document.getElementById(id);
-    if(val=="Running"){ el.className="status-ok"; }
-    else if(val=="Stopped"){ el.className="status-bad"; }
-    else{ el.className="status-warn"; }
+    if(val=="Running") el.className="status-ok";
+    else if(val=="Stopped") el.className="status-bad";
+    else el.className="status-warn";
 }
 
 setInterval(refresh,2000);
