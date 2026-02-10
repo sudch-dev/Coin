@@ -1,270 +1,142 @@
+# ========== IMPORTS ==========
 from flask import Flask, jsonify, request, render_template
-import threading, time, requests, hmac, hashlib, json, os
+import threading, time, requests, hmac, hashlib, json, os, sqlite3
 from datetime import datetime
-from collections import deque
 from pytz import timezone
 
+# ========== APP ==========
 app = Flask(__name__)
 
-# ================== TIME ==================
+# ========== TIMEZONE ==========
 IST = timezone("Asia/Kolkata")
 def ist_now():
     return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ================== CONFIG ==================
+# ========== CONFIG ==========
 API_KEY = os.getenv("API_KEY","")
 API_SECRET = os.getenv("API_SECRET","")
 BASE_URL = "https://api.coindcx.com"
+PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT"]
 
-PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT"]
+# ========== DATABASE ==========
+DB="bot.db"
+def db():
+    return sqlite3.connect(DB,check_same_thread=False)
 
-CAPITAL_RISK_PCT = 0.01      # 1% risk per trade
-TP_PCT = 0.02                # 2% target
-SL_PCT = 0.01                # 1% stoploss
-TRAIL_PCT = 0.008            # 0.8% trailing
+def init_db():
+    con=db();cur=con.cursor()
+    cur.execute("create table if not exists trades(time,pair,side,qty,price)")
+    cur.execute("create table if not exists orders(time,pair,side,qty,status)")
+    cur.execute("create table if not exists logs(time,msg)")
+    con.commit();con.close()
 
-CANDLE_INTERVAL = 60         # 1 minute candles
-HISTORY = 120                # 120 candles
+init_db()
 
-# ================== STATE ==================
-bot_running = False
-bot_thread = None
+# ========== BOT STATE ==========
+bot_running=False
+bot_thread=None
 
-STATE = {
-    "status":"Idle",
-    "last":None,
-    "balances":{},
-    "positions":{},
-    "orders":[],
-    "trades":[],
-    "logs":[],
-    "errors":[],
-    "equity":0,
-    "regime":"--"
+STATE={
+ "status":"Idle","last":None,
+ "balances":{},"positions":{},
+ "orders":[],"trades":[],
+ "logs":[],"errors":[],
+ "health":{"api":"--","exchange":"--"}
 }
 
-ticks = {p:[] for p in PAIRS}
-candles = {p:deque(maxlen=HISTORY) for p in PAIRS}
-
-# ================== UTILS ==================
+# ========== UTILS ==========
 def log(msg):
-    print(msg)
     STATE["logs"].append(f"{ist_now()} | {msg}")
-    if len(STATE["logs"])>300:
-        STATE["logs"]=STATE["logs"][-300:]
+    con=db();cur=con.cursor()
+    cur.execute("insert into logs values(?,?)",(ist_now(),msg))
+    con.commit();con.close()
 
-def hmac_signature(payload):
-    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+def sign(payload):
+    return hmac.new(API_SECRET.encode(),payload.encode(),hashlib.sha256).hexdigest()
 
-def api_post(path, payload):
+def api_post(path,payload):
     body=json.dumps(payload)
     headers={
         "X-AUTH-APIKEY":API_KEY,
-        "X-AUTH-SIGNATURE":hmac_signature(body),
+        "X-AUTH-SIGNATURE":sign(body),
         "Content-Type":"application/json"
     }
     return requests.post(BASE_URL+path,headers=headers,data=body,timeout=15)
 
-# ================== EXCHANGE ==================
-def get_wallet_balances():
-    balances={}
+# ========== EXCHANGE ==========
+def balances():
+    data={}
     try:
-        payload={"timestamp":int(time.time()*1000)}
-        r=api_post("/exchange/v1/users/balances",payload)
+        r=api_post("/exchange/v1/users/balances",{"timestamp":int(time.time()*1000)})
         if r.ok:
             for b in r.json():
-                balances[b["currency"]] = float(b["balance"])
-    except Exception as e:
-        log(f"BALANCE ERROR {e}")
-    return balances
+                data[b["currency"]]=float(b["balance"])
+            STATE["health"]["api"]="OK"
+        else: STATE["health"]["api"]="ERROR"
+    except: STATE["health"]["api"]="ERROR"
+    return data
 
-def place_order(pair, side, qty):
-    STATE["orders"].append({
-        "time":ist_now(),"pair":pair,"side":side,"qty":qty,"status":"SIM"
-    })
-    log(f"EXEC {side} {pair} {qty}")
+def prices():
+    try:
+        r=requests.get(BASE_URL+"/exchange/ticker",timeout=10)
+        if r.ok:
+            STATE["health"]["exchange"]="OK"
+            return r.json()
+        else: STATE["health"]["exchange"]="ERROR"
+    except: STATE["health"]["exchange"]="ERROR"
+    return []
 
-# ================== MARKET ==================
-def fetch_prices():
-    r=requests.get(f"{BASE_URL}/exchange/ticker",timeout=10)
-    if not r.ok: return {}
-    data=r.json()
-    out={}
-    for x in data:
-        if x["market"] in PAIRS:
-            out[x["market"]] = float(x["last_price"])
-    return out
-
-def build_candles(pair, price):
-    now=int(time.time())
-    ticks[pair].append((now,price))
-    if len(ticks[pair])>5000:
-        ticks[pair]=ticks[pair][-5000:]
-
-    bucket = now - (now % CANDLE_INTERVAL)
-    if not candles[pair] or candles[pair][-1]["t"]!=bucket:
-        candles[pair].append({
-            "t":bucket,"o":price,"h":price,"l":price,"c":price
-        })
-    else:
-        c=candles[pair][-1]
-        c["h"]=max(c["h"],price)
-        c["l"]=min(c["l"],price)
-        c["c"]=price
-
-# ================== INDICATORS ==================
-def ema(values,n):
-    if len(values)<n: return None
-    k=2/(n+1)
-    e=sum(values[:n])/n
-    for v in values[n:]:
-        e=v*k+e*(1-k)
-    return e
-
-# ================== REGIME ==================
-def detect_regime(closes):
-    if len(closes)<50: return "Sideways"
-    hi=max(closes[-50:])
-    lo=min(closes[-50:])
-    vol=(hi-lo)/lo if lo else 0
-    if vol>0.05: return "Breakout"
-    ema_fast=ema(closes,9)
-    ema_slow=ema(closes,21)
-    if ema_fast and ema_slow and ema_fast>ema_slow:
-        return "Trend"
-    return "Sideways"
-
-# ================== STRATEGY ==================
-def strategy(pair):
-    cs=list(candles[pair])
-    if len(cs)<50: return None
-
-    closes=[c["c"] for c in cs]
-
-    ema9=ema(closes,9)
-    ema21=ema(closes,21)
-    ema50=ema(closes,50)
-
-    regime=detect_regime(closes)
-    STATE["regime"]=regime
-
-    price=closes[-1]
-
-    # -------- TREND STRATEGY --------
-    if regime=="Trend":
-        if ema9>ema21>ema50:
-            return {"side":"BUY","price":price}
-
-    # -------- BREAKOUT STRATEGY --------
-    if regime=="Breakout":
-        hi=max(closes[-20:])
-        if price>hi:
-            return {"side":"BUY","price":price}
-
-    # -------- SIDEWAYS STRATEGY --------
-    if regime=="Sideways":
-        hi=max(closes[-20:])
-        lo=min(closes[-20:])
-        if price<=lo*1.002:
-            return {"side":"BUY","price":price}
-        if price>=hi*0.998:
-            return {"side":"SELL","price":price}
-
+# ========== STRATEGY ==========
+def strategy(price, pair):
+    # simple auto strategy
+    import random
+    r=random.random()
+    if r>0.98: return "BUY"
+    if r<0.02: return "SELL"
     return None
 
-# ================== POSITION ENGINE ==================
-def manage_position(pair, price):
-    pos=STATE["positions"].get(pair)
-    if not pos: return
+# ========== RISK ==========
+def size(usdt, price):
+    risk=usdt*0.01
+    return round(risk/price,6)
 
-    side=pos["side"]
-    entry=pos["entry"]
-    qty=pos["qty"]
-    sl=pos["sl"]
-    tp=pos["tp"]
-    trail=pos["trail"]
+# ========== EXECUTION ==========
+def execute(pair, side, qty, price):
+    order={"time":ist_now(),"pair":pair,"side":side,"qty":qty,"price":price}
+    STATE["orders"].append(order)
+    STATE["trades"].append(order)
+    con=db();cur=con.cursor()
+    cur.execute("insert into trades values(?,?,?,?,?)",(order["time"],pair,side,qty,price))
+    con.commit();con.close()
+    log(f"{side} {pair} {qty} @ {price}")
 
-    # trailing
-    if side=="BUY":
-        new_trail = price*(1-TRAIL_PCT)
-        pos["trail"]=max(trail,new_trail)
-
-        if price<=pos["trail"]:
-            place_order(pair,"SELL",qty)
-            del STATE["positions"][pair]
-            log(f"TRAIL EXIT {pair}")
-
-        elif price<=sl:
-            place_order(pair,"SELL",qty)
-            del STATE["positions"][pair]
-            log(f"SL EXIT {pair}")
-
-        elif price>=tp:
-            place_order(pair,"SELL",qty)
-            del STATE["positions"][pair]
-            log(f"TP EXIT {pair}")
-
-# ================== BOT ==================
+# ========== BOT LOOP ==========
 def bot_loop():
     global bot_running
     log("BOT STARTED")
     while bot_running:
-        try:
-            STATE["last"]=ist_now()
-            balances=get_wallet_balances()
-            STATE["balances"]=balances
-            usdt=balances.get("USDT",0)
-            STATE["equity"]=usdt
+        STATE["last"]=ist_now()
+        STATE["balances"]=balances()
+        tickers=prices()
 
-            prices=fetch_prices()
+        usdt=STATE["balances"].get("USDT",0)
 
-            for pair,price in prices.items():
-                build_candles(pair,price)
+        for t in tickers:
+            if t["market"] in PAIRS:
+                price=float(t["last_price"])
+                sig=strategy(price,t["market"])
+                if sig:
+                    qty=size(usdt,price)
+                    if qty>0:
+                        execute(t["market"],sig,qty,price)
 
-                # manage open
-                manage_position(pair,price)
-
-                # skip if already in position
-                if pair in STATE["positions"]:
-                    continue
-
-                sig=strategy(pair)
-                if not sig: continue
-
-                if sig["side"]=="BUY" and usdt>20:
-                    risk_amt=usdt*CAPITAL_RISK_PCT
-                    qty=round(risk_amt/price,6)
-
-                    sl=price*(1-SL_PCT)
-                    tp=price*(1+TP_PCT)
-                    trail=price*(1-TRAIL_PCT)
-
-                    place_order(pair,"BUY",qty)
-
-                    STATE["positions"][pair]={
-                        "side":"BUY","entry":price,"qty":qty,
-                        "sl":sl,"tp":tp,"trail":trail
-                    }
-
-                    STATE["trades"].append({
-                        "time":ist_now(),"pair":pair,
-                        "side":"BUY","entry":price
-                    })
-
-                    log(f"ENTRY {pair} @ {price}")
-
-        except Exception as e:
-            STATE["errors"].append(str(e))
-            log(f"BOT ERROR {e}")
-
-        time.sleep(3)
+        time.sleep(5)
 
     log("BOT STOPPED")
 
-# ================== ROUTES ==================
+# ========== ROUTES ==========
 @app.route("/")
-def home():
-    return render_template("index.html")
+def home(): return render_template("index.html")
 
 @app.route("/start",methods=["POST"])
 def start():
@@ -274,30 +146,29 @@ def start():
         STATE["status"]="Running"
         bot_thread=threading.Thread(target=bot_loop,daemon=True)
         bot_thread.start()
-    return jsonify({"status":"started"})
+    return jsonify({"ok":True})
 
 @app.route("/stop",methods=["POST"])
 def stop():
     global bot_running
     bot_running=False
     STATE["status"]="Stopped"
-    return jsonify({"status":"stopped"})
+    return jsonify({"ok":True})
 
 @app.route("/status")
 def status():
+    return jsonify(STATE)
+
+@app.route("/diagnostics")
+def diagnostics():
     return jsonify({
-        "status":STATE["status"],
-        "last":STATE["last"],
-        "balances":STATE["balances"],
-        "equity":STATE["equity"],
-        "positions":STATE["positions"],
-        "orders":STATE["orders"][-20:],
-        "trades":STATE["trades"][-20:],
-        "regime":STATE["regime"],
-        "logs":STATE["logs"][-20:],
-        "errors":STATE["errors"][-5:]
+        "time":ist_now(),
+        "api_key_loaded":bool(API_KEY),
+        "api_secret_loaded":bool(API_SECRET),
+        "bot_running":bot_running,
+        "health":STATE["health"]
     })
 
-# ================== MAIN ==================
+# ========== MAIN ==========
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=5000)
