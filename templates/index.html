@@ -1,156 +1,71 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="UTF-8">
-<title>ERX Algo Trading Platform</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-
+<title>Algo Trading System</title>
 <style>
-body{margin:0;font-family:Segoe UI,Arial;background:#0b0e14;color:#e8ecf1}
-header{background:#0f1320;padding:15px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1f2640}
-header h1{font-size:18px;margin:0;color:#67d1ff}
-.badge{padding:6px 12px;border-radius:20px;font-size:12px;font-weight:bold}
-.running{background:#1f8f4a}
-.stopped{background:#8f1f1f}
-.container{padding:15px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:15px}
-.panel{background:#0f1424;border:1px solid #1f2640;border-radius:12px;padding:14px}
-.panel h3{margin:0 0 10px 0;font-size:13px;color:#9fd3ff;border-bottom:1px solid #1f2640;padding-bottom:6px}
-button{border:none;border-radius:6px;padding:8px 14px;font-weight:bold;cursor:pointer;margin:4px}
-.start{background:#67ff9c}
-.stop{background:#ff6767;color:#fff}
-.test{background:#67d1ff}
-small{color:#9aa4b2}
-.list{max-height:220px;overflow:auto;font-size:12px}
-.list div{padding:6px;border-bottom:1px solid #1f2640}
-pre{background:#0b0e14;border-radius:6px;padding:10px;font-size:11px;max-height:220px;overflow:auto;color:#7fffd4}
-.statgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;font-size:12px}
-.stat{background:#0b0e14;padding:8px;border-radius:6px}
-footer{text-align:center;font-size:11px;color:#777;padding:10px}
+body{margin:0;font-family:Arial;background:#0e0e0e;color:#fff}
+.top{padding:15px;background:#111;display:flex;justify-content:space-between;align-items:center}
+.btn{padding:10px 18px;border:none;border-radius:6px;cursor:pointer}
+.start{background:#00c853;color:#000}
+.stop{background:#ff1744;color:#fff}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:12px}
+.card{background:#151515;padding:12px;border-radius:10px}
+h3{margin:0 0 8px 0;font-size:14px;color:#00e5ff}
+.log{font-size:12px;max-height:200px;overflow:auto}
 </style>
 </head>
 
 <body>
 
-<header>
-  <h1>ERX Algo Trading Platform</h1>
-  <div id="botBadge" class="badge stopped">IDLE</div>
-</header>
-
-<div class="container">
-
-<!-- CONTROL -->
-<div class="panel">
-<h3>Bot Control</h3>
-<div class="stat">Status: <b id="statusText">Idle</b></div>
-<div class="stat">Mode: <b id="strategyMode">Hybrid</b></div>
-<div class="stat">Market Regime: <b id="regime">--</b></div>
-<div class="stat">Last Update: <b id="lastUpdate">--</b></div>
-<button class="start" onclick="startBot()">Start</button>
-<button class="stop" onclick="stopBot()">Stop</button>
+<div class="top">
+  <div>🤖 Production Algo Trading System</div>
+  <div>
+    <button class="btn start" onclick="start()">START</button>
+    <button class="btn stop" onclick="stop()">STOP</button>
+  </div>
 </div>
 
-<!-- PORTFOLIO -->
-<div class="panel">
-<h3>Portfolio</h3>
-<div class="statgrid">
-  <div class="stat">USDT: <b id="usdt">0</b></div>
-  <div class="stat">Equity: <b id="equity">0</b></div>
-  <div class="stat">Free Margin: <b id="margin">0</b></div>
-  <div class="stat">Exposure: <b id="exposure">0%</b></div>
-</div>
-<pre id="balances">{}</pre>
-</div>
+<div class="grid">
+  <div class="card"><h3>Status</h3><div id="status"></div></div>
+  <div class="card"><h3>Equity</h3><div id="equity"></div></div>
+  <div class="card"><h3>Regime</h3><div id="regime"></div></div>
+  <div class="card"><h3>USDT</h3><div id="usdt"></div></div>
 
-<!-- POSITIONS -->
-<div class="panel">
-<h3>Active Positions</h3>
-<div class="list" id="positions"></div>
-</div>
+  <div class="card"><h3>Positions</h3><pre id="positions"></pre></div>
+  <div class="card"><h3>Orders</h3><pre id="orders"></pre></div>
+  <div class="card"><h3>Trades</h3><pre id="trades"></pre></div>
+  <div class="card"><h3>Errors</h3><pre id="errors"></pre></div>
 
-<!-- ORDERS -->
-<div class="panel">
-<h3>Open Orders</h3>
-<div class="list" id="orders"></div>
+  <div class="card" style="grid-column:span 4">
+    <h3>System Logs</h3>
+    <div class="log" id="logs"></div>
+  </div>
 </div>
-
-<!-- TRADES -->
-<div class="panel">
-<h3>Trade History</h3>
-<div class="list" id="trades"></div>
-</div>
-
-<!-- RISK -->
-<div class="panel">
-<h3>Risk Engine</h3>
-<div class="statgrid">
-  <div class="stat">Risk/Trade: <b id="riskTrade">0.7%</b></div>
-  <div class="stat">Max DD: <b id="maxdd">5%</b></div>
-  <div class="stat">Daily Limit: <b id="dailylimit">2%</b></div>
-  <div class="stat">Positions: <b id="poscount">0</b></div>
-</div>
-</div>
-
-<!-- SYSTEM -->
-<div class="panel">
-<h3>System Monitor</h3>
-<pre id="syslog">System ready</pre>
-</div>
-
-<!-- API -->
-<div class="panel">
-<h3>API Diagnostics</h3>
-<button class="test" onclick="testBalance()">Balance</button>
-<button class="test" onclick="testKey()">Key</button>
-<button class="test" onclick="testConn()">Connection</button>
-<pre id="diag">No diagnostics</pre>
-</div>
-
-</div>
-
-<footer>
-ERX Algo Platform • Hybrid Strategy Engine • Automated Execution • Risk Managed System
-</footer>
 
 <script>
-async function fetchStatus(){
- try{
-  const r = await fetch('/status');
-  const d = await r.json();
+function start(){fetch("/start",{method:"POST"})}
+function stop(){fetch("/stop",{method:"POST"})}
 
-  document.getElementById("statusText").innerText=d.status;
-  document.getElementById("lastUpdate").innerText=d.last||"--";
-  document.getElementById("usdt").innerText=d.usdt||0;
-  document.getElementById("balances").innerText=JSON.stringify(d.balances||{},null,2);
+async function refresh(){
+  let r=await fetch("/status");
+  let d=await r.json();
 
-  const badge=document.getElementById("botBadge");
-  if(d.status==="Running"){badge.innerText="RUNNING";badge.className="badge running";}
-  else{badge.innerText="STOPPED";badge.className="badge stopped";}
+  document.getElementById("status").innerText=d.status+" | "+d.last;
+  document.getElementById("equity").innerText=d.equity;
+  document.getElementById("regime").innerText=d.regime;
+  document.getElementById("usdt").innerText=(d.balances.USDT||0);
 
-  let t=document.getElementById("trades"); t.innerHTML="";
-  (d.trades||[]).forEach(x=>{
-    let div=document.createElement("div");
-    div.innerText=`${x.time||""} | ${x.pair||""} | ${x.side||""}`;
-    t.appendChild(div);
-  });
+  document.getElementById("positions").innerText=JSON.stringify(d.positions,null,2);
+  document.getElementById("orders").innerText=JSON.stringify(d.orders,null,2);
+  document.getElementById("trades").innerText=JSON.stringify(d.trades,null,2);
+  document.getElementById("errors").innerText=JSON.stringify(d.errors,null,2);
 
- }catch(e){
-  document.getElementById("syslog").innerText="STATUS FETCH ERROR: "+e;
- }
+  document.getElementById("logs").innerHTML=d.logs.map(x=>"<div>"+x+"</div>").join("");
 }
 
-function startBot(){fetch('/start',{method:'POST'});}
-function stopBot(){fetch('/stop',{method:'POST'});}
-
-function testBalance(){fetch('/api/balance_test').then(r=>r.json()).then(d=>diag(d));}
-function testKey(){fetch('/api/key_test').then(r=>r.json()).then(d=>diag(d));}
-function testConn(){fetch('/api/connection_test').then(r=>r.json()).then(d=>diag(d));}
-
-function diag(d){
- document.getElementById("diag").innerText=JSON.stringify(d,null,2);
-}
-
-setInterval(fetchStatus,4000);
-fetchStatus();
+setInterval(refresh,2000);
+refresh();
 </script>
 
 </body>
