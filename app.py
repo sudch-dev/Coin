@@ -97,7 +97,7 @@ def strategy(price, pair):
 
 # ========== RISK ==========
 def size(usdt, price):
-    risk=usdt*0.01
+    risk=usdt*0.1
     return round(risk/price,6)
 
 # ========== EXECUTION ==========
