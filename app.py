@@ -38,6 +38,7 @@ init_db()
 bot_running=False
 bot_thread=None
 KILL_SWITCH=False
+KEEPALIVE=True
 
 STATE={
  "status":"Idle",
@@ -52,10 +53,10 @@ STATE={
     "daily_pnl":0.0,
     "loss_streak":0,
     "trades_today":0,
-    "max_dd":-0.05,          # -5%
+    "max_dd":-0.05,          
     "max_trades":10,
     "max_loss_streak":3,
-    "max_exposure":0.2      # 20% capital
+    "max_exposure":0.2      
  }
 }
 
@@ -125,11 +126,10 @@ def update_market(t):
     d["last"]=price
     return d
 
-# ================== VOLATILITY FILTER ==================
+# ================== FILTERS & ENGINES ==================
 def vol_filter(vol, avg_vol):
-    return vol > avg_vol*0.8   # avoid dead markets
+    return vol > avg_vol*0.8
 
-# ================== BREAKOUT ENGINE ==================
 def breakout_engine(price, high, low, vol, avg_vol):
     if price > high*1.001 and vol > avg_vol*1.7:
         return "BUY"
@@ -137,9 +137,8 @@ def breakout_engine(price, high, low, vol, avg_vol):
         return "SELL"
     return None
 
-# ================== RISK ENGINE ==================
 def capital_allocator(usdt):
-    return usdt * 0.02   # 2% per trade
+    return usdt * 0.02
 
 def size(usdt, price):
     cap = capital_allocator(usdt)
@@ -148,8 +147,6 @@ def size(usdt, price):
 
 def risk_firewall():
     r=STATE["risk"]
-    if r["daily_pnl"] <= r["max_dd"]*10000:
-        return False
     if r["loss_streak"] >= r["max_loss_streak"]:
         return False
     if r["trades_today"] >= r["max_trades"]:
@@ -206,28 +203,22 @@ def exit_engine(pair, price, vol, avg_vol):
     pos=STATE["positions"][pair]
     entry,sl,tp,qty=pos["entry"],pos["sl"],pos["tp"],pos["qty"]
 
-    # Stop loss
     if price<=sl:
         exit_trade(pair,qty,price,"SL"); return
 
-    # Take profit
     if price>=tp:
         exit_trade(pair,qty,price,"TP"); return
 
-    # Break-even
     if price>=entry*1.015:
         pos["sl"]=max(pos["sl"],entry)
 
-    # Trailing stop
     if price>pos["peak"]:
         pos["peak"]=price
         pos["sl"]=max(pos["sl"],round(price*0.992,4))
 
-    # Fake breakout
     if price<entry*0.995 and vol<avg_vol*0.6:
         exit_trade(pair,qty,price,"FAKE_BREAKOUT")
 
-# ================== EXIT EXECUTOR ==================
 def exit_trade(pair, qty, price, reason):
     mode=STATE["mode"]
     order={
@@ -274,10 +265,8 @@ def bot_loop():
                 price=d["last"]
                 vol=float(t.get("volume",0))
 
-                # EXIT FIRST
                 exit_engine(t["market"],price,vol,d["avg_vol"])
 
-                # ENTRY
                 if t["market"] not in STATE["positions"]:
                     if not risk_firewall(): 
                         continue
@@ -293,6 +282,21 @@ def bot_loop():
 
         time.sleep(5)
     log("ENGINE STOPPED")
+
+# ================== KEEPALIVE ENGINE ==================
+def keepalive_loop():
+    while KEEPALIVE:
+        try:
+            api_post("/exchange/v1/users/balances",{"timestamp":int(time.time()*1000)})
+            STATE["health"]["api"]="OK"
+        except:
+            STATE["health"]["api"]="ERROR"
+
+        log("HEARTBEAT | System Alive")
+        time.sleep(60)
+
+keepalive_thread = threading.Thread(target=keepalive_loop, daemon=True)
+keepalive_thread.start()
 
 # ================== ROUTES ==================
 @app.route("/")
@@ -336,6 +340,15 @@ def flatten():
         exit_trade(pair,pos["qty"],pos["entry"],"EMERGENCY")
     log("EMERGENCY FLATTEN")
     return jsonify({"ok":True})
+
+@app.route("/ping")
+def ping():
+    return jsonify({
+        "status":"alive",
+        "time":ist_now(),
+        "engine":STATE["status"],
+        "mode":STATE["mode"]
+    })
 
 @app.route("/status")
 def status(): return jsonify(STATE)
