@@ -1,13 +1,13 @@
 import os, time, json, hmac, hashlib, threading, requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 
 # ================== CONFIG ==================
 API_KEY = os.environ.get("API_KEY", "")
 API_SECRET = os.environ.get("API_SECRET", "")
 BASE_URL = "https://api.coindcx.com"
 
-APP_BASE_URL = os.environ.get("APP_BASE_URL")  # https://coin-xxxx.onrender.com
-KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "120"))
+APP_BASE_URL = os.environ.get("APP_BASE_URL")  # e.g. https://coin-xxxx.onrender.com
+KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "300"))
 
 app = Flask(__name__)
 
@@ -15,18 +15,20 @@ app = Flask(__name__)
 MODE = "PAPER"   # PAPER / LIVE
 running = True
 
-STATE = {
-    "running": False,
-    "last_scan": None,
-    "last_keepalive": None,
-    "server_time": None,
-    "heartbeat": None,
-    "pnl": {"realized": 0.0, "unrealized": 0.0}
+state = {
+    "running": True,
+    "server_time": 0,
+    "heartbeat": 0,
+    "last_scan": 0,
+    "last_keepalive": 0,
+    "pnl": {
+        "realized": 0.0,
+        "unrealized": 0.0
+    }
 }
 
 positions = {}
 orders = []
-scan_log = []
 
 # ================== MARKETS ==================
 PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT"]
@@ -47,9 +49,9 @@ MIN_NOTIONAL = {
     "SOLUSDT": 5
 }
 
-RISK_PCT = 0.05
-TP_PCT = 0.02
-SL_PCT = 0.01
+RISK_PCT = 0.05     # 5% per trade
+TP_PCT = 0.02       # 2%
+SL_PCT = 0.01       # 1%
 CANDLE_INTERVAL = 60  # seconds
 
 # ================== UTIL ==================
@@ -69,53 +71,31 @@ def now():
 
 # ================== KEEP ALIVE ==================
 def _keepalive_ping():
-    if not APP_BASE_URL:
+    if not APP_BASE_URL: 
         return
     try:
         requests.get(f"{APP_BASE_URL}/ping", timeout=10)
-        STATE["last_keepalive"] = now()
+        state["last_keepalive"] = int(time.time())
     except:
         pass
 
 # ================== EXCHANGE ==================
-def safe_json(resp):
-    try:
-        return resp.json()
-    except:
-        return {}
-
 def get_wallet():
-    balances = {}
     payload = {"timestamp": int(time.time()*1000)}
-    try:
-        r = requests.post(
-            f"{BASE_URL}/exchange/v1/users/balances",
-            headers=headers(payload),
-            json=payload,
-            timeout=15
-        )
-        data = safe_json(r)
-
-        if isinstance(data, list):
-            for b in data:
-                balances[b["currency"]] = float(b.get("available_balance", 0))
-        else:
-            scan_log.append({"time": now(), "error": data})
-    except Exception as e:
-        scan_log.append({"time": now(), "wallet_error": str(e)})
-
+    r = requests.post(f"{BASE_URL}/exchange/v1/users/balances",
+                      headers=headers(payload), json=payload, timeout=15)
+    data = r.json()
+    balances = {}
+    for b in data:
+        balances[b["currency"]] = float(b["available_balance"])
     return balances
 
 def fetch_price(pair):
-    try:
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        data = safe_json(r)
-        if isinstance(data, list):
-            for m in data:
-                if m["market"] == pair:
-                    return float(m["last_price"])
-    except:
-        pass
+    r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+    data = r.json()
+    for m in data:
+        if m["market"] == pair:
+            return float(m["last_price"])
     return None
 
 def format_qty(qty, pair):
@@ -139,18 +119,15 @@ def place_order(pair, side, qty):
     }
 
     if MODE == "PAPER":
-        return {"mode": "PAPER", "payload": payload, "status": "filled"}
+        return {"paper": True, "payload": payload}
 
-    try:
-        r = requests.post(
-            f"{BASE_URL}/exchange/v1/orders/create",
-            headers=headers(payload),
-            json=payload,
-            timeout=20
-        )
-        return safe_json(r)
-    except Exception as e:
-        return {"error": str(e)}
+    r = requests.post(
+        f"{BASE_URL}/exchange/v1/orders/create",
+        headers=headers(payload),
+        json=payload,
+        timeout=20
+    )
+    return r.json()
 
 # ================== STRATEGY ==================
 def breakout(price, hist):
@@ -170,18 +147,20 @@ def monitor_exits(prices):
                 qty = pos["qty"]
                 res = place_order(pair, "SELL", qty)
 
-                pnl = (price - pos["entry"]) * qty
-                STATE["pnl"]["realized"] += pnl
+                pnl = (price - pos["entry"]) * pos["qty"]
+                state["pnl"]["realized"] += pnl
 
                 orders.append({
+                    "time": now(),
                     "pair": pair,
-                    "exit_price": price,
+                    "side": "EXIT",
                     "qty": qty,
-                    "side": "SELL",
-                    "res": res,
+                    "exit_price": price,
                     "pnl": pnl,
-                    "time": now()
+                    "mode": MODE,
+                    "exchange": res
                 })
+
                 del positions[pair]
 
 # ================== MAIN LOOP ==================
@@ -189,20 +168,19 @@ price_hist = {p: [] for p in PAIRS}
 
 def scan_loop():
     global running
-    STATE["running"] = True
 
     while True:
+
         if not running:
-            time.sleep(1)
+            time.sleep(2)
             continue
 
-        STATE["heartbeat"] = now()
-        STATE["server_time"] = now()
+        # system state
+        state["heartbeat"] = int(time.time())
+        state["server_time"] = int(time.time())
 
         # keepalive
-        if APP_BASE_URL and (
-            not STATE["last_keepalive"] or now() - STATE["last_keepalive"] > KEEPALIVE_SEC
-        ):
+        if APP_BASE_URL and (time.time() - state["last_keepalive"] > KEEPALIVE_SEC):
             _keepalive_ping()
 
         prices = {}
@@ -214,11 +192,21 @@ def scan_loop():
                 if len(price_hist[p]) > 200:
                     price_hist[p] = price_hist[p][-200:]
 
+        # exits
         monitor_exits(prices)
 
+        # unrealized pnl
+        unreal = 0.0
+        for pair, pos in positions.items():
+            if pair in prices:
+                unreal += (prices[pair] - pos["entry"]) * pos["qty"]
+        state["pnl"]["unrealized"] = unreal
+
+        # wallet
         wallet = get_wallet()
         usdt = wallet.get("USDT", 0)
 
+        # entries
         for pair in PAIRS:
             if pair in positions:
                 continue
@@ -232,12 +220,13 @@ def scan_loop():
                 if qty <= 0:
                     continue
 
-                res = place_order(pair, "BUY", qty)
+                side = "BUY"
+                res = place_order(pair, side, qty)
 
                 entry = price
                 positions[pair] = {
                     "pair": pair,
-                    "side": "BUY",
+                    "side": side,
                     "qty": qty,
                     "entry": entry,
                     "tp": entry * (1 + TP_PCT),
@@ -247,31 +236,58 @@ def scan_loop():
                 }
 
                 orders.append({
+                    "time": now(),
                     "pair": pair,
-                    "side": "BUY",
+                    "side": side,
                     "qty": qty,
-                    "price": entry,
+                    "entry_price": entry,
                     "mode": MODE,
-                    "res": res,
-                    "time": now()
+                    "exchange": res
                 })
 
-        # unrealized PnL
-        upnl = 0
-        for pair, pos in positions.items():
-            p = prices.get(pair)
-            if p:
-                upnl += (p - pos["entry"]) * pos["qty"]
-
-        STATE["pnl"]["unrealized"] = upnl
-        STATE["last_scan"] = now()
-
+        state["last_scan"] = int(time.time())
         time.sleep(CANDLE_INTERVAL)
 
 # ================== API ==================
 @app.route("/")
 def ui():
-    return render_template_string(index_html)
+    return """
+    <html>
+    <head>
+    <title>Trading Engine</title>
+    <style>
+    body{background:#0b0b0b;color:#00ffcc;font-family:monospace;padding:20px}
+    button{padding:10px;margin:5px;background:#111;color:#0f0;border:1px solid #0f0}
+    pre{background:#050505;padding:10px;max-height:70vh;overflow:auto}
+    </style>
+    </head>
+    <body>
+    <h2>Institutional Breakout Engine</h2>
+
+    <button onclick="setMode('PAPER')">Paper</button>
+    <button onclick="setMode('LIVE')">Live</button>
+    <button onclick="toggle(true)">Start</button>
+    <button onclick="toggle(false)">Stop</button>
+
+    <pre id="out"></pre>
+
+    <script>
+    function load(){
+        fetch('/status').then(r=>r.json()).then(d=>{
+            document.getElementById('out').innerText = JSON.stringify(d,null,2);
+        });
+    }
+    function setMode(m){
+        fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})})
+    }
+    function toggle(v){
+        fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})})
+    }
+    setInterval(load,2000)
+    </script>
+    </body>
+    </html>
+    """
 
 @app.route("/ping")
 def ping():
@@ -281,9 +297,9 @@ def ping():
 def status():
     return jsonify({
         "mode": MODE,
-        "state": STATE,
+        "state": state,
         "positions": positions,
-        "orders": orders[-30:]
+        "orders": orders[-50:]
     })
 
 @app.route("/mode", methods=["POST"])
@@ -295,83 +311,9 @@ def set_mode():
 @app.route("/control", methods=["POST"])
 def control():
     global running
-    running = bool(request.json.get("run", True))
-    STATE["running"] = running
+    running = request.json.get("run", True)
+    state["running"] = running
     return jsonify({"running": running})
-
-# ================== UI ==================
-index_html = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Institutional Breakout Engine</title>
-<style>
-body{background:#0b0b0b;color:#00ffd0;font-family:monospace;padding:20px}
-h2{color:#00ffaa}
-.panel{border:1px solid #00ffaa;padding:10px;margin:10px 0}
-button{padding:8px 12px;margin:5px;background:#000;color:#00ffaa;border:1px solid #00ffaa}
-pre{background:#050505;padding:10px;max-height:300px;overflow:auto}
-.green{color:#00ff00}
-.red{color:#ff4444}
-</style>
-</head>
-<body>
-
-<h2>Institutional Breakout Engine</h2>
-
-<div class="panel">
-<b>Controls</b><br>
-<button onclick="setMode('PAPER')">Paper</button>
-<button onclick="setMode('LIVE')">Live</button>
-<button onclick="toggle(true)">Start</button>
-<button onclick="toggle(false)">Stop</button>
-</div>
-
-<div class="panel" id="statusPanel"></div>
-
-<div class="panel">
-<b>Positions</b>
-<pre id="pos"></pre>
-</div>
-
-<div class="panel">
-<b>Orders</b>
-<pre id="ord"></pre>
-</div>
-
-<script>
-function load(){
- fetch('/status').then(r=>r.json()).then(d=>{
-   document.getElementById('statusPanel').innerHTML = `
-   Mode: <b>${d.mode}</b><br>
-   Bot: <b>${d.state.running}</b><br>
-   Server Time: ${new Date(d.state.server_time*1000).toLocaleTimeString()}<br>
-   Heartbeat: ${new Date(d.state.heartbeat*1000).toLocaleTimeString()}<br>
-   Last Scan: ${new Date(d.state.last_scan*1000).toLocaleTimeString()}<br>
-   KeepAlive: ${d.state.last_keepalive ? new Date(d.state.last_keepalive*1000).toLocaleTimeString() : '--'}<br>
-   PnL Realized: <span class="green">${d.state.pnl.realized.toFixed(4)}</span><br>
-   PnL Unrealized: <span class="green">${d.state.pnl.unrealized.toFixed(4)}</span>
-   `;
-
-   document.getElementById('pos').innerText = JSON.stringify(d.positions,null,2);
-   document.getElementById('ord').innerText = JSON.stringify(d.orders,null,2);
- });
-}
-
-function setMode(m){
- fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})})
-}
-
-function toggle(v){
- fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})})
-}
-
-setInterval(load,2000);
-</script>
-
-</body>
-</html>
-"""
 
 # ================== BOOT ==================
 if __name__ == "__main__":
