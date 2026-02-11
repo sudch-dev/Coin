@@ -1,8 +1,4 @@
-import os
-import time
-import json
-import threading
-import requests
+import os, time, json, hmac, hashlib, threading, requests
 from flask import Flask, jsonify, request, render_template
 
 # ======================================================
@@ -12,12 +8,10 @@ API_KEY = os.environ.get("API_KEY", "")
 API_SECRET = os.environ.get("API_SECRET", "")
 BASE_URL = "https://api.coindcx.com"
 
-# Render / hosting keepalive config
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "")  # e.g. https://your-app.onrender.com
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "")
 KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "60"))
 
-SCAN_INTERVAL = 5   # seconds
-CANDLE_INTERVAL = 60
+SCAN_INTERVAL = 5
 
 # ======================================================
 # APP
@@ -30,10 +24,7 @@ app = Flask(__name__)
 running = False
 MODE = "PAPER"   # PAPER | LIVE
 
-PAIRS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"
-]
+PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
 
 prices = {}
 price_history = {}
@@ -41,20 +32,32 @@ positions = {}
 orders = []
 scan_log = []
 
-pnl = {
-    "realized": 0.0,
-    "unrealized": 0.0
-}
+pnl = {"realized":0.0,"unrealized":0.0}
 
 SETTINGS = {
-    "tp_pct": 0.01,
+    "tp_pct": 0.02,
     "sl_pct": 0.005,
     "risk_per_trade": 0.01,
     "breakout_window": 20
 }
 
 # ======================================================
-# KEEPALIVE SYSTEM (RENDER SAFE)
+# AUTH UTILS
+# ======================================================
+def sign(payload:str):
+    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+def api_post(path, payload):
+    body = json.dumps(payload)
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sign(body),
+        "Content-Type": "application/json"
+    }
+    return requests.post(BASE_URL + path, headers=headers, data=body, timeout=15)
+
+# ======================================================
+# KEEPALIVE SYSTEM
 # ======================================================
 _last_keepalive = 0
 
@@ -76,40 +79,45 @@ def keepalive_loop():
         time.sleep(5)
 
 # ======================================================
-# EXCHANGE ABSTRACTION (mock now, live later)
+# EXCHANGE (REAL)
 # ======================================================
-def fetch_all_prices():
+def fetch_prices():
+    r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
     data = {}
-    for p in PAIRS:
-        if p not in prices:
-            prices[p] = 100.0
-
-        # simulated movement (replace with real API/WebSocket)
-        drift = (0.0005 - 0.001 * ((int(time.time()) % 2)))
-        prices[p] = prices[p] * (1 + drift)
-
-        data[p] = {
-            "price": round(prices[p], 4),
-            "ts": int(time.time())
-        }
+    if r.ok:
+        for t in r.json():
+            if t["market"] in PAIRS:
+                data[t["market"]] = {
+                    "price": float(t["last_price"]),
+                    "ts": int(time.time())
+                }
     return data
 
-def place_order(pair, side, qty, price, mode="PAPER"):
-    order = {
-        "id": f"ORD-{int(time.time()*1000)}",
-        "pair": pair,
-        "side": side,
-        "qty": qty,
-        "price": price,
-        "mode": mode,
-        "time": int(time.time()),
-        "status": "FILLED"
+def fetch_balances():
+    payload = {"timestamp": int(time.time()*1000)}
+    r = api_post("/exchange/v1/users/balances", payload)
+    data = {}
+    if r.ok:
+        for b in r.json():
+            data[b["currency"]] = float(b["balance"])
+    return data
+
+def place_spot_order(pair, side, qty):
+    payload = {
+        "side": side.lower(),   # buy / sell
+        "order_type": "market_order",
+        "market": pair,
+        "total_quantity": qty,
+        "timestamp": int(time.time()*1000)
     }
-    orders.append(order)
-    return order
+    r = api_post("/exchange/v1/orders/create", payload)
+    if r.ok:
+        return r.json()
+    else:
+        return {"error": r.text}
 
 # ======================================================
-# BREAKOUT ENGINE (REAL LOGIC STRUCTURE)
+# BREAKOUT ENGINE
 # ======================================================
 def detect_breakout(pair, price):
     hist = price_history.setdefault(pair, [])
@@ -122,72 +130,92 @@ def detect_breakout(pair, price):
     high = max(window[:-1])
     low = min(window[:-1])
 
-    # structure breakout
     if price > high:
         return "UP"
     if price < low:
         return "DOWN"
-
     return None
 
 # ======================================================
-# TRADE ENGINE
+# POSITION ENGINE
 # ======================================================
+def position_size(usdt_balance, price):
+    risk_amount = usdt_balance * SETTINGS["risk_per_trade"]
+    qty = risk_amount / price
+    return round(qty, 6)
+
 def open_position(pair, side, price):
     if pair in positions:
         return
 
-    qty = 1  # replace with risk engine later
-    order = place_order(pair, side, qty, price, MODE)
+    balances = fetch_balances()
+    usdt = balances.get("USDT",0)
+    if usdt <= 10:
+        scan_log.append("LOW BALANCE - NO TRADE")
+        return
+
+    qty = position_size(usdt, price)
+
+    order_data = None
+    if MODE == "LIVE":
+        order_data = place_spot_order(pair, side, qty)
+    else:
+        order_data = {"mode":"PAPER","pair":pair,"side":side,"qty":qty}
+
+    orders.append(order_data)
 
     positions[pair] = {
         "pair": pair,
         "side": side,
         "entry": price,
         "qty": qty,
-        "tp": price * (1 + SETTINGS["tp_pct"] if side == "BUY" else 1 - SETTINGS["tp_pct"]),
-        "sl": price * (1 - SETTINGS["sl_pct"] if side == "BUY" else 1 + SETTINGS["sl_pct"]),
+        "tp": price * (1 + SETTINGS["tp_pct"] if side=="BUY" else 1 - SETTINGS["tp_pct"]),
+        "sl": price * (1 - SETTINGS["sl_pct"] if side=="BUY" else 1 + SETTINGS["sl_pct"]),
         "time": int(time.time()),
-        "order_id": order["id"]
+        "mode": MODE
     }
 
+# ======================================================
+# EXIT ENGINE
+# ======================================================
 def monitor_exits(price_map):
     global pnl
     for pair in list(positions.keys()):
         pos = positions[pair]
         price = price_map[pair]["price"]
 
-        closed = False
+        exit_signal = False
         profit = 0
 
         if pos["side"] == "BUY":
-            if price >= pos["tp"]:
+            if price >= pos["tp"] or price <= pos["sl"]:
                 profit = (price - pos["entry"]) * pos["qty"]
-                closed = True
-            elif price <= pos["sl"]:
-                profit = (price - pos["entry"]) * pos["qty"]
-                closed = True
+                exit_signal = True
         else:
-            if price <= pos["tp"]:
+            if price <= pos["tp"] or price >= pos["sl"]:
                 profit = (pos["entry"] - price) * pos["qty"]
-                closed = True
-            elif price >= pos["sl"]:
-                profit = (pos["entry"] - price) * pos["qty"]
-                closed = True
+                exit_signal = True
 
-        if closed:
+        if exit_signal:
+            if MODE == "LIVE":
+                place_spot_order(pair, "SELL" if pos["side"]=="BUY" else "BUY", pos["qty"])
+
             pnl["realized"] += profit
             scan_log.append(f"EXIT {pair} PNL {round(profit,4)}")
             del positions[pair]
 
 # ======================================================
-# MAIN SCAN LOOP
+# MAIN LOOP
 # ======================================================
 def scan_loop():
     global running
     while running:
         try:
-            price_map = fetch_all_prices()
+            price_map = fetch_prices()
+            if not price_map:
+                time.sleep(2)
+                continue
+
             monitor_exits(price_map)
 
             for pair in PAIRS:
@@ -203,9 +231,8 @@ def scan_loop():
                     scan_log.append(f"{pair} BREAKOUT DOWN @ {price}")
 
             time.sleep(SCAN_INTERVAL)
-
         except Exception as e:
-            scan_log.append(f"ERROR: {str(e)}")
+            scan_log.append(f"ENGINE ERROR: {str(e)}")
             time.sleep(2)
 
 # ======================================================
@@ -236,20 +263,19 @@ def start():
     if not running:
         running = True
         threading.Thread(target=scan_loop, daemon=True).start()
-    return jsonify({"ok": True})
+    return jsonify({"ok":True})
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global running
     running = False
-    return jsonify({"ok": True})
+    return jsonify({"ok":True})
 
 @app.route("/mode", methods=["POST"])
 def mode():
     global MODE
-    data = request.json
-    MODE = data.get("mode", "PAPER")
-    return jsonify({"ok": True, "mode": MODE})
+    MODE = request.json.get("mode","PAPER")
+    return jsonify({"ok":True,"mode":MODE})
 
 @app.route("/orders")
 def get_orders():
@@ -267,8 +293,5 @@ def get_log():
 # BOOT
 # ======================================================
 if __name__ == "__main__":
-    # Keepalive thread (Render-safe)
     threading.Thread(target=keepalive_loop, daemon=True).start()
-
-    # Flask server
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
