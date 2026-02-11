@@ -1,181 +1,223 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Trading Engine Monitor</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Institutional Breakout Engine</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
 <style>
-body{margin:0;background:#0b0f14;color:#dbe4ee;font-family:system-ui}
-.header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#05080c;border-bottom:1px solid #1f2a36}
-.title{font-size:18px;font-weight:600}
-.badge{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700}
-.live{background:#2a0f0f;color:#ff4d4d}
-.paper{background:#0f2a1f;color:#00ff9c}
-.run{background:#0f1f2a;color:#3ab4ff}
-.stop{background:#2a0f0f;color:#ff4d4d}
-
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:12px}
-.card{background:#0f1720;border:1px solid #1f2a36;border-radius:10px;padding:12px}
-h3{margin:0 0 8px 0;font-size:13px;color:#9fb3c8}
-
-.kv{font-size:12px;line-height:1.6}
-.green{color:#00ff9c}
-.red{color:#ff4d4d}
-.blue{color:#3ab4ff}
-.yellow{color:#ffcc00}
-
-.table{width:100%;border-collapse:collapse;font-size:12px}
-.table th{color:#8fa6bf;text-align:left;border-bottom:1px solid #1f2a36;padding:6px}
-.table td{padding:6px;border-bottom:1px solid #131c26}
-
-.controls{display:flex;gap:8px;flex-wrap:wrap}
-.btn{padding:8px 12px;border-radius:6px;border:1px solid #1f2a36;background:#05080c;color:#dbe4ee;font-weight:600;cursor:pointer}
-
-.full{grid-column:1/5}
-.scroll{max-height:260px;overflow:auto}
+body{
+  background:#050505;
+  color:#e6fff8;
+  font-family: "Segoe UI", monospace;
+  margin:0;
+  padding:15px;
+}
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  border-bottom:1px solid #00ffcc;
+  padding-bottom:10px;
+}
+.title{
+  font-size:20px;
+  color:#00ffcc;
+  font-weight:600;
+}
+.badge{
+  padding:4px 10px;
+  border-radius:4px;
+  font-size:12px;
+  margin-left:5px;
+}
+.green{background:#0a3; color:#fff;}
+.red{background:#a00; color:#fff;}
+.orange{background:#ff8800; color:#000;}
+.panel{
+  border:1px solid #00ffcc;
+  border-radius:6px;
+  padding:10px;
+  margin-top:12px;
+}
+.panel-title{
+  color:#00ffcc;
+  font-weight:600;
+  margin-bottom:6px;
+}
+.grid{
+  display:grid;
+  grid-template-columns:repeat(2,1fr);
+  gap:8px;
+  font-size:13px;
+}
+.ctrl button{
+  background:#000;
+  border:1px solid #00ffcc;
+  color:#00ffcc;
+  padding:8px 12px;
+  margin:4px;
+  border-radius:4px;
+}
+.ctrl button:hover{
+  background:#00ffcc;
+  color:#000;
+  cursor:pointer;
+}
+.table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:12px;
+}
+.table th,.table td{
+  border:1px solid #00ffcc;
+  padding:6px;
+  text-align:center;
+}
+.table th{
+  background:#002222;
+  color:#00ffcc;
+}
+.pnlpos{color:#00ff00;}
+.pnlneg{color:#ff4444;}
+.footer{
+  margin-top:10px;
+  text-align:center;
+  font-size:11px;
+  color:#888;
+}
 </style>
 </head>
 
 <body>
 
 <div class="header">
-  <div class="title">Institutional Trading Engine</div>
+  <div class="title">Institutional Breakout Engine</div>
   <div>
-    <span id="mode" class="badge paper">PAPER</span>
-    <span id="run" class="badge stop">STOPPED</span>
+    <span id="modeBadge" class="badge orange">MODE</span>
+    <span id="runBadge" class="badge red">STOPPED</span>
   </div>
 </div>
 
-<div class="grid">
-
-<!-- SYSTEM -->
-<div class="card">
-<h3>System</h3>
-<div class="kv">
-Time: <span id="time"></span><br>
-Engine: <span id="engine"></span><br>
-Heartbeat: <span id="hb"></span><br>
-</div>
+<div class="panel ctrl">
+  <button onclick="setMode('PAPER')">Paper</button>
+  <button onclick="setMode('LIVE')">Live</button>
+  <button onclick="toggle(true)">Start</button>
+  <button onclick="toggle(false)">Stop</button>
 </div>
 
-<!-- CONTROL -->
-<div class="card">
-<h3>Control</h3>
-<div class="controls">
-<button class="btn" onclick="setMode('PAPER')">Paper</button>
-<button class="btn" onclick="setMode('LIVE')">Live</button>
-<button class="btn" onclick="toggle(true)">Start</button>
-<button class="btn" onclick="toggle(false)">Stop</button>
-</div>
+<div class="panel">
+  <div class="panel-title">System Status</div>
+  <div class="grid" id="sys"></div>
 </div>
 
-<!-- PNL -->
-<div class="card">
-<h3>P&L</h3>
-<div class="kv">
-Realized: <span id="real" class="green">0</span><br>
-Unrealized: <span id="unreal" class="blue">0</span>
-</div>
+<div class="panel">
+  <div class="panel-title">PnL</div>
+  <div class="grid" id="pnl"></div>
 </div>
 
-<!-- STATS -->
-<div class="card">
-<h3>Stats</h3>
-<div class="kv">
-Positions: <span id="posc"></span><br>
-Orders: <span id="ordc"></span>
-</div>
-</div>
-
-<!-- POSITIONS -->
-<div class="card full">
-<h3>Open Positions</h3>
-<div class="scroll">
-<table class="table">
-<thead><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th><th>Mode</th></tr></thead>
-<tbody id="pos"></tbody>
-</table>
-</div>
+<div class="panel">
+  <div class="panel-title">Open Positions</div>
+  <table class="table" id="posTable">
+    <thead>
+      <tr>
+        <th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th><th>Mode</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
-<!-- ORDERS -->
-<div class="card full">
-<h3>Orders & Exchange Confirmations</h3>
-<div class="scroll">
-<table class="table">
-<thead>
-<tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Exchange</th></tr>
-</thead>
-<tbody id="ord"></tbody>
-</table>
-</div>
+<div class="panel">
+  <div class="panel-title">Orders / Exchange Confirmations</div>
+  <table class="table" id="ordTable">
+    <thead>
+      <tr>
+        <th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Mode</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 </div>
 
+<div class="footer">
+Institutional Execution Engine · Live Risk Managed · Exchange Connected
 </div>
 
 <script>
-function fmt(t){return new Date(t*1000).toLocaleTimeString()}
+function fmt(t){
+  if(!t) return "--";
+  return new Date(t*1000).toLocaleTimeString();
+}
 
-async function load(){
- const r=await fetch('/status'); const d=await r.json();
+function load(){
+ fetch('/status').then(r=>r.json()).then(d=>{
 
- // badges
- document.getElementById("mode").innerText=d.mode;
- document.getElementById("mode").className="badge "+(d.mode=="LIVE"?"live":"paper");
- document.getElementById("run").innerText=d.running?"RUNNING":"STOPPED";
- document.getElementById("run").className="badge "+(d.running?"run":"stop");
+  // Badges
+  document.getElementById("modeBadge").innerText = d.mode;
+  document.getElementById("modeBadge").className = "badge " + (d.mode=="LIVE"?"green":"orange");
 
- // system
- document.getElementById("time").innerText=new Date().toLocaleString();
- document.getElementById("engine").innerText=d.engine_alive?"ALIVE":"DOWN";
- document.getElementById("hb").innerText="OK";
+  document.getElementById("runBadge").innerText = d.state.running ? "RUNNING" : "STOPPED";
+  document.getElementById("runBadge").className = "badge " + (d.state.running?"green":"red");
 
- // pnl
- document.getElementById("real").innerText=d.pnl?.realized||0;
- document.getElementById("unreal").innerText=d.pnl?.unrealized||0;
+  // System
+  document.getElementById("sys").innerHTML = `
+    <div>Server Time</div><div>${fmt(d.state.server_time)}</div>
+    <div>Heartbeat</div><div>${fmt(d.state.heartbeat)}</div>
+    <div>Last Scan</div><div>${fmt(d.state.last_scan)}</div>
+    <div>KeepAlive</div><div>${fmt(d.state.last_keepalive)}</div>
+  `;
 
- // stats
- document.getElementById("posc").innerText=Object.keys(d.positions||{}).length;
- document.getElementById("ordc").innerText=(d.orders||[]).length;
+  // PnL
+  let r = d.state.pnl.realized;
+  let u = d.state.pnl.unrealized;
+  document.getElementById("pnl").innerHTML = `
+    <div>Realized</div><div class="${r>=0?'pnlpos':'pnlneg'}">${r.toFixed(4)}</div>
+    <div>Unrealized</div><div class="${u>=0?'pnlpos':'pnlneg'}">${u.toFixed(4)}</div>
+  `;
 
- // positions
- const p=document.getElementById("pos"); p.innerHTML="";
- Object.values(d.positions||{}).forEach(x=>{
-   p.innerHTML+=`<tr>
-<td>${x.pair}</td>
-<td class="${x.side=='BUY'?'green':'red'}">${x.side}</td>
-<td>${x.qty}</td>
-<td>${x.entry.toFixed(4)}</td>
-<td class="green">${x.tp.toFixed(4)}</td>
-<td class="red">${x.sl.toFixed(4)}</td>
-<td>${x.mode}</td>
-</tr>`;
- });
+  // Positions
+  let pb = "";
+  for(let k in d.positions){
+    let p = d.positions[k];
+    pb += `<tr>
+      <td>${p.pair}</td>
+      <td>${p.side}</td>
+      <td>${p.qty}</td>
+      <td>${p.entry.toFixed(4)}</td>
+      <td>${p.tp.toFixed(4)}</td>
+      <td>${p.sl.toFixed(4)}</td>
+      <td>${p.mode}</td>
+    </tr>`;
+  }
+  document.querySelector("#posTable tbody").innerHTML = pb || "<tr><td colspan='7'>No open positions</td></tr>";
 
- // orders
- const o=document.getElementById("ord"); o.innerHTML="";
- (d.orders||[]).slice(-30).reverse().forEach(x=>{
-   o.innerHTML+=`<tr>
-<td>${fmt(x.time||0)}</td>
-<td>${x.pair||"-"}</td>
-<td class="${x.side=='BUY'?'green':'red'}">${x.side||"-"}</td>
-<td>${x.qty||"-"}</td>
-<td>${x.price||"-"}</td>
-<td>${x.exchange_status||"SENT"}</td>
-<td>${JSON.stringify(x.exchange_msg||{}).slice(0,40)}</td>
-</tr>`;
+  // Orders
+  let ob = "";
+  d.orders.forEach(o=>{
+    ob += `<tr>
+      <td>${fmt(o.time)}</td>
+      <td>${o.pair||'-'}</td>
+      <td>${o.side||'-'}</td>
+      <td>${o.qty||'-'}</td>
+      <td>${o.price||o.exit_price||'-'}</td>
+      <td>${o.res?.status||o.res?.message||'ok'}</td>
+      <td>${o.mode||'-'}</td>
+    </tr>`;
+  });
+  document.querySelector("#ordTable tbody").innerHTML = ob || "<tr><td colspan='7'>No orders</td></tr>";
+
  });
 }
 
 function setMode(m){
- fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
-}
-function toggle(v){
- fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})});
+ fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})})
 }
 
-setInterval(load,2000); load();
+function toggle(v){
+ fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})})
+}
+
+setInterval(load,2000);
 </script>
 
 </body>
