@@ -1,246 +1,207 @@
 import os, time, json, hmac, hashlib, threading, requests
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, request, jsonify, render_template_string
 
-# ======================================================
-# CONFIG
-# ======================================================
+# ================== CONFIG ==================
 API_KEY = os.environ.get("API_KEY", "")
 API_SECRET = os.environ.get("API_SECRET", "")
 BASE_URL = "https://api.coindcx.com"
 
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "")
-KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "60"))
+APP_BASE_URL = os.environ.get("APP_BASE_URL")  # e.g. https://coin-xxxx.onrender.com
+KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "300"))
 
-SCAN_INTERVAL = 5
-
-# ======================================================
-# APP
-# ======================================================
 app = Flask(__name__)
 
-# ======================================================
-# GLOBAL STATE
-# ======================================================
-running = False
-MODE = "PAPER"   # PAPER | LIVE
+# ================== STATE ==================
+MODE = "PAPER"   # PAPER / LIVE
+running = True
+_last_keepalive = 0
 
-PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
-
-prices = {}
-price_history = {}
 positions = {}
 orders = []
 scan_log = []
 
-pnl = {"realized":0.0,"unrealized":0.0}
+# ================== MARKETS ==================
+PAIRS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT"]
 
-SETTINGS = {
-    "tp_pct": 0.02,
-    "sl_pct": 0.005,
-    "risk_per_trade": 0.1,
-    "breakout_window": 20
+PAIR_PRECISION = {
+    "BTCUSDT": 6,
+    "ETHUSDT": 5,
+    "BNBUSDT": 4,
+    "XRPUSDT": 4,
+    "SOLUSDT": 3
 }
 
-# ======================================================
-# AUTH UTILS
-# ======================================================
-def sign(payload:str):
-    return hmac.new(API_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+MIN_NOTIONAL = {
+    "BTCUSDT": 5,
+    "ETHUSDT": 5,
+    "BNBUSDT": 5,
+    "XRPUSDT": 5,
+    "SOLUSDT": 5
+}
 
-def api_post(path, payload):
-    body = json.dumps(payload)
-    headers = {
+RISK_PCT = 0.05     # 5% per trade
+TP_PCT = 0.02       # 2%
+SL_PCT = 0.01       # 1%
+CANDLE_INTERVAL = 60  # seconds
+
+# ================== UTIL ==================
+def sign(payload):
+    payload_str = json.dumps(payload, separators=(',', ':'))
+    return hmac.new(API_SECRET.encode(), payload_str.encode(), hashlib.sha256).hexdigest()
+
+def headers(payload):
+    return {
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sign(body),
+        "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
-    return requests.post(BASE_URL + path, headers=headers, data=body, timeout=15)
 
-# ======================================================
-# KEEPALIVE SYSTEM
-# ======================================================
-_last_keepalive = 0
+def now():
+    return int(time.time())
 
+# ================== KEEP ALIVE ==================
 def _keepalive_ping():
-    if not APP_BASE_URL:
+    if not APP_BASE_URL: 
         return
     try:
-        requests.get(f"{APP_BASE_URL}/ping", timeout=5)
+        requests.get(f"{APP_BASE_URL}/ping", timeout=10)
     except:
         pass
 
-def keepalive_loop():
-    global _last_keepalive
-    while True:
-        now = time.time()
-        if now - _last_keepalive >= KEEPALIVE_SEC:
-            _keepalive_ping()
-            _last_keepalive = now
-        time.sleep(5)
-
-# ======================================================
-# EXCHANGE (REAL)
-# ======================================================
-def fetch_prices():
-    r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
-    data = {}
-    if r.ok:
-        for t in r.json():
-            if t["market"] in PAIRS:
-                data[t["market"]] = {
-                    "price": float(t["last_price"]),
-                    "ts": int(time.time())
-                }
-    return data
-
-def fetch_balances():
+# ================== EXCHANGE ==================
+def get_wallet():
     payload = {"timestamp": int(time.time()*1000)}
-    r = api_post("/exchange/v1/users/balances", payload)
-    data = {}
-    if r.ok:
-        for b in r.json():
-            data[b["currency"]] = float(b["balance"])
-    return data
+    r = requests.post(f"{BASE_URL}/exchange/v1/users/balances",
+                      headers=headers(payload), json=payload, timeout=15)
+    data = r.json()
+    balances = {}
+    for b in data:
+        balances[b["currency"]] = float(b["available_balance"])
+    return balances
 
-def place_spot_order(pair, side, qty):
-    payload = {
-        "side": side.lower(),   # buy / sell
-        "order_type": "market_order",
-        "market": pair,
-        "total_quantity": qty,
-        "timestamp": int(time.time()*1000)
-    }
-    r = api_post("/exchange/v1/orders/create", payload)
-    if r.ok:
-        return r.json()
-    else:
-        return {"error": r.text}
-
-# ======================================================
-# BREAKOUT ENGINE
-# ======================================================
-def detect_breakout(pair, price):
-    hist = price_history.setdefault(pair, [])
-    hist.append(price)
-
-    if len(hist) < SETTINGS["breakout_window"]:
-        return None
-
-    window = hist[-SETTINGS["breakout_window"]:]
-    high = max(window[:-1])
-    low = min(window[:-1])
-
-    if price > high:
-        return "UP"
-    if price < low:
-        return "DOWN"
+def fetch_price(pair):
+    r = requests.get(f"{BASE_URL}/exchange/ticker")
+    data = r.json()
+    for m in data:
+        if m["market"] == pair:
+            return float(m["last_price"])
     return None
 
-# ======================================================
-# POSITION ENGINE
-# ======================================================
-def position_size(usdt_balance, price):
-    risk_amount = usdt_balance * SETTINGS["risk_per_trade"]
-    qty = risk_amount / price
-    return round(qty, 6)
+def format_qty(qty, pair):
+    prec = PAIR_PRECISION.get(pair, 6)
+    return float(f"{qty:.{prec}f}")
 
-def open_position(pair, side, price):
-    if pair in positions:
-        return
+def calc_qty(usdt, price, pair):
+    risk = usdt * RISK_PCT
+    if risk < MIN_NOTIONAL[pair]:
+        return 0
+    raw = risk / price
+    return format_qty(raw, pair)
 
-    balances = fetch_balances()
-    usdt = balances.get("USDT",0)
-    if usdt <= 10:
-        scan_log.append("LOW BALANCE - NO TRADE")
-        return
-
-    qty = position_size(usdt, price)
-
-    order_data = None
-    if MODE == "LIVE":
-        order_data = place_spot_order(pair, side, qty)
-    else:
-        order_data = {"mode":"PAPER","pair":pair,"side":side,"qty":qty}
-
-    orders.append(order_data)
-
-    positions[pair] = {
-        "pair": pair,
-        "side": side,
-        "entry": price,
-        "qty": qty,
-        "tp": price * (1 + SETTINGS["tp_pct"] if side=="BUY" else 1 - SETTINGS["tp_pct"]),
-        "sl": price * (1 - SETTINGS["sl_pct"] if side=="BUY" else 1 + SETTINGS["sl_pct"]),
-        "time": int(time.time()),
-        "mode": MODE
+def place_order(pair, side, qty):
+    payload = {
+        "side": side.lower(),
+        "order_type": "market",
+        "market": pair,
+        "quantity": str(qty),
+        "timestamp": int(time.time()*1000)
     }
+    if MODE == "PAPER":
+        return {"paper": True, "payload": payload}
 
-# ======================================================
-# EXIT ENGINE
-# ======================================================
-def monitor_exits(price_map):
-    global pnl
-    for pair in list(positions.keys()):
-        pos = positions[pair]
-        price = price_map[pair]["price"]
+    r = requests.post(f"{BASE_URL}/exchange/v1/orders/create",
+                      headers=headers(payload), json=payload, timeout=20)
+    return r.json()
 
-        exit_signal = False
-        profit = 0
+# ================== STRATEGY ==================
+def breakout(price, hist):
+    if len(hist) < 20:
+        return False
+    high = max(hist[-20:])
+    return price > high
+
+def monitor_exits(prices):
+    for pair, pos in list(positions.items()):
+        price = prices.get(pair)
+        if not price: 
+            continue
 
         if pos["side"] == "BUY":
             if price >= pos["tp"] or price <= pos["sl"]:
-                profit = (price - pos["entry"]) * pos["qty"]
-                exit_signal = True
-        else:
-            if price <= pos["tp"] or price >= pos["sl"]:
-                profit = (pos["entry"] - price) * pos["qty"]
-                exit_signal = True
+                qty = pos["qty"]
+                res = place_order(pair, "SELL", qty)
+                orders.append({"pair": pair, "exit": price, "res": res})
+                del positions[pair]
 
-        if exit_signal:
-            if MODE == "LIVE":
-                place_spot_order(pair, "SELL" if pos["side"]=="BUY" else "BUY", pos["qty"])
+# ================== MAIN LOOP ==================
+price_hist = {p: [] for p in PAIRS}
 
-            pnl["realized"] += profit
-            scan_log.append(f"EXIT {pair} PNL {round(profit,4)}")
-            del positions[pair]
-
-# ======================================================
-# MAIN LOOP
-# ======================================================
 def scan_loop():
-    global running
+    global _last_keepalive
     while running:
-        try:
-            price_map = fetch_prices()
-            if not price_map:
-                time.sleep(2)
+
+        # keepalive
+        if APP_BASE_URL and (time.time() - _last_keepalive > KEEPALIVE_SEC):
+            _keepalive_ping()
+            _last_keepalive = time.time()
+
+        prices = {}
+        for p in PAIRS:
+            pr = fetch_price(p)
+            if pr:
+                prices[p] = pr
+                price_hist[p].append(pr)
+                if len(price_hist[p]) > 200:
+                    price_hist[p] = price_hist[p][-200:]
+
+        monitor_exits(prices)
+
+        wallet = get_wallet()
+        usdt = wallet.get("USDT", 0)
+
+        for pair in PAIRS:
+            if pair in positions:
                 continue
 
-            monitor_exits(price_map)
+            price = prices.get(pair)
+            if not price:
+                continue
 
-            for pair in PAIRS:
-                price = price_map[pair]["price"]
-                signal = detect_breakout(pair, price)
+            if breakout(price, price_hist[pair]):
+                qty = calc_qty(usdt, price, pair)
+                if qty <= 0:
+                    continue
 
-                if signal == "UP":
-                    open_position(pair, "BUY", price)
-                    scan_log.append(f"{pair} BREAKOUT UP @ {price}")
+                side = "BUY"
+                res = place_order(pair, side, qty)
 
-                elif signal == "DOWN":
-                    open_position(pair, "SELL", price)
-                    scan_log.append(f"{pair} BREAKOUT DOWN @ {price}")
+                entry = price
+                positions[pair] = {
+                    "pair": pair,
+                    "side": side,
+                    "qty": qty,
+                    "entry": entry,
+                    "tp": entry * (1 + TP_PCT),
+                    "sl": entry * (1 - SL_PCT),
+                    "time": now(),
+                    "mode": MODE
+                }
 
-            time.sleep(SCAN_INTERVAL)
-        except Exception as e:
-            scan_log.append(f"ENGINE ERROR: {str(e)}")
-            time.sleep(2)
+                orders.append({
+                    "pair": pair,
+                    "side": side,
+                    "qty": qty,
+                    "price": entry,
+                    "mode": MODE,
+                    "res": res
+                })
 
-# ======================================================
-# ROUTES
-# ======================================================
+        time.sleep(CANDLE_INTERVAL)
+
+# ================== API ==================
 @app.route("/")
-def index():
-    return render_template("index.html")
+def ui():
+    return index_html
 
 @app.route("/ping")
 def ping():
@@ -249,49 +210,64 @@ def ping():
 @app.route("/status")
 def status():
     return jsonify({
-        "running": running,
         "mode": MODE,
-        "positions": positions,
-        "orders": orders[-50:],
-        "pnl": pnl,
-        "settings": SETTINGS
+        "orders": orders[-20:],
+        "positions": positions
     })
 
-@app.route("/start", methods=["POST"])
-def start():
-    global running
-    if not running:
-        running = True
-        threading.Thread(target=scan_loop, daemon=True).start()
-    return jsonify({"ok":True})
-
-@app.route("/stop", methods=["POST"])
-def stop():
-    global running
-    running = False
-    return jsonify({"ok":True})
-
 @app.route("/mode", methods=["POST"])
-def mode():
+def set_mode():
     global MODE
-    MODE = request.json.get("mode","PAPER")
-    return jsonify({"ok":True,"mode":MODE})
+    MODE = request.json.get("mode", "PAPER")
+    return jsonify({"ok": True, "mode": MODE})
 
-@app.route("/orders")
-def get_orders():
-    return jsonify(orders)
+@app.route("/control", methods=["POST"])
+def control():
+    global running
+    running = request.json.get("run", True)
+    return jsonify({"running": running})
 
-@app.route("/positions")
-def get_positions():
-    return jsonify(positions)
+# ================== UI ==================
+index_html = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Institutional Breakout Engine</title>
+<style>
+body{background:#0f0f0f;color:#00ffcc;font-family:monospace;padding:20px}
+button{padding:10px;margin:5px;background:#111;color:#0f0;border:1px solid #0f0}
+pre{background:#050505;padding:10px}
+</style>
+</head>
+<body>
+<h2>Institutional Breakout Engine</h2>
 
-@app.route("/log")
-def get_log():
-    return jsonify(scan_log[-200:])
+<button onclick="setMode('PAPER')">Paper</button>
+<button onclick="setMode('LIVE')">Live</button>
+<button onclick="toggle(true)">Start</button>
+<button onclick="toggle(false)">Stop</button>
 
-# ======================================================
-# BOOT
-# ======================================================
+<pre id="out"></pre>
+
+<script>
+function load(){
+ fetch('/status').then(r=>r.json()).then(d=>{
+  document.getElementById('out').innerText = JSON.stringify(d,null,2);
+ });
+}
+function setMode(m){
+ fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})})
+}
+function toggle(v){
+ fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})})
+}
+setInterval(load,2000)
+</script>
+</body>
+</html>
+"""
+
+# ================== BOOT ==================
 if __name__ == "__main__":
-    threading.Thread(target=keepalive_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+    threading.Thread(target=scan_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
