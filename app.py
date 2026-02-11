@@ -15,7 +15,7 @@ BASE_URL = "https://api.coindcx.com"
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "")
 KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "60"))
 
-CANDLE_INTERVAL = 60   # seconds
+CANDLE_INTERVAL = 15   # seconds
 SCAN_INTERVAL = 5
 
 # =========================
