@@ -37,7 +37,7 @@ pnl = {"realized":0.0,"unrealized":0.0}
 SETTINGS = {
     "tp_pct": 0.02,
     "sl_pct": 0.005,
-    "risk_per_trade": 0.01,
+    "risk_per_trade": 0.1,
     "breakout_window": 20
 }
 
