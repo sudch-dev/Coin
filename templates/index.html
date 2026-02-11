@@ -1,281 +1,181 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="UTF-8">
-<title>Institutional Breakout Engine</title>
+<title>Trading Engine Monitor</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <style>
-:root{
-  --bg:#0b0f14;
-  --panel:#0f1720;
-  --border:#1f2a36;
-  --green:#00ff9c;
-  --red:#ff4d4d;
-  --blue:#3ab4ff;
-  --text:#dbe4ee;
-  --muted:#7f8fa3;
-}
+body{margin:0;background:#0b0f14;color:#dbe4ee;font-family:system-ui}
+.header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#05080c;border-bottom:1px solid #1f2a36}
+.title{font-size:18px;font-weight:600}
+.badge{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:700}
+.live{background:#2a0f0f;color:#ff4d4d}
+.paper{background:#0f2a1f;color:#00ff9c}
+.run{background:#0f1f2a;color:#3ab4ff}
+.stop{background:#2a0f0f;color:#ff4d4d}
 
-*{box-sizing:border-box}
-body{
-  margin:0;
-  background:var(--bg);
-  color:var(--text);
-  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
-}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:12px}
+.card{background:#0f1720;border:1px solid #1f2a36;border-radius:10px;padding:12px}
+h3{margin:0 0 8px 0;font-size:13px;color:#9fb3c8}
 
-.header{
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  padding:16px 24px;
-  background:#070b10;
-  border-bottom:1px solid var(--border);
-}
+.kv{font-size:12px;line-height:1.6}
+.green{color:#00ff9c}
+.red{color:#ff4d4d}
+.blue{color:#3ab4ff}
+.yellow{color:#ffcc00}
 
-.title{
-  font-size:18px;
-  font-weight:600;
-  letter-spacing:0.5px;
-}
+.table{width:100%;border-collapse:collapse;font-size:12px}
+.table th{color:#8fa6bf;text-align:left;border-bottom:1px solid #1f2a36;padding:6px}
+.table td{padding:6px;border-bottom:1px solid #131c26}
 
-.status{
-  display:flex;
-  gap:15px;
-  align-items:center;
-}
+.controls{display:flex;gap:8px;flex-wrap:wrap}
+.btn{padding:8px 12px;border-radius:6px;border:1px solid #1f2a36;background:#05080c;color:#dbe4ee;font-weight:600;cursor:pointer}
 
-.badge{
-  padding:6px 12px;
-  border-radius:6px;
-  font-size:12px;
-  font-weight:600;
-}
-
-.live{background:rgba(255,77,77,0.15);color:var(--red)}
-.paper{background:rgba(0,255,156,0.15);color:var(--green)}
-.running{background:rgba(58,180,255,0.15);color:var(--blue)}
-
-.container{
-  padding:20px;
-  display:grid;
-  grid-template-columns: 1fr 1fr;
-  gap:20px;
-}
-
-.panel{
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:10px;
-  padding:15px;
-}
-
-.panel h3{
-  margin:0 0 10px 0;
-  font-size:14px;
-  color:#9fb3c8;
-  font-weight:600;
-  letter-spacing:0.5px;
-}
-
-.controls{
-  display:flex;
-  gap:10px;
-  flex-wrap:wrap;
-}
-
-.btn{
-  padding:10px 16px;
-  border-radius:6px;
-  background:#0b1220;
-  border:1px solid var(--border);
-  color:var(--text);
-  cursor:pointer;
-  font-weight:600;
-}
-
-.btn:hover{border-color:var(--blue)}
-
-.btn-live{color:var(--red);border-color:rgba(255,77,77,0.4)}
-.btn-paper{color:var(--green);border-color:rgba(0,255,156,0.4)}
-.btn-start{color:var(--green)}
-.btn-stop{color:var(--red)}
-
-.table{
-  width:100%;
-  border-collapse:collapse;
-  font-size:13px;
-}
-
-.table th{
-  text-align:left;
-  color:#8fa6bf;
-  font-weight:600;
-  padding:8px;
-  border-bottom:1px solid var(--border);
-}
-
-.table td{
-  padding:8px;
-  border-bottom:1px solid #131c26;
-}
-
-.green{color:var(--green)}
-.red{color:var(--red)}
-.blue{color:var(--blue)}
-
-.full{
-  grid-column:1/3;
-}
-
-.footer{
-  text-align:center;
-  padding:10px;
-  color:var(--muted);
-  font-size:11px;
-}
-
-@media(max-width:900px){
-  .container{grid-template-columns:1fr}
-  .full{grid-column:1/2}
-}
+.full{grid-column:1/5}
+.scroll{max-height:260px;overflow:auto}
 </style>
 </head>
 
 <body>
 
 <div class="header">
-  <div class="title">Institutional Breakout Engine</div>
-  <div class="status">
-    <div id="modeBadge" class="badge paper">PAPER</div>
-    <div id="runBadge" class="badge running">RUNNING</div>
+  <div class="title">Institutional Trading Engine</div>
+  <div>
+    <span id="mode" class="badge paper">PAPER</span>
+    <span id="run" class="badge stop">STOPPED</span>
   </div>
 </div>
 
-<div class="container">
+<div class="grid">
 
-  <!-- CONTROL PANEL -->
-  <div class="panel">
-    <h3>Engine Control</h3>
-    <div class="controls">
-      <button class="btn btn-paper" onclick="setMode('PAPER')">Paper Mode</button>
-      <button class="btn btn-live" onclick="setMode('LIVE')">Live Mode</button>
-      <button class="btn btn-start" onclick="toggle(true)">Start Engine</button>
-      <button class="btn btn-stop" onclick="toggle(false)">Stop Engine</button>
-    </div>
-  </div>
-
-  <!-- SYSTEM STATUS -->
-  <div class="panel">
-    <h3>System Status</h3>
-    <pre id="sys" style="font-size:12px;color:#9fb3c8"></pre>
-  </div>
-
-  <!-- POSITIONS -->
-  <div class="panel full">
-    <h3>Open Positions</h3>
-    <table class="table" id="posTable">
-      <thead>
-        <tr>
-          <th>Pair</th>
-          <th>Side</th>
-          <th>Qty</th>
-          <th>Entry</th>
-          <th>TP</th>
-          <th>SL</th>
-          <th>Mode</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
-  <!-- ORDERS -->
-  <div class="panel full">
-    <h3>Orders / Executions</h3>
-    <table class="table" id="ordTable">
-      <thead>
-        <tr>
-          <th>Pair</th>
-          <th>Side</th>
-          <th>Qty</th>
-          <th>Price</th>
-          <th>Mode</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </div>
-
+<!-- SYSTEM -->
+<div class="card">
+<h3>System</h3>
+<div class="kv">
+Time: <span id="time"></span><br>
+Engine: <span id="engine"></span><br>
+Heartbeat: <span id="hb"></span><br>
+</div>
 </div>
 
-<div class="footer">
-  Engine: Institutional Breakout System • Live Market Execution • Risk Managed
+<!-- CONTROL -->
+<div class="card">
+<h3>Control</h3>
+<div class="controls">
+<button class="btn" onclick="setMode('PAPER')">Paper</button>
+<button class="btn" onclick="setMode('LIVE')">Live</button>
+<button class="btn" onclick="toggle(true)">Start</button>
+<button class="btn" onclick="toggle(false)">Stop</button>
+</div>
+</div>
+
+<!-- PNL -->
+<div class="card">
+<h3>P&L</h3>
+<div class="kv">
+Realized: <span id="real" class="green">0</span><br>
+Unrealized: <span id="unreal" class="blue">0</span>
+</div>
+</div>
+
+<!-- STATS -->
+<div class="card">
+<h3>Stats</h3>
+<div class="kv">
+Positions: <span id="posc"></span><br>
+Orders: <span id="ordc"></span>
+</div>
+</div>
+
+<!-- POSITIONS -->
+<div class="card full">
+<h3>Open Positions</h3>
+<div class="scroll">
+<table class="table">
+<thead><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th><th>Mode</th></tr></thead>
+<tbody id="pos"></tbody>
+</table>
+</div>
+</div>
+
+<!-- ORDERS -->
+<div class="card full">
+<h3>Orders & Exchange Confirmations</h3>
+<div class="scroll">
+<table class="table">
+<thead>
+<tr><th>Time</th><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th><th>Status</th><th>Exchange</th></tr>
+</thead>
+<tbody id="ord"></tbody>
+</table>
+</div>
+</div>
+
 </div>
 
 <script>
+function fmt(t){return new Date(t*1000).toLocaleTimeString()}
+
 async function load(){
-  const r = await fetch('/status');
-  const d = await r.json();
+ const r=await fetch('/status'); const d=await r.json();
 
-  // Badges
-  const modeBadge = document.getElementById("modeBadge");
-  modeBadge.innerText = d.mode;
-  modeBadge.className = "badge " + (d.mode==="LIVE"?"live":"paper");
+ // badges
+ document.getElementById("mode").innerText=d.mode;
+ document.getElementById("mode").className="badge "+(d.mode=="LIVE"?"live":"paper");
+ document.getElementById("run").innerText=d.running?"RUNNING":"STOPPED";
+ document.getElementById("run").className="badge "+(d.running?"run":"stop");
 
-  // System
-  document.getElementById("sys").innerText = JSON.stringify({
-    mode:d.mode,
-    open_positions:Object.keys(d.positions).length,
-    orders:d.orders.length
-  },null,2);
+ // system
+ document.getElementById("time").innerText=new Date().toLocaleString();
+ document.getElementById("engine").innerText=d.engine_alive?"ALIVE":"DOWN";
+ document.getElementById("hb").innerText="OK";
 
-  // Positions
-  const pt = document.querySelector("#posTable tbody");
-  pt.innerHTML="";
-  Object.values(d.positions).forEach(p=>{
-    const tr=document.createElement("tr");
-    tr.innerHTML=`
-      <td>${p.pair}</td>
-      <td class="${p.side==='BUY'?'green':'red'}">${p.side}</td>
-      <td>${p.qty}</td>
-      <td>${p.entry.toFixed(4)}</td>
-      <td class="green">${p.tp.toFixed(4)}</td>
-      <td class="red">${p.sl.toFixed(4)}</td>
-      <td>${p.mode}</td>
-    `;
-    pt.appendChild(tr);
-  });
+ // pnl
+ document.getElementById("real").innerText=d.pnl?.realized||0;
+ document.getElementById("unreal").innerText=d.pnl?.unrealized||0;
 
-  // Orders
-  const ot = document.querySelector("#ordTable tbody");
-  ot.innerHTML="";
-  d.orders.slice(-20).reverse().forEach(o=>{
-    const tr=document.createElement("tr");
-    tr.innerHTML=`
-      <td>${o.pair||"-"}</td>
-      <td class="${o.side==='BUY'?'green':'red'}">${o.side||"-"}</td>
-      <td>${o.qty||"-"}</td>
-      <td>${o.price||"-"}</td>
-      <td>${o.mode||"-"}</td>
-      <td>${o.res?.status||o.res?.paper?"OK":"ERR"}</td>
-    `;
-    ot.appendChild(tr);
-  });
+ // stats
+ document.getElementById("posc").innerText=Object.keys(d.positions||{}).length;
+ document.getElementById("ordc").innerText=(d.orders||[]).length;
+
+ // positions
+ const p=document.getElementById("pos"); p.innerHTML="";
+ Object.values(d.positions||{}).forEach(x=>{
+   p.innerHTML+=`<tr>
+<td>${x.pair}</td>
+<td class="${x.side=='BUY'?'green':'red'}">${x.side}</td>
+<td>${x.qty}</td>
+<td>${x.entry.toFixed(4)}</td>
+<td class="green">${x.tp.toFixed(4)}</td>
+<td class="red">${x.sl.toFixed(4)}</td>
+<td>${x.mode}</td>
+</tr>`;
+ });
+
+ // orders
+ const o=document.getElementById("ord"); o.innerHTML="";
+ (d.orders||[]).slice(-30).reverse().forEach(x=>{
+   o.innerHTML+=`<tr>
+<td>${fmt(x.time||0)}</td>
+<td>${x.pair||"-"}</td>
+<td class="${x.side=='BUY'?'green':'red'}">${x.side||"-"}</td>
+<td>${x.qty||"-"}</td>
+<td>${x.price||"-"}</td>
+<td>${x.exchange_status||"SENT"}</td>
+<td>${JSON.stringify(x.exchange_msg||{}).slice(0,40)}</td>
+</tr>`;
+ });
 }
 
 function setMode(m){
-  fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
+ fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})});
 }
-
 function toggle(v){
-  fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})});
+ fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run:v})});
 }
 
-setInterval(load,2000);
-load();
+setInterval(load,2000); load();
 </script>
 
 </body>
