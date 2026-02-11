@@ -5,39 +5,42 @@ import threading
 import requests
 from flask import Flask, jsonify, request, render_template
 
-# =========================
+# ======================================================
 # CONFIG
-# =========================
+# ======================================================
 API_KEY = os.environ.get("API_KEY", "")
 API_SECRET = os.environ.get("API_SECRET", "")
 BASE_URL = "https://api.coindcx.com"
 
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "")
+# Render / hosting keepalive config
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "")  # e.g. https://your-app.onrender.com
 KEEPALIVE_SEC = int(os.environ.get("KEEPALIVE_SEC", "60"))
 
-CANDLE_INTERVAL = 15   # seconds
-SCAN_INTERVAL = 5
+SCAN_INTERVAL = 5   # seconds
+CANDLE_INTERVAL = 60
 
-# =========================
+# ======================================================
 # APP
-# =========================
+# ======================================================
 app = Flask(__name__)
 
-# =========================
+# ======================================================
 # GLOBAL STATE
-# =========================
+# ======================================================
 running = False
 MODE = "PAPER"   # PAPER | LIVE
 
 PAIRS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
-    "XRPUSDT", "ADAUSDT", "DOGEUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT",
+    "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"
 ]
 
 prices = {}
+price_history = {}
 positions = {}
 orders = []
 scan_log = []
+
 pnl = {
     "realized": 0.0,
     "unrealized": 0.0
@@ -50,9 +53,11 @@ SETTINGS = {
     "breakout_window": 20
 }
 
-# =========================
-# KEEPALIVE SYSTEM (SAFE)
-# =========================
+# ======================================================
+# KEEPALIVE SYSTEM (RENDER SAFE)
+# ======================================================
+_last_keepalive = 0
+
 def _keepalive_ping():
     if not APP_BASE_URL:
         return
@@ -62,23 +67,29 @@ def _keepalive_ping():
         pass
 
 def keepalive_loop():
+    global _last_keepalive
     while True:
-        _keepalive_ping()
-        time.sleep(KEEPALIVE_SEC)
+        now = time.time()
+        if now - _last_keepalive >= KEEPALIVE_SEC:
+            _keepalive_ping()
+            _last_keepalive = now
+        time.sleep(5)
 
-# =========================
-# EXCHANGE ABSTRACTION
-# =========================
+# ======================================================
+# EXCHANGE ABSTRACTION (mock now, live later)
+# ======================================================
 def fetch_all_prices():
-    # replace with exchange API later
     data = {}
     for p in PAIRS:
         if p not in prices:
             prices[p] = 100.0
-        # mock movement
-        prices[p] *= (1 + (0.001 - 0.002 * (time.time() % 2)))
+
+        # simulated movement (replace with real API/WebSocket)
+        drift = (0.0005 - 0.001 * ((int(time.time()) % 2)))
+        prices[p] = prices[p] * (1 + drift)
+
         data[p] = {
-            "price": round(prices[p], 2),
+            "price": round(prices[p], 4),
             "ts": int(time.time())
         }
     return data
@@ -97,34 +108,36 @@ def place_order(pair, side, qty, price, mode="PAPER"):
     orders.append(order)
     return order
 
-# =========================
-# BREAKOUT ENGINE
-# =========================
-price_history = {}
-
+# ======================================================
+# BREAKOUT ENGINE (REAL LOGIC STRUCTURE)
+# ======================================================
 def detect_breakout(pair, price):
     hist = price_history.setdefault(pair, [])
     hist.append(price)
+
     if len(hist) < SETTINGS["breakout_window"]:
         return None
+
     window = hist[-SETTINGS["breakout_window"]:]
     high = max(window[:-1])
     low = min(window[:-1])
 
+    # structure breakout
     if price > high:
         return "UP"
     if price < low:
         return "DOWN"
+
     return None
 
-# =========================
+# ======================================================
 # TRADE ENGINE
-# =========================
+# ======================================================
 def open_position(pair, side, price):
     if pair in positions:
         return
 
-    qty = 1  # position sizing logic here
+    qty = 1  # replace with risk engine later
     order = place_order(pair, side, qty, price, MODE)
 
     positions[pair] = {
@@ -144,23 +157,32 @@ def monitor_exits(price_map):
         pos = positions[pair]
         price = price_map[pair]["price"]
 
+        closed = False
+        profit = 0
+
         if pos["side"] == "BUY":
-            if price >= pos["tp"] or price <= pos["sl"]:
+            if price >= pos["tp"]:
                 profit = (price - pos["entry"]) * pos["qty"]
-            else:
-                continue
+                closed = True
+            elif price <= pos["sl"]:
+                profit = (price - pos["entry"]) * pos["qty"]
+                closed = True
         else:
-            if price <= pos["tp"] or price >= pos["sl"]:
+            if price <= pos["tp"]:
                 profit = (pos["entry"] - price) * pos["qty"]
-            else:
-                continue
+                closed = True
+            elif price >= pos["sl"]:
+                profit = (pos["entry"] - price) * pos["qty"]
+                closed = True
 
-        pnl["realized"] += profit
-        del positions[pair]
+        if closed:
+            pnl["realized"] += profit
+            scan_log.append(f"EXIT {pair} PNL {round(profit,4)}")
+            del positions[pair]
 
-# =========================
-# MAIN LOOP
-# =========================
+# ======================================================
+# MAIN SCAN LOOP
+# ======================================================
 def scan_loop():
     global running
     while running:
@@ -181,13 +203,14 @@ def scan_loop():
                     scan_log.append(f"{pair} BREAKOUT DOWN @ {price}")
 
             time.sleep(SCAN_INTERVAL)
+
         except Exception as e:
             scan_log.append(f"ERROR: {str(e)}")
             time.sleep(2)
 
-# =========================
+# ======================================================
 # ROUTES
-# =========================
+# ======================================================
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -202,7 +225,7 @@ def status():
         "running": running,
         "mode": MODE,
         "positions": positions,
-        "orders": orders[-20:],
+        "orders": orders[-50:],
         "pnl": pnl,
         "settings": SETTINGS
     })
@@ -238,11 +261,14 @@ def get_positions():
 
 @app.route("/log")
 def get_log():
-    return jsonify(scan_log[-100:])
+    return jsonify(scan_log[-200:])
 
-# =========================
+# ======================================================
 # BOOT
-# =========================
+# ======================================================
 if __name__ == "__main__":
+    # Keepalive thread (Render-safe)
     threading.Thread(target=keepalive_loop, daemon=True).start()
+
+    # Flask server
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
