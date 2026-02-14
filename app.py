@@ -13,7 +13,7 @@ import numpy as np
 app = Flask(__name__)
 
 # =========================================================
-# 🔐 LOAD API KEYS FROM ENV
+# 🔐 CONFIG
 # =========================================================
 
 API_KEY = os.environ.get("COINDCX_API_KEY")
@@ -21,11 +21,10 @@ API_SECRET = os.environ.get("COINDCX_API_SECRET")
 
 BASE_URL = "https://api.coindcx.com"
 
-symbol = "BTCUSDT"
+symbol = "btcusdt"        # lowercase for CoinDCX candles
 timeframe = "15m"
-order_size_usdt = 2
+order_size_usdt = 20
 
-# Strategy parameters
 ema_len = 200
 rsi_len = 14
 atr_len = 14
@@ -35,11 +34,11 @@ max_adds = 4
 tp_atr_mult = 1.2
 sl_atr_mult = 3.0
 
-# =========================================================
-# 📊 GLOBAL STATE
-# =========================================================
-
 server_start_time = datetime.datetime.utcnow()
+
+# =========================================================
+# 📊 STATE
+# =========================================================
 
 in_position = False
 entry_prices = []
@@ -47,8 +46,7 @@ total_qty = 0
 
 trade_log = []
 
-# ⭐ TRADING MODE (DEFAULT SAFE)
-LIVE_TRADING = False
+LIVE_TRADING = False  # SAFE DEFAULT
 
 
 # =========================================================
@@ -66,15 +64,20 @@ def log(msg):
 
 
 # =========================================================
-# 🪙 COINDCX API
+# 🪙 API SIGN
 # =========================================================
 
 def sign(payload):
     secret_bytes = bytes(API_SECRET, "utf-8")
     json_payload = json.dumps(payload, separators=(",", ":"))
-    return hmac.new(secret_bytes, json_payload.encode(),
+    return hmac.new(secret_bytes,
+                    json_payload.encode(),
                     hashlib.sha256).hexdigest()
 
+
+# =========================================================
+# 🛒 ORDER FUNCTIONS
+# =========================================================
 
 def place_market_buy(usdt_amount):
 
@@ -98,7 +101,7 @@ def place_market_buy(usdt_amount):
     r = requests.post(BASE_URL + "/exchange/v1/orders/create",
                       json=payload, headers=headers)
 
-    log(f"LIVE BUY: {r.text}")
+    log(f"LIVE BUY → {r.text}")
 
 
 def place_market_sell(quantity):
@@ -123,17 +126,44 @@ def place_market_sell(quantity):
     r = requests.post(BASE_URL + "/exchange/v1/orders/create",
                       json=payload, headers=headers)
 
-    log(f"LIVE SELL: {r.text}")
+    log(f"LIVE SELL → {r.text}")
 
 
 # =========================================================
-# 📈 MARKET DATA
+# 📈 SAFE MARKET DATA FETCH  (FIXED)
 # =========================================================
 
-def get_data():
+def get_latest_data():
+
     url = f"{BASE_URL}/market_data/candles"
-    params = {"pair": symbol, "interval": timeframe, "limit": 300}
-    df = pd.DataFrame(requests.get(url, params=params).json()).astype(float)
+
+    params = {
+        "pair": symbol,
+        "interval": timeframe,
+        "limit": 300
+    }
+
+    r = requests.get(url, params=params, timeout=15)
+
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}")
+
+    data = r.json()
+
+    # Validate format
+    if not isinstance(data, list) or len(data) == 0:
+        raise Exception(f"Invalid candle data: {data}")
+
+    df = pd.DataFrame(data)
+
+    needed = ["open", "high", "low", "close"]
+    for col in needed:
+        if col not in df.columns:
+            raise Exception(f"Missing column {col}")
+
+    df = df.astype(float)
+
+    # ===== INDICATORS =====
 
     df["ema"] = df["close"].ewm(span=ema_len).mean()
 
@@ -152,7 +182,7 @@ def get_data():
 
 
 # =========================================================
-# 🤖 BOT LOOP
+# 🤖 TRADING LOOP
 # =========================================================
 
 def bot_loop():
@@ -160,14 +190,18 @@ def bot_loop():
 
     while True:
         try:
-            d = get_data()
+            d = get_latest_data()
 
-            price, ema, rsi, atr = d["close"], d["ema"], d["rsi"], d["atr"]
+            price = d["close"]
+            ema = d["ema"]
+            rsi = d["rsi"]
+            atr = d["atr"]
 
             log(f"P={price:.2f} EMA={ema:.2f} RSI={rsi:.1f}")
 
             # ENTRY
             if not in_position:
+
                 if price > ema and rsi < rsi_long_level:
                     place_market_buy(order_size_usdt)
 
@@ -187,7 +221,7 @@ def bot_loop():
                         place_market_buy(order_size_usdt)
                         entry_prices.append(price)
                         total_qty += order_size_usdt / price
-                        log("AVERAGING")
+                        log("AVERAGING BUY")
 
                 tp = avg + atr * tp_atr_mult
                 sl = avg - atr * sl_atr_mult
@@ -201,11 +235,12 @@ def bot_loop():
                     total_qty = 0
 
         except Exception as e:
-            log(f"ERROR: {e}")
+            log(f"DATA ERROR → {e}")
 
         time.sleep(60)
 
 
+# Start bot thread
 threading.Thread(target=bot_loop, daemon=True).start()
 
 
@@ -230,7 +265,7 @@ def index():
 def toggle():
     global LIVE_TRADING
     LIVE_TRADING = not LIVE_TRADING
-    log(f"MODE CHANGED → {'LIVE' if LIVE_TRADING else 'PAPER'}")
+    log(f"MODE → {'LIVE' if LIVE_TRADING else 'PAPER'}")
     return ("", 204)
 
 
