@@ -1,80 +1,83 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            background:#0f172a;
-            color:#e2e8f0;
-            font-family:Arial;
-            text-align:center;
-            padding:30px;
-        }
-        .card {
-            background:#1e293b;
-            padding:25px;
-            border-radius:12px;
-            max-width:750px;
-            margin:auto;
-        }
-        button {
-            padding:12px 20px;
-            font-size:16px;
-            border:none;
-            border-radius:8px;
-            cursor:pointer;
-            margin-top:10px;
-        }
-        .paper { background:#22c55e; }
-        .live  { background:#ef4444; }
-        .log {
-            text-align:left;
-            background:#020617;
-            padding:15px;
-            border-radius:8px;
-            margin-top:20px;
-            max-height:350px;
-            overflow-y:auto;
-            font-size:14px;
-        }
-    </style>
+<title>ULTRA AI CoinDCX</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{
+  background:#0b1b3b;
+  font-family:Arial;
+  color:white;
+  text-align:center;
+}
+.card{
+  background:#1e2c48;
+  margin:30px auto;
+  padding:30px;
+  border-radius:15px;
+  width:90%;
+  max-width:420px;
+}
+button{
+  padding:12px 20px;
+  background:#22c55e;
+  border:none;
+  border-radius:8px;
+  font-size:18px;
+  cursor:pointer;
+}
+.logs{
+  background:#020617;
+  padding:10px;
+  border-radius:8px;
+  text-align:left;
+  height:160px;
+  overflow:auto;
+}
+</style>
 </head>
+
 <body>
 
 <div class="card">
+<h1>🚀 ULTRA AI BOT</h1>
 
-    <h1>🚀 CoinDCX Trading Bot</h1>
+<p>Mode: <b id="mode"></b></p>
 
-    <p>Mode: <strong>{{ mode }}</strong></p>
+<button onclick="toggle()">Toggle Paper / Live</button>
 
-    <button onclick="toggleMode()"
-            class="{{ 'live' if mode=='LIVE' else 'paper' }}">
-        Toggle Paper / Live
-    </button>
+<p>Uptime: <span id="uptime"></span></p>
 
-    <p>Status:
-        {% if position %} IN POSITION {% else %} WAITING {% endif %}
-    </p>
+<h3>Active Positions</h3>
+<pre id="pos"></pre>
 
-    <p>Uptime:</p>
-    <h2>{{ uptime }}</h2>
-
-    <h3>Recent Logs</h3>
-
-    <div class="log">
-        {% for l in logs %}
-            <div>{{ l }}</div>
-        {% endfor %}
-    </div>
+<h3>Recent Logs</h3>
+<div class="logs" id="logs"></div>
 
 </div>
 
 <script>
-function toggleMode() {
-    fetch("/toggle", {method: "POST"})
-        .then(() => location.reload());
+
+async function fetchStatus(){
+  const r = await fetch("/status");
+  const d = await r.json();
+
+  document.getElementById("mode").innerText = d.mode;
+  document.getElementById("uptime").innerText = d.uptime;
+  document.getElementById("pos").innerText =
+      JSON.stringify(d.positions,null,2);
+
+  document.getElementById("logs").innerHTML =
+      d.logs.join("<br>");
 }
+
+async function toggle(){
+  await fetch("/toggle");
+}
+
+setInterval(fetchStatus,2000);
+fetchStatus();
+
 </script>
 
 </body>
