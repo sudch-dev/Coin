@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 # ================= CONFIG =================
 
-BASE_URL = "https://api.coindcx.com"
+BASE_URL = "https://public.coindcx.com"
 
 symbol = "btcusdt"      # CoinDCX pair name (lowercase)
 timeframe = "15m"
