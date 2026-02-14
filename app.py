@@ -50,7 +50,7 @@ def get_data(symbol):
     }
 
     r = requests.get(
-        "https://public.coindcx.com/market_data/candles",
+        "https://api.coindcx.com/exchange/v1/market_data/candles",
         params=params,
         timeout=15
     )
