@@ -1,92 +1,43 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
 <title>ORDI Futures Bot</title>
 <style>
-body{font-family:Arial;background:#0e1117;color:#fff}
-.card{background:#161b22;padding:15px;margin:10px;border-radius:8px}
-table{width:100%;border-collapse:collapse}
-td,th{padding:8px;border-bottom:1px solid #333}
-button{padding:10px 20px;margin:5px;font-size:16px}
+body { font-family: Arial; background:#111; color:white; text-align:center }
+button { padding:12px 20px; margin:10px; font-size:18px }
+.card { background:#222; padding:20px; margin:20px; border-radius:10px }
 </style>
 </head>
+
 <body>
 
-<h2>ORDIUSDT Futures Dashboard</h2>
+<h1>ORDI-USDT Futures Bot</h1>
+
+<div class="card">
+<h2>Status: <span id="status">Idle</span></h2>
+<h2>Price: <span id="price">0</span></h2>
+<h2>Equity: <span id="equity">0</span> USDT</h2>
+<h2>Position: <span id="position">None</span></h2>
+</div>
 
 <button onclick="start()">START</button>
 <button onclick="stop()">STOP</button>
 
-<div class="card">
-<h3>Account</h3>
-<div>Equity: <span id="equity"></span></div>
-<div>USDT Balance: <span id="balance"></span></div>
-<div>Status: <span id="status"></span></div>
-</div>
-
-<div class="card">
-<h3>Position</h3>
-<table>
-<thead>
-<tr>
-<th>Side</th><th>Size</th><th>Entry</th>
-<th>Mark</th><th>Liq</th><th>PnL</th>
-</tr>
-</thead>
-<tbody id="pos"></tbody>
-</table>
-</div>
-
-<div class="card">
-<h3>Recent Trades</h3>
-<table>
-<thead>
-<tr><th>Time</th><th>Side</th><th>Entry</th><th>Qty</th></tr>
-</thead>
-<tbody id="trades"></tbody>
-</table>
-</div>
-
 <script>
-function start(){ fetch("/start",{method:"POST"}) }
-function stop(){ fetch("/stop",{method:"POST"}) }
+function start() { fetch('/start',{method:'POST'}) }
+function stop() { fetch('/stop',{method:'POST'}) }
 
-function update(){
- fetch("/status")
- .then(r=>r.json())
- .then(d=>{
-   document.getElementById("equity").innerText=d.equity.toFixed(2)
-   document.getElementById("balance").innerText=d.balance.toFixed(2)
-   document.getElementById("status").innerText=d.status
-
-   let p=""
-   if(d.position){
-     p=`<tr>
-     <td>${d.position.side}</td>
-     <td>${d.position.size}</td>
-     <td>${d.position.entry_price}</td>
-     <td>${d.position.mark_price}</td>
-     <td>${d.position.liquidation_price}</td>
-     <td>${d.position.unrealized_pnl}</td>
-     </tr>`
-   }
-   document.getElementById("pos").innerHTML=p
-
-   let t=""
-   d.trades.forEach(x=>{
-     t+=`<tr>
-     <td>${x.time}</td>
-     <td>${x.side}</td>
-     <td>${x.entry.toFixed(4)}</td>
-     <td>${x.qty.toFixed(3)}</td>
-     </tr>`
-   })
-   document.getElementById("trades").innerHTML=t
- })
-}
-setInterval(update,3000)
-update()
+setInterval(()=>{
+fetch('/status')
+.then(r=>r.json())
+.then(d=>{
+document.getElementById('status').innerText = d.status
+document.getElementById('price').innerText = d.price
+document.getElementById('equity').innerText = d.equity
+document.getElementById('position').innerText =
+    d.position.size ? d.position.size : "None"
+})
+},2000)
 </script>
 
 </body>
