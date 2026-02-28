@@ -3,38 +3,41 @@
 <head>
 <title>ORDI Futures Bot</title>
 <style>
-body { font-family: Arial; background:#111; color:white; text-align:center }
-button { padding:12px 20px; margin:10px; font-size:18px }
+body { background:#111; color:white; font-family:Arial; text-align:center }
 .card { background:#222; padding:20px; margin:20px; border-radius:10px }
+button { padding:12px 20px; margin:10px; font-size:18px }
 </style>
 </head>
-
 <body>
 
 <h1>ORDI-USDT Futures Bot</h1>
 
 <div class="card">
 <h2>Status: <span id="status">Idle</span></h2>
-<h2>Price: <span id="price">0</span></h2>
-<h2>Equity: <span id="equity">0</span> USDT</h2>
-<h2>Position: <span id="position">None</span></h2>
+<h3>Price: <span id="price">0</span></h3>
+<h3>Wallet Balance: <span id="wallet">0</span> USDT</h3>
+<h3>Available: <span id="available">0</span> USDT</h3>
+<h3>Position Size: <span id="position">None</span></h3>
 </div>
 
 <button onclick="start()">START</button>
 <button onclick="stop()">STOP</button>
+<button onclick="flatten()">FLATTEN</button>
 
 <script>
-function start() { fetch('/start',{method:'POST'}) }
-function stop() { fetch('/stop',{method:'POST'}) }
+function start(){ fetch('/start',{method:'POST'}) }
+function stop(){ fetch('/stop',{method:'POST'}) }
+function flatten(){ fetch('/flatten',{method:'POST'}) }
 
 setInterval(()=>{
 fetch('/status')
 .then(r=>r.json())
 .then(d=>{
-document.getElementById('status').innerText = d.status
-document.getElementById('price').innerText = d.price
-document.getElementById('equity').innerText = d.equity
-document.getElementById('position').innerText =
+document.getElementById("status").innerText = d.bot_status
+document.getElementById("price").innerText = d.price
+document.getElementById("wallet").innerText = d.wallet_balance
+document.getElementById("available").innerText = d.available_balance
+document.getElementById("position").innerText =
     d.position.size ? d.position.size : "None"
 })
 },2000)
