@@ -1,46 +1,52 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>ORDI Futures Bot</title>
-<style>
-body { background:#111; color:white; font-family:Arial; text-align:center }
-.card { background:#222; padding:20px; margin:20px; border-radius:10px }
-button { padding:12px 20px; margin:10px; font-size:18px }
-</style>
+  <title>ORDI Futures Pro Bot</title>
+  <style>
+    body { font-family: Arial; background:#111; color:#eee; text-align:center; }
+    .card { background:#222; padding:20px; margin:20px auto; width:320px; border-radius:10px; }
+    button { padding:12px 20px; margin:8px; font-size:16px; border:none; border-radius:6px; }
+    .buy { background:#00c853; color:white; }
+    .sell { background:#d50000; color:white; }
+  </style>
 </head>
+
 <body>
 
-<h1>ORDI-USDT Futures Bot</h1>
+<h1>ORDIUSDT Futures — PRO</h1>
 
 <div class="card">
-<h2>Status: <span id="status">Idle</span></h2>
-<h3>Price: <span id="price">0</span></h3>
-<h3>Wallet Balance: <span id="wallet">0</span> USDT</h3>
-<h3>Available: <span id="available">0</span> USDT</h3>
-<h3>Position Size: <span id="position">None</span></h3>
+  <p>Price: <span id="price">-</span></p>
+  <p>Wallet: <span id="wallet">-</span> USDT</p>
+  <p>Available: <span id="available">-</span> USDT</p>
+  <p>PnL: <span id="pnl">-</span></p>
 </div>
 
-<button onclick="start()">START</button>
-<button onclick="stop()">STOP</button>
-<button onclick="flatten()">FLATTEN</button>
+<div class="card">
+  <button class="buy" onclick="trade('buy')">LONG</button>
+  <button class="sell" onclick="trade('sell')">SHORT</button>
+</div>
 
 <script>
-function start(){ fetch('/start',{method:'POST'}) }
-function stop(){ fetch('/stop',{method:'POST'}) }
-function flatten(){ fetch('/flatten',{method:'POST'}) }
+async function update() {
+  const r = await fetch('/status');
+  const d = await r.json();
 
-setInterval(()=>{
-fetch('/status')
-.then(r=>r.json())
-.then(d=>{
-document.getElementById("status").innerText = d.bot_status
-document.getElementById("price").innerText = d.price
-document.getElementById("wallet").innerText = d.wallet_balance
-document.getElementById("available").innerText = d.available_balance
-document.getElementById("position").innerText =
-    d.position.size ? d.position.size : "None"
-})
-},2000)
+  document.getElementById('price').innerText = d.price.toFixed(3);
+  document.getElementById('wallet').innerText = d.wallet_balance.toFixed(2);
+  document.getElementById('available').innerText = d.available_balance.toFixed(2);
+  document.getElementById('pnl').innerText = d.pnl.toFixed(2);
+}
+
+async function trade(side) {
+  const r = await fetch('/' + side);
+  const d = await r.json();
+  alert(JSON.stringify(d));
+  update();
+}
+
+setInterval(update, 3000);
+update();
 </script>
 
 </body>
