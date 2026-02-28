@@ -65,7 +65,7 @@ def get_wallet():
 
     usdt = 0
     for x in extract_list(res):
-        if x.get("currency") == "USDT":
+        if x.get("currency") == "INR":
             usdt = float(x.get("balance", 0))
     return usdt
 
