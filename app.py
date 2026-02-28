@@ -8,14 +8,13 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
+# Use Render Environment Variables
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET", "")
 
 BASE = "https://api.coindcx.com"
-# Futures symbols require the exchange prefix (e.g., 'B-' for Binance)
+# FIXED: CoinDCX Futures uses the 'B-' prefix for ORDI/USDT
 SYMBOL = "B-ORDI_USDT" 
-
-# ========= AUTHENTICATION =========
 
 def sign(payload_str):
     return hmac.new(API_SECRET.encode(), payload_str.encode(), hashlib.sha256).hexdigest()
@@ -31,13 +30,13 @@ def signed_post(endpoint, body):
     try:
         r = requests.post(BASE + endpoint, headers=headers, data=payload, timeout=10)
         return r.json()
-    except: return {}
-
-# ========= DATA FETCHING =========
+    except Exception as e:
+        print(f"API Error: {e}")
+        return {}
 
 @app.route("/status")
 def status():
-    # 1. Get Live Price
+    # 1. Fetch Live Price using the correct Ticker endpoint
     price = 0
     try:
         r = requests.get(f"{BASE}/exchange/ticker", timeout=5)
@@ -46,31 +45,32 @@ def status():
                 price = float(x.get("last_price", 0))
     except: pass
 
-    # 2. Get Futures Wallet Balance
+    # 2. Fetch Futures Wallet Balance
     wallet = 0
-    balance_res = signed_post("/exchange/v1/derivatives/futures/balances", {})
-    # CoinDCX Futures balances often return a list or a 'data' object
-    balances = balance_res if isinstance(balance_res, list) else balance_res.get("data", [])
+    # Note: Check if your account uses 'balances' or 'futures/balances' endpoint
+    res = signed_post("/exchange/v1/derivatives/futures/balances", {})
+    balances = res if isinstance(res, list) else res.get("data", [])
     for b in balances:
+        # Use 'USDT' for the futures wallet identifier
         if b.get("asset") == "USDT": 
             wallet = float(b.get("balance", 0))
 
-    # 3. Get Active Position
+    # 3. Fetch Active Position
     side, size, entry, pnl, roe = "NONE", 0, 0, 0, 0
     pos_res = signed_post("/exchange/v1/derivatives/futures/positions", {})
     positions = pos_res if isinstance(pos_res, list) else pos_res.get("data", [])
     
     for p in positions:
         if p.get("symbol") == SYMBOL:
-            size = abs(float(p.get("quantity", 0)))
-            entry = float(p.get("entry_price", 0))
-            if float(p.get("quantity", 0)) > 0: side = "LONG"
-            elif float(p.get("quantity", 0)) < 0: side = "SHORT"
-            
-            # Simple PnL Calculation
-            if entry > 0:
+            qty = float(p.get("quantity", 0))
+            if qty != 0:
+                size = abs(qty)
+                entry = float(p.get("entry_price", 0))
+                side = "LONG" if qty > 0 else "SHORT"
+                # PnL Calculation
                 pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
-                roe = (pnl / (entry * size / 10)) * 100 # Approx 10x leverage ROE
+                # Estimate ROE (assuming 10x leverage as a placeholder)
+                roe = (pnl / (entry * size / 10)) * 100 if entry > 0 else 0
 
     return jsonify({
         "equity": round(wallet, 2),
