@@ -3,29 +3,34 @@
 <head>
     <title>CoinDCX Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>body { background: #0b0e11; color: white; font-family: sans-serif; }</style>
+    <style>body { background: #0b0e11; color: white; }</style>
 </head>
 <body class="p-10">
-    <div class="max-w-2xl mx-auto bg-gray-900 p-8 rounded-xl shadow-2xl border border-gray-800">
-        <h1 class="text-2xl font-bold mb-6 text-yellow-500">CoinDCX Live Monitor</h1>
+    <div class="max-w-2xl mx-auto bg-gray-900 p-8 rounded-xl border border-gray-800 shadow-2xl">
+        <h1 class="text-2xl font-bold mb-6 text-yellow-500 border-b border-gray-800 pb-4">CoinDCX Live Monitor</h1>
         
         <div class="grid grid-cols-2 gap-4 mb-8">
-            <div class="p-4 bg-black rounded">
-                <p class="text-gray-400 text-xs uppercase">Wallet (USDT)</p>
-                <p id="equity" class="text-xl font-mono">Loading...</p>
+            <div class="p-4 bg-black rounded border border-gray-800">
+                <p class="text-gray-400 text-xs uppercase font-bold mb-1">Wallet (USDT)</p>
+                <p id="equity" class="text-2xl font-mono">--</p>
             </div>
-            <div class="p-4 bg-black rounded">
-                <p class="text-gray-400 text-xs uppercase">ORDI Price</p>
-                <p id="mark" class="text-xl font-mono text-yellow-400">Loading...</p>
+            <div class="p-4 bg-black rounded border border-gray-800">
+                <p class="text-gray-400 text-xs uppercase font-bold mb-1">ORDI Price</p>
+                <p id="mark" class="text-2xl font-mono text-yellow-400">--</p>
             </div>
         </div>
 
-        <div class="space-y-2 text-sm">
-            <div class="flex justify-between border-b border-gray-800 py-2">
-                <span>Position Side:</span> <span id="side">--</span>
+        <div class="space-y-4 bg-black p-6 rounded border border-gray-800">
+            <div class="flex justify-between items-center">
+                <span class="text-gray-400">Position Side:</span>
+                <span id="side" class="font-bold text-lg">--</span>
             </div>
-            <div class="flex justify-between py-2">
-                <span>Unrealized PnL:</span> <span id="pnl" class="font-bold">--</span>
+            <div class="flex justify-between items-center border-t border-gray-900 pt-4">
+                <span class="text-gray-400">Unrealized PnL:</span>
+                <div class="text-right">
+                    <p id="pnl" class="text-xl font-bold">--</p>
+                    <p id="roe" class="text-xs">--</p>
+                </div>
             </div>
         </div>
     </div>
@@ -35,13 +40,17 @@
             try {
                 const res = await fetch('/status');
                 const d = await res.json();
-                document.getElementById('equity').innerText = d.equity;
-                document.getElementById('mark').innerText = d.mark;
+                document.getElementById('equity').innerText = d.equity + " USDT";
+                document.getElementById('mark').innerText = "$" + d.mark;
                 document.getElementById('side').innerText = d.side;
-                document.getElementById('pnl').innerText = d.pnl + " USDT";
-            } catch (e) { console.error("Update error"); }
+                
+                const pnlEl = document.getElementById('pnl');
+                pnlEl.innerText = d.pnl + " USDT";
+                pnlEl.className = d.pnl >= 0 ? "text-xl font-bold text-green-500" : "text-xl font-bold text-red-500";
+                document.getElementById('roe').innerText = d.roe + "% ROE";
+            } catch (e) { console.error("API error"); }
         }
-        setInterval(refresh, 5000);
+        setInterval(refresh, 3000);
         refresh();
     </script>
 </body>
