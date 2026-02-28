@@ -1,5 +1,5 @@
 flask
 requests
-pytz
-pandas
 gunicorn
+pandas
+pandas_ta
