@@ -1,264 +1,569 @@
 import os
 import time
+import threading
 import hmac
-import json
 import hashlib
 import requests
-import pandas as pd
-import numpy as np
-from flask import Flask, jsonify, render_template_string
-from datetime import datetime
+import json
+from flask import Flask, render_template, jsonify
+from datetime import datetime, timedelta
+from pytz import timezone
+from collections import deque
+from statistics import median
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET").encode()
+BASE_URL = "https://api.coindcx.com"
 
-API_KEY = os.getenv("COINDCX_API_KEY")
-API_SECRET = os.getenv("COINDCX_API_SECRET")
+PAIRS = [
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
+    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
+]
 
-coins = ["BTCINR", "ETHINR", "XRPINR", "SOLINR"]
-timeframe = "5m"
+PAIR_RULES = {
+    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
+    "XRPUSDT": {"precision": 4, "min_qty": 0.1},
+    "SHIBUSDT": {"precision": 4, "min_qty": 10000},
+    "DOGEUSDT": {"precision": 4, "min_qty": 0.01},
+    "SOLUSDT": {"precision": 4, "min_qty": 0.01},
+    "AEROUSDT": {"precision": 2, "min_qty": 0.01},
+    "ADAUSDT": {"precision": 2, "min_qty": 2},
+    "LTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "BNBUSDT": {"precision": 4, "min_qty": 0.001}
+}
 
-ema_len = 200
-rsi_len = 14
-atr_len = 14
+# --- Tunables ---
+CANDLE_INTERVAL = 15            # seconds (changed from 30 -> 15 as requested)
+TRADE_COOLDOWN_SEC = 30
 
-risk_pct = 0.02
-paper_balance = 10000
+IST = timezone('Asia/Kolkata')
+def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
+def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
 
-mode = "PAPER"
-positions = {}
-logs = []
-start_time = datetime.now()
+tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
+scan_log, trade_log, exit_orders = [], [], []
+daily_profit, pair_precision = {}, {}
+running = False
+status = {"msg": "Idle", "last": ""}
+status_epoch = 0
+error_message = ""
 
-# ================= LOGGING =================
+# Prevent multiple entries on the same flip-candle
+_last_signal_candle_start = {p: None for p in PAIRS}
 
-def log(msg):
-    t = datetime.now().strftime("%H:%M:%S")
-    logs.insert(0, f"[{t}] {msg}")
-    if len(logs) > 60:
-        logs.pop()
+# ===== Persistent P&L state (confirmed fills only) =====
+PROFIT_STATE_FILE = "profit_state.json"
+profit_state = {
+    "cumulative_pnl": 0.0,
+    "daily": {},
+    "inventory": {},
+    "processed_orders": []
+}
+pair_cooldown_until = {p: 0 for p in PAIRS}
 
-# ================= DATA =================
+def load_profit_state():
+    global profit_state
+    try:
+        with open(PROFIT_STATE_FILE, "r") as f:
+            data = json.load(f)
+        profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
+        profit_state["daily"] = dict(data.get("daily", {}))
+        profit_state["inventory"] = data.get("inventory", {})
+        profit_state["processed_orders"] = list(data.get("processed_orders", []))
+    except:
+        pass
 
-def get_data(symbol):
-
-    params = {
-        "pair": symbol,
-        "interval": timeframe,
-        "limit": 300
+def save_profit_state():
+    tmp = {
+        "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
+        "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
+        "inventory": profit_state.get("inventory", {}),
+        "processed_orders": profit_state.get("processed_orders", [])
     }
+    try:
+        with open(PROFIT_STATE_FILE, "w") as f:
+            json.dump(tmp, f)
+    except:
+        pass
 
-    r = requests.get(
-        "https://api.coindcx.com/exchange/v1/market_data/candles",
-        params=params,
-        timeout=15
-    )
+def _get_inventory_deque(market):
+    inv = profit_state["inventory"].get(market, [])
+    dq = deque()
+    for lot in inv:
+        try:
+            q, c = float(lot[0]), float(lot[1])
+            if q > 0 and c > 0:
+                dq.append([q, c])
+        except:
+            continue
+    return dq
 
-    if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code}")
+def _set_inventory_from_deque(market, dq):
+    profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
 
-    data = r.json()
+def apply_fill_update(market, side, price, qty, ts_ms, order_id):
+    if not order_id: return
+    if order_id in profit_state["processed_orders"]: return
+    try:
+        price = float(price); qty = float(qty)
+    except:
+        return
+    if price <= 0 or qty <= 0: return
 
-    if not isinstance(data, list) or len(data) == 0:
-        raise Exception(f"No data for {symbol}")
+    inv = _get_inventory_deque(market)
+    realized = 0.0
 
-    df = pd.DataFrame(data)
+    if side.lower() == "buy":
+        inv.append([qty, price])
+    else:
+        sell_q = qty
+        while sell_q > 1e-18 and inv:
+            lot_q, lot_px = inv[0]
+            used = min(sell_q, lot_q)
+            realized += (price - lot_px) * used
+            lot_q -= used
+            sell_q -= used
+            if lot_q <= 1e-18:
+                inv.popleft()
+            else:
+                inv[0][0] = lot_q
 
-    df = df[["open", "high", "low", "close"]].astype(float)
+    _set_inventory_from_deque(market, inv)
+    profit_state["processed_orders"].append(order_id)
+    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
+    dkey = ist_date()
+    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
+    save_profit_state()
 
-    # Indicators
-    df["ema"] = df["close"].ewm(span=ema_len).mean()
+# ===== end persistent P&L helpers =====
 
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(rsi_len).mean()
-    loss = (-delta.clip(upper=0)).rolling(rsi_len).mean()
-    rs = gain / loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+def hmac_signature(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - df["close"].shift()).abs()
-    tr3 = (df["low"] - df["close"].shift()).abs()
+def fetch_pair_precisions():
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
+        if r.ok:
+            for item in r.json():
+                if item.get("pair") in PAIRS:
+                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
+    except:
+        pass
 
-    df["atr"] = np.maximum(tr1, np.maximum(tr2, tr3)).rolling(atr_len).mean()
+def get_wallet_balances():
+    payload = json.dumps({"timestamp": int(time.time() * 1000)})
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    balances = {}
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
+        if r.ok:
+            for b in r.json():
+                balances[b['currency']] = float(b['balance'])
+    except:
+        pass
+    return balances
 
-    return df
+def fetch_all_prices():
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+        if r.ok:
+            now = int(time.time())
+            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
+                    for item in r.json() if item.get("market") in PAIRS}
+    except:
+        pass
+    return {}
 
-# ================= SIGNAL =================
+def aggregate_candles(pair, interval=CANDLE_INTERVAL):
+    ticks = tick_logs[pair]
+    if not ticks: return
+    candles, candle, last_window = [], None, None
+    for ts, price in sorted(ticks, key=lambda x: x[0]):
+        wstart = ts - (ts % interval)
+        if last_window != wstart:
+            if candle: candles.append(candle)
+            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
+            last_window = wstart
+        else:
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price
+            candle["volume"] += 1
+    if candle: candles.append(candle)
+    candle_logs[pair] = candles[-100:]  # keep more, 15s candles are small
 
-def signal(df):
+# ========= Indicators =========
+def _atr_14(candles):
+    if len(candles) < 15: return None
+    trs = []
+    prev_close = candles[-15]["close"]
+    for c in candles[-14:]:
+        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
+        trs.append(tr)
+        prev_close = c["close"]
+    return sum(trs) / len(trs) if trs else None
 
-    last = df.iloc[-1]
+# -------- Parabolic SAR (classic) --------
+def _psar_series(candles, step=0.02, max_step=0.2):
+    """
+    Returns list of dicts: [{'sar': float, 'bull': bool}], length == len(candles)
+    Uses classic Wilder PSAR on completed candles.
+    """
+    n = len(candles)
+    if n < 2:
+        return []
 
-    if last["close"] > last["ema"] and last["rsi"] < 65:
-        return "BUY"
+    psar = [None] * n
+    bull = True  # initial trend guess
+    af = step
+    ep = candles[0]["high"]
+    sar = candles[0]["low"]
 
-    if last["close"] < last["ema"] and last["rsi"] > 35:
-        return "SELL"
+    # Decide initial trend from first 2 candles
+    if candles[1]["close"] < candles[0]["close"]:
+        bull = False
+        ep = candles[0]["low"]
+        sar = candles[0]["high"]
 
+    psar[0] = sar
+
+    for i in range(1, n):
+        c_prev = candles[i - 1]
+        c = candles[i]
+
+        sar = sar + af * (ep - sar)
+
+        if bull:
+            # SAR cannot be above last two lows
+            sar = min(sar, c_prev["low"], c["low"])
+        else:
+            # SAR cannot be below last two highs
+            sar = max(sar, c_prev["high"], c["high"])
+
+        reverse = False
+        if bull:
+            if c["low"] < sar:
+                reverse = True
+        else:
+            if c["high"] > sar:
+                reverse = True
+
+        if reverse:
+            bull = not bull
+            sar = ep  # on reversal, SAR = prior EP
+            af = step
+            if bull:
+                ep = c["high"]
+                # adjust SAR to min of last two lows
+                sar = min(sar, c_prev["low"], c["low"])
+            else:
+                ep = c["low"]
+                # adjust SAR to max of last two highs
+                sar = max(sar, c_prev["high"], c["high"])
+        else:
+            if bull:
+                if c["high"] > ep:
+                    ep = c["high"]
+                    af = min(af + step, max_step)
+            else:
+                if c["low"] < ep:
+                    ep = c["low"]
+                    af = min(af + step, max_step)
+
+        psar[i] = sar
+
+    out = []
+    # Determine bull/bear for each candle: price above SAR => bull
+    for i in range(n):
+        c = candles[i]
+        is_bull = c["close"] > psar[i]
+        out.append({"sar": psar[i], "bull": is_bull})
+    return out
+
+# ========= Signal (PSAR-only) =========
+def pa_buy_sell_signal_psar(pair):
+    """
+    PSAR-only entry:
+    - Use COMPLETED 15s candles.
+    - Generate a signal ONLY on a flip (bull <-> bear) between the last two completed candles.
+    """
+    candles = candle_logs[pair]
+    if len(candles) < 6:
+        return None
+
+    completed = candles[:-1] if len(candles) >= 2 else candles
+    if len(completed) < 5:
+        return None
+
+    states = _psar_series(completed)
+    if len(states) < 3:
+        return None
+
+    prev_state = states[-2]
+    last_state = states[-1]
+    last_candle = completed[-1]
+
+    # Flip detected only once per last completed candle
+    if _last_signal_candle_start.get(pair) == last_candle["start"]:
+        return None
+
+    # BUY if flipped to bull; SELL if flipped to bear
+    if (not prev_state["bull"]) and last_state["bull"]:
+        _last_signal_candle_start[pair] = last_candle["start"]
+        return {
+            "side": "BUY",
+            "entry": last_candle["close"],    # use close of flip candle
+            "atr": _atr_14(completed),
+            "msg": "BUY: PSAR flip to bullish"
+        }
+    if prev_state["bull"] and (not last_state["bull"]):
+        _last_signal_candle_start[pair] = last_candle["start"]
+        return {
+            "side": "SELL",
+            "entry": last_candle["close"],
+            "atr": _atr_14(completed),
+            "msg": "SELL: PSAR flip to bearish"
+        }
     return None
 
-# ================= LIVE ORDER =================
+def _signed_post(url, body):
+    payload = json.dumps(body, separators=(',', ':'))
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=headers, data=payload, timeout=12)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return {}
 
-def place_live_order(symbol, side, qty):
+def place_order(pair, side, qty):
+    payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
+               "timestamp": int(time.time() * 1000)}
+    body = json.dumps(payload)
+    sig = hmac_signature(body)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
-    url = "https://api.coindcx.com/exchange/v1/orders/create"
+def get_order_status(order_id=None, client_order_id=None):
+    body = {"timestamp": int(time.time() * 1000)}
+    if order_id: body["id"] = order_id
+    if client_order_id: body["client_order_id"] = client_order_id
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
+    return res if isinstance(res, dict) else {}
 
-    body = {
-        "side": side,
-        "order_type": "market_order",
-        "market": symbol,
-        "total_quantity": qty,
-        "timestamp": int(time.time() * 1000)
-    }
+def _record_fill_from_status(market, side, st, order_id):
+    try:
+        total_q = float(st.get("total_quantity", 0))
+        remain_q = float(st.get("remaining_quantity", 0))
+        filled = max(0.0, total_q - remain_q)
+        avg_px = float(st.get("avg_price", 0))
+    except:
+        filled, avg_px = 0.0, 0.0
 
-    payload = json.dumps(body)
-    signature = hmac.new(
-        API_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature
-    }
-
-    r = requests.post(url, data=payload, headers=headers)
-
-    return r.json()
-
-# ================= TRADING LOOP =================
-
-def trade():
-
-    global paper_balance
-
-    for c in coins:
-
+    if filled > 0 and avg_px > 0:
+        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time()*1000)
         try:
+            ts_ms = int(ts_field)
+            if ts_ms < 10**12: ts_ms *= 1000
+        except:
+            ts_ms = int(time.time() * 1000)
+        apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
 
-            df = get_data(c)
-            sig = signal(df)
-            price = df["close"].iloc[-1]
+def monitor_exits(prices):
+    global error_message
+    to_remove = []
+    for ex in exit_orders:
+        pair, side, qty, tp, sl, entry = ex.values()
+        price = prices.get(pair, {}).get("price")
+        if not price: continue
+        if side == "BUY" and (price >= tp or price <= sl):
+            res = place_order(pair, "SELL", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "SELL", st, order_id)
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+        elif side == "SELL" and (price <= tp or price >= sl):
+            res = place_order(pair, "BUY", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "BUY", st, order_id)
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+    for ex in to_remove: exit_orders.remove(ex)
 
-            if c not in positions and sig:
+def _has_open_exit_for(pair):
+    for ex in exit_orders:
+        if ex.get("pair") == pair:
+            return True
+    return False
 
-                qty = round((paper_balance * risk_pct) / price, 6)
+def scan_loop():
+    global running, error_message, status_epoch
+    scan_log.clear()
+    interval = CANDLE_INTERVAL
 
-                sl = price - df["atr"].iloc[-1]
-                tp = price + df["atr"].iloc[-1] * 2
+    while running:
+        prices = fetch_all_prices()
+        now = int(time.time())
+        monitor_exits(prices)
+        balances = get_wallet_balances()
 
-                positions[c] = {
-                    "side": sig,
-                    "entry": price,
-                    "sl": sl,
-                    "tp": tp,
-                    "qty": qty
-                }
+        for pair in PAIRS:
+            if pair not in prices:
+                continue
 
-                if mode == "LIVE":
-                    place_live_order(c, sig.lower(), qty)
+            price = prices[pair]["price"]
+            tick_logs[pair].append((now, price))
+            if len(tick_logs[pair]) > 2000:
+                tick_logs[pair] = tick_logs[pair][-2000:]
 
-                log(f"{mode} {sig} {c} @ {price:.2f}")
+            # build/refresh 15s candles
+            aggregate_candles(pair, interval)
 
-            # ===== MANAGE POSITION =====
+            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
+            if last_candle:
+                if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
+                    scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
+                else:
+                    # --- PSAR-only entry ---
+                    signal = pa_buy_sell_signal_psar(pair)
+                    if signal:
+                        error_message = ""
+                        entry = signal["entry"]
+                        atr = signal.get("atr", None)
 
-            if c in positions:
+                        usdt_bal = balances.get("USDT", 0.0)
+                        risk_amt = 0.005 * usdt_bal
+                        min_tick_risk = entry * 0.0015
+                        risk_unit = max((0.5 * atr) if atr else 0, min_tick_risk)
 
-                pos = positions[c]
+                        if signal["side"] == "BUY":
+                            sl = round(entry - 2 * risk_unit, 6)
+                            tp = round(entry + 4 * risk_unit, 6)
+                            risk_per_unit = max(entry - sl, 1e-9)
+                            qty_risk = risk_amt / risk_per_unit
+                            qty_cap = (0.3 * usdt_bal) / entry
+                            qty = min(qty_risk, qty_cap)
+                        else:
+                            sl = round(entry + 2 * risk_unit, 6)
+                            tp = round(entry - 6 * risk_unit, 6)
+                            coin = pair[:-4]
+                            qty = balances.get(coin, 0.0)
 
-                if pos["side"] == "BUY":
+                        # Precision & min qty
+                        qty = round(qty, pair_precision.get(pair, 6))
+                        rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
+                        qty = max(qty, rule["min_qty"])
+                        qty = round(qty, rule["precision"])
 
-                    if price <= pos["sl"] or price >= pos["tp"]:
+                        if qty <= 0:
+                            scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
+                        else:
+                            res = place_order(pair, signal["side"], qty)
 
-                        pnl = (price - pos["entry"]) * pos["qty"]
+                            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SL {sl} | TP {tp} | {res}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
+                                "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
+                            })
+                            exit_orders.append({
+                                "pair": pair, "side": signal["side"], "qty": qty,
+                                "tp": tp, "sl": sl, "entry": entry
+                            })
 
-                        if mode == "LIVE":
-                            place_live_order(c, "sell", pos["qty"])
+                            # Confirm from order success -> update P&L
+                            try:
+                                order_id = (res.get("orders") or [{}])[0].get("id")
+                            except:
+                                order_id = None
+                            if order_id:
+                                st = get_order_status(order_id=order_id)
+                                _record_fill_from_status(pair, signal["side"], st, order_id)
 
-                        paper_balance += pnl
-                        log(f"EXIT {c} PnL={pnl:.2f}")
+                            if "error" in res:
+                                error_message = res["error"]
+                    else:
+                        scan_log.append(f"{ist_now()} | {pair} | No Signal (PSAR)")
 
-                        del positions[c]
+        status["msg"], status["last"] = "Running", ist_now()
+        status_epoch = int(time.time())
+        time.sleep(5)
 
-                if pos["side"] == "SELL":
+    status["msg"] = "Idle"
 
-                    if price >= pos["sl"] or price <= pos["tp"]:
-
-                        pnl = (pos["entry"] - price) * pos["qty"]
-
-                        if mode == "LIVE":
-                            place_live_order(c, "buy", pos["qty"])
-
-                        paper_balance += pnl
-                        log(f"EXIT {c} PnL={pnl:.2f}")
-
-                        del positions[c]
-
-        except Exception as e:
-            log(f"DATA ERROR → {str(e)}")
-
-# ================= BACKGROUND LOOP =================
-
-import threading
-
-def loop():
-    log("BOT STARTED")
-    while True:
-        trade()
-        time.sleep(30)
-
-threading.Thread(target=loop, daemon=True).start()
-
-# ================= UI =================
-
-HTML = """
-<h1>🚀 ULTRA AI BOT</h1>
-<h2>Mode: {{mode}}</h2>
-
-<button onclick="fetch('/toggle')">
-Toggle Paper / Live
-</button>
-
-<p>Uptime: {{uptime}}</p>
-
-<h3>Active Positions</h3>
-<pre>{{positions}}</pre>
-
-<h3>Recent Logs</h3>
-<pre>{{logs}}</pre>
-"""
+def compute_realized_pnl_today():
+    return round(profit_state["daily"].get(ist_date(), 0.0), 6)
 
 @app.route("/")
-def home():
-    uptime = str(datetime.now() - start_time)
-    return render_template_string(
-        HTML,
-        mode=mode,
-        uptime=uptime,
-        positions=json.dumps(positions, indent=2),
-        logs="\n".join(logs[:20])
-    )
+def index():
+    return render_template("index.html")
 
-@app.route("/toggle")
-def toggle():
-    global mode
-    mode = "LIVE" if mode == "PAPER" else "PAPER"
-    log(f"MODE → {mode}")
-    return "OK"
+@app.route("/start", methods=["POST"])
+def start():
+    global running
+    if not running:
+        running = True
+        t = threading.Thread(target=scan_loop)
+        t.daemon = True
+        t.start()
+    return jsonify({"status": "started"})
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
 
 @app.route("/status")
-def status():
+def get_status():
+    balances = get_wallet_balances()
+    coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
+    profit_today = compute_realized_pnl_today()
+    profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
+    cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
+
     return jsonify({
-        "mode": mode,
-        "positions": positions,
-        "logs": logs[:20],
-        "uptime": str(datetime.now() - start_time)
+        "status": status["msg"],
+        "last": status["last"],
+        "status_epoch": status_epoch,
+        "usdt": balances.get("USDT", 0.0),
+        "profit_today": profit_today,
+        "profit_yesterday": profit_yesterday,
+        "pnl_cumulative": cumulative_pnl,
+        "coins": coins,
+        "trades": trade_log[-10:][::-1],
+        "scans": scan_log[-30:][::-1],
+        "error": error_message
     })
 
-# ================= RUN =================
+@app.route("/ping")
+def ping(): return "pong"
 
 if __name__ == "__main__":
+    load_profit_state()
+    fetch_pair_precisions()
     app.run(host="0.0.0.0", port=10000)
