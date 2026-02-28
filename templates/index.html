@@ -1,110 +1,124 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ORDI/USDT Futures</title>
+  <title>CoinDCX Futures Pro Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<style>
-body{
-  background:#071222;
-  color:white;
-  font-family:Arial;
-  text-align:center;
-  padding:20px;
-}
+  <style>
+    body {
+      background: #0b0f17;
+      color: #e6edf3;
+      font-family: Arial;
+      padding: 15px;
+    }
 
-.card{
-  background:#0d1f35;
-  margin:20px auto;
-  padding:25px;
-  border-radius:14px;
-  width:90%;
-  max-width:420px;
-  font-size:22px;
-}
+    h2 { color: #4cc9f0; }
 
-.value{
-  margin-top:10px;
-  font-weight:bold;
-  font-size:26px;
-  color:#00f0ff;
-}
+    .card {
+      background: #111826;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 10px;
+    }
 
-button{
-  width:90%;
-  max-width:420px;
-  padding:18px;
-  margin:14px auto;
-  border:none;
-  border-radius:12px;
-  font-size:22px;
-  font-weight:bold;
-  color:white;
-  display:block;
-}
+    .row {
+      display: flex;
+      justify-content: space-between;
+      margin: 5px 0;
+    }
 
-.long{ background:#00c853; }
-.short{ background:#ff1744; }
-.close{ background:#2979ff; }
+    button {
+      padding: 10px;
+      margin: 5px;
+      border-radius: 6px;
+      border: none;
+      font-size: 16px;
+    }
 
-button:active{ opacity:0.8; }
-</style>
+    .buy { background: #16c784; color: black; }
+    .sell { background: #ea3943; color: white; }
+    .stop { background: orange; color: black; }
+
+    .log {
+      background: black;
+      padding: 10px;
+      height: 150px;
+      overflow-y: auto;
+      font-size: 13px;
+    }
+  </style>
 </head>
 
 <body>
 
-<h1>ORDI/USDT Futures</h1>
+<h2>🚀 CoinDCX Futures Bot — ORDIUSDT</h2>
 
 <div class="card">
-  Price
-  <div id="price" class="value">--</div>
+  <h3>🏦 Account</h3>
+  <div class="row"><span>Equity:</span><span id="equity">--</span></div>
+  <div class="row"><span>Available:</span><span id="available">--</span></div>
+  <div class="row"><span>Used Margin:</span><span id="margin">--</span></div>
+  <div class="row"><span>Unrealized P&L:</span><span id="upl">--</span></div>
+  <div class="row"><span>Realized Today:</span><span id="rpl">--</span></div>
 </div>
 
 <div class="card">
-  Wallet (USDT)
-  <div id="wallet" class="value">--</div>
+  <h3>📊 Position</h3>
+  <div class="row"><span>Side:</span><span id="side">--</span></div>
+  <div class="row"><span>Size:</span><span id="size">--</span></div>
+  <div class="row"><span>Entry:</span><span id="entry">--</span></div>
+  <div class="row"><span>Mark Price:</span><span id="mark">--</span></div>
+  <div class="row"><span>P&L:</span><span id="pnl">--</span></div>
+  <div class="row"><span>ROE %:</span><span id="roe">--</span></div>
+  <div class="row"><span>Liq Price:</span><span id="liq">--</span></div>
 </div>
 
 <div class="card">
-  Position
-  <div id="position" class="value">NONE</div>
+  <h3>📋 Orders</h3>
+  <div id="orders">No active orders</div>
 </div>
 
-<button class="long" onclick="send('long')">LONG</button>
-<button class="short" onclick="send('short')">SHORT</button>
-<button class="close" onclick="send('close')">CLOSE</button>
+<div class="card">
+  <h3>⚡ Bot Control</h3>
+  <button class="buy" onclick="start()">START</button>
+  <button class="stop" onclick="stop()">STOP</button>
+</div>
+
+<div class="card">
+  <h3>📜 Logs</h3>
+  <div class="log" id="logs"></div>
+</div>
 
 <script>
-async function update(){
-  try{
-    const r = await fetch("/status");
-    const d = await r.json();
+async function refresh() {
+  const res = await fetch('/status');
+  const d = await res.json();
 
-    document.getElementById("price").innerText =
-      d.price ? Number(d.price).toFixed(4) : "--";
+  document.getElementById("equity").innerText = d.equity;
+  document.getElementById("available").innerText = d.available;
+  document.getElementById("margin").innerText = d.margin;
+  document.getElementById("upl").innerText = d.upl;
+  document.getElementById("rpl").innerText = d.rpl;
 
-    document.getElementById("wallet").innerText =
-      d.wallet ? Number(d.wallet).toFixed(4) : "0";
+  document.getElementById("side").innerText = d.side;
+  document.getElementById("size").innerText = d.size;
+  document.getElementById("entry").innerText = d.entry;
+  document.getElementById("mark").innerText = d.mark;
+  document.getElementById("pnl").innerText = d.pnl;
+  document.getElementById("roe").innerText = d.roe;
+  document.getElementById("liq").innerText = d.liq;
 
-    document.getElementById("position").innerText =
-      d.position || "NONE";
+  document.getElementById("orders").innerText = d.orders;
 
-  }catch(e){
-    console.log("Update error", e);
-  }
+  document.getElementById("logs").innerText =
+    (d.logs || []).join("\n");
 }
 
-async function send(action){
-  try{
-    await fetch("/" + action, { method:"POST" });
-    setTimeout(update, 1000);
-  }catch(e){
-    alert("Order failed");
-  }
-}
+async function start() { await fetch('/start', {method:'POST'}); }
+async function stop() { await fetch('/stop', {method:'POST'}); }
 
-update();
-setInterval(update, 5000);
+setInterval(refresh, 3000);
+refresh();
 </script>
 
 </body>
