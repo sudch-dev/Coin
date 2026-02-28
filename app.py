@@ -9,10 +9,9 @@ from flask import Flask, jsonify, render_template
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET").encode()
+API_SECRET = os.environ.get("API_SECRET", "").encode()
 
 BASE = "https://api.coindcx.com"
-
 SYMBOL = "ORDIUSDT"
 
 # ========= SIGNATURE =========
@@ -22,21 +21,40 @@ def sign(payload):
 
 def signed_post(endpoint, body):
     payload = json.dumps(body, separators=(',', ':'))
+
     headers = {
         "X-AUTH-APIKEY": API_KEY,
         "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
+
     r = requests.post(BASE + endpoint, headers=headers, data=payload, timeout=10)
-    return r.json()
+
+    try:
+        return r.json()
+    except:
+        return {}
+
+# ========= SAFE DATA EXTRACT =========
+
+def extract_list(res):
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict):
+        if "data" in res and isinstance(res["data"], list):
+            return res["data"]
+    return []
 
 # ========= PRICE =========
 
 def get_price():
-    r = requests.get(BASE + "/exchange/ticker", timeout=10)
-    for x in r.json():
-        if x["market"] == SYMBOL:
-            return float(x["last_price"])
+    try:
+        r = requests.get(BASE + "/exchange/ticker", timeout=10)
+        for x in r.json():
+            if x.get("market") == SYMBOL:
+                return float(x.get("last_price", 0))
+    except:
+        pass
     return 0
 
 # ========= FUTURES WALLET =========
@@ -46,12 +64,12 @@ def get_wallet():
     res = signed_post("/exchange/v1/derivatives/futures/balances", body)
 
     usdt = 0
-    for x in res:
+    for x in extract_list(res):
         if x.get("currency") == "USDT":
             usdt = float(x.get("balance", 0))
     return usdt
 
-# ========= OPEN POSITION =========
+# ========= POSITION =========
 
 def get_position():
     body = {"timestamp": int(time.time() * 1000)}
@@ -61,73 +79,69 @@ def get_position():
     size = 0
     entry = 0
 
-    if isinstance(res, list):
-        for p in res:
-            if p.get("symbol") == SYMBOL:
-                size = float(p.get("size", 0))
-                entry = float(p.get("avg_price", 0))
+    for p in extract_list(res):
+        if p.get("symbol") == SYMBOL:
+            size = float(p.get("size", 0))
+            entry = float(p.get("avg_price", 0))
 
-                if size > 0:
-                    side = "LONG"
-                elif size < 0:
-                    side = "SHORT"
+            if size > 0:
+                side = "LONG"
+            elif size < 0:
+                side = "SHORT"
 
     return side, abs(size), entry
 
-# ========= ACTIVE ORDERS =========
+# ========= ORDERS =========
 
 def get_orders():
     body = {"timestamp": int(time.time() * 1000)}
     res = signed_post("/exchange/v1/derivatives/futures/orders", body)
 
     active = []
-    if isinstance(res, list):
-        for o in res:
-            if o.get("symbol") == SYMBOL and o.get("status") == "open":
-                active.append(o.get("side") + " " + str(o.get("price")))
+
+    for o in extract_list(res):
+        if o.get("symbol") == SYMBOL and o.get("status") == "open":
+            active.append(f"{o.get('side')} {o.get('price')}")
+
     return active
 
 # ========= STATUS =========
 
 @app.route("/status")
 def status():
-    try:
-        price = get_price()
-        wallet = get_wallet()
-        side, size, entry = get_position()
-        orders = get_orders()
 
-        pnl = 0
-        roe = 0
-        liq = "--"
+    price = get_price()
+    wallet = get_wallet()
+    side, size, entry = get_position()
+    orders = get_orders()
 
-        if entry > 0:
-            pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
-            roe = (pnl / wallet * 100) if wallet > 0 else 0
+    pnl = 0
+    roe = 0
 
-        return jsonify({
-            "equity": wallet,
-            "available": wallet,
-            "margin": "--",
-            "upl": round(pnl, 4),
-            "rpl": 0,
+    if entry > 0:
+        pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
+        roe = (pnl / wallet * 100) if wallet > 0 else 0
 
-            "side": side,
-            "size": size,
-            "entry": entry,
-            "mark": price,
-            "pnl": round(pnl, 4),
-            "roe": round(roe, 2),
-            "liq": liq,
+    return jsonify({
+        "equity": wallet,
+        "available": wallet,
+        "margin": "--",
+        "upl": round(pnl, 4),
+        "rpl": 0,
 
-            "orders": orders,
-            "logs": ["System OK"]
-        })
+        "side": side,
+        "size": size,
+        "entry": entry,
+        "mark": price,
+        "pnl": round(pnl, 4),
+        "roe": round(roe, 2),
+        "liq": "--",
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        "orders": orders,
+        "logs": ["System OK"]
+    })
 
-# ========= CONTROL =========
+# ========= BOT CONTROL =========
 
 running = False
 
