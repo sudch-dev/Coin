@@ -43,3 +43,8 @@ def automation_loop():
             # execute_trade_logic(signal) # Call your trade function here
         
         time.sleep(60) # Run every minute
+        
+        
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
