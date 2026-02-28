@@ -13,7 +13,7 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET", "")
 
 BASE = "https://api.coindcx.com"
-# FIXED: CoinDCX Futures uses 'B-' prefix and underscore for derivatives
+# MANDATORY: CoinDCX Futures uses 'B-' prefix for Binance-sourced markets
 SYMBOL = "B-ORDI_USDT" 
 
 # ========= AUTHENTICATION =========
@@ -44,7 +44,28 @@ def signed_post(endpoint, body):
         print(f"API Connection Error: {e}")
         return {}
 
-# ========= DATA EXTRACTION =========
+# ========= DEEP SCAN BALANCE =========
+
+def get_futures_balance():
+    """Scans all balance fields for USDT-M or Tether values."""
+    res = signed_post("/exchange/v1/derivatives/futures/balances", {})
+    
+    # CoinDCX can return data as a direct list or inside a 'data' key
+    balances = res if isinstance(res, list) else res.get("data", [])
+    
+    for item in balances:
+        # Check all possible asset/currency labels
+        asset = str(item.get("asset") or item.get("currency") or item.get("instrument_name", "")).upper()
+        
+        # Match USDT, TETHER, or USDT-M
+        if any(name in asset for name in ["USDT", "TETHER"]):
+            # Pull balance from any available numeric field
+            val = float(item.get("balance") or item.get("available_balance") or item.get("quantity", 0))
+            if val > 0: return val
+            
+    return 0.0
+
+# ========= MAIN MONITOR =========
 
 @app.route("/status")
 def status():
@@ -57,35 +78,23 @@ def status():
                 price = float(x.get("last_price", 0))
     except: pass
 
-    # 2. Fetch Futures Wallet Balance (Tether/USDT)
-    wallet = 0.0
-    # Targeted futures balance endpoint
-    res = signed_post("/exchange/v1/derivatives/futures/balances", {})
-    # CoinDCX often wraps response in a 'data' key or returns a list
-    balances = res if isinstance(res, list) else res.get("data", [])
-    
-    for b in balances:
-        # Check for both "asset" and "currency" keys and both USDT/TETHER names
-        asset = str(b.get("asset") or b.get("currency") or "").upper()
-        if asset in ["USDT", "TETHER"]:
-            wallet = float(b.get("balance") or b.get("available_balance", 0))
-            break
+    # 2. Fetch Deep Scanned Wallet Balance
+    wallet = get_futures_balance()
 
-    # 3. Fetch Active Position Data
+    # 3. Fetch Position Data
     side, size, entry, pnl, roe = "NONE", 0, 0, 0, 0
     pos_res = signed_post("/exchange/v1/derivatives/futures/positions", {})
     positions = pos_res if isinstance(pos_res, list) else pos_res.get("data", [])
     
     for p in positions:
-        if p.get("symbol") == SYMBOL:
-            qty = float(p.get("quantity", 0))
+        if p.get("symbol") == SYMBOL or p.get("market") == SYMBOL:
+            qty = float(p.get("quantity") or p.get("size", 0))
             if qty != 0:
                 size = abs(qty)
-                entry = float(p.get("entry_price", 0))
+                entry = float(p.get("entry_price") or p.get("avg_price", 0))
                 side = "LONG" if qty > 0 else "SHORT"
-                # PnL Calculation based on current mark price
+                # PnL Calculation
                 pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
-                # Estimating ROE (Assuming 10x leverage for calculation)
                 roe = (pnl / (entry * size / 10)) * 100 if entry > 0 else 0
 
     return jsonify({
@@ -103,6 +112,5 @@ def index():
     return render_template("index.html")
 
 if __name__ == "__main__":
-    # Ensure Render's dynamic port is used
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
