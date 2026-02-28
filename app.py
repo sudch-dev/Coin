@@ -4,198 +4,157 @@ import json
 import hmac
 import hashlib
 import requests
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
-
-BASE_URL = "https://api.coindcx.com"
 
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
-SYMBOL = "ORDIUSDT"
+BASE_URL = "https://api.coindcx.com"
+SYMBOL = "ORDIUSDT"   # ORDI/USDT futures
 LEVERAGE = 3
-RISK_PER_TRADE = 0.01
-DAILY_LOSS_LIMIT = 0.05
-MIN_NOTIONAL = 5
 
-daily_start_equity = None
+# ---------- SIGNED REQUEST ----------
 
-# ================= SIGNED REQUEST =================
-
-def post(endpoint, body):
-    payload = json.dumps(body)
-
-    signature = hmac.new(
+def sign(payload):
+    return hmac.new(
         API_SECRET.encode(),
         payload.encode(),
         hashlib.sha256
     ).hexdigest()
 
+def post(endpoint, body):
+    payload = json.dumps(body, separators=(',', ':'))
     headers = {
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
+    r = requests.post(BASE_URL + endpoint, data=payload, headers=headers, timeout=10)
+    if r.status_code == 200:
+        return r.json()
+    return {"error": r.text}
 
-    r = requests.post(BASE_URL + endpoint,
-                      data=payload,
-                      headers=headers,
-                      timeout=10)
-
-    if r.status_code != 200:
-        return {"error": "API request failed"}
-
-    return r.json()
-
-# ================= ACCOUNT =================
-
-def get_equity():
-    body = {"timestamp": int(time.time() * 1000)}
-    data = post("/exchange/v1/derivatives/account", body)
-
-    if "data" not in data:
-        return 0, 0
-
-    wallet = float(data["data"]["wallet_balance"])
-    available = float(data["data"]["available_balance"])
-
-    return wallet, available
-
-# ================= PRICE =================
+# ---------- MARKET PRICE ----------
 
 def get_price():
-    r = requests.get(
-        f"{BASE_URL}/exchange/ticker?market={SYMBOL}",
-        timeout=10
-    )
-    return float(r.json()["last_price"])
+    r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
+    for x in r.json():
+        if x["market"] == SYMBOL:
+            return float(x["last_price"])
+    return 0
 
-# ================= POSITION =================
+# ---------- FUTURES WALLET ----------
+
+def get_wallet():
+    body = {"timestamp": int(time.time()*1000)}
+    res = post("/exchange/v1/derivatives/futures/balance", body)
+    return float(res.get("available_balance", 0))
+
+# ---------- POSITION ----------
 
 def get_position():
-    body = {"timestamp": int(time.time() * 1000)}
-    data = post("/exchange/v1/derivatives/positions", body)
-
-    if "data" not in data:
-        return {}
-
-    for p in data["data"]:
+    body = {"timestamp": int(time.time()*1000)}
+    res = post("/exchange/v1/derivatives/futures/positions", body)
+    for p in res.get("data", []):
         if p["market"] == SYMBOL:
             return p
-
-    return {}
-
-# ================= RISK ENGINE =================
-
-def risk_checks():
-    global daily_start_equity
-
-    wallet, available = get_equity()
-
-    if daily_start_equity is None:
-        daily_start_equity = wallet
-
-    # Too small balance
-    if available < 10:
-        return "Balance too low"
-
-    # Daily loss cutoff
-    if wallet < daily_start_equity * (1 - DAILY_LOSS_LIMIT):
-        return "Daily loss limit reached"
-
-    # Existing position
-    if get_position():
-        return "Position already open"
-
     return None
 
-# ================= POSITION SIZE =================
+# ---------- SET LEVERAGE ----------
 
-def calculate_qty(price):
-    wallet, available = get_equity()
+def set_leverage():
+    body = {
+        "timestamp": int(time.time()*1000),
+        "market": SYMBOL,
+        "leverage": LEVERAGE
+    }
+    return post("/exchange/v1/derivatives/change_leverage", body)
 
-    risk_amount = available * RISK_PER_TRADE
-    position_value = risk_amount * LEVERAGE
+# ---------- ORDER SIZE ----------
 
-    if position_value < MIN_NOTIONAL:
+def calc_qty(price):
+    balance = get_wallet()
+    risk = balance * 0.20
+    position_value = risk * LEVERAGE
+
+    if position_value < 5:
         return 0
 
     qty = position_value / price
     return round(qty, 2)
 
-# ================= LEVERAGE =================
-
-def set_leverage():
-    body = {
-        "timestamp": int(time.time() * 1000),
-        "market": SYMBOL,
-        "leverage": LEVERAGE
-    }
-    post("/exchange/v1/derivatives/change_leverage", body)
-
-# ================= ORDER =================
+# ---------- PLACE ORDER ----------
 
 def place_order(side):
-
-    error = risk_checks()
-    if error:
-        return {"error": error}
-
     price = get_price()
-    qty = calculate_qty(price)
+    qty = calc_qty(price)
 
     if qty <= 0:
-        return {"error": "Order size too small"}
+        return {"error": "Balance too small"}
 
-    set_leverage()
+    if get_position():
+        return {"error": "Position already open"}
 
     body = {
-        "timestamp": int(time.time() * 1000),
+        "timestamp": int(time.time()*1000),
         "market": SYMBOL,
         "side": side,
         "order_type": "market_order",
-        "quantity": str(qty),
-        "leverage": LEVERAGE
+        "total_quantity": str(qty)
     }
 
-    return post("/exchange/v1/derivatives/create_order", body)
+    return post("/exchange/v1/derivatives/futures/orders/create", body)
 
-# ================= DASHBOARD API =================
+# ---------- CLOSE POSITION ----------
 
-@app.route("/status")
-def status():
+def close_position():
+    pos = get_position()
+    if not pos:
+        return {"error": "No position"}
 
-    wallet, available = get_equity()
-    price = get_price()
-    position = get_position()
+    side = "sell" if pos["side"] == "buy" else "buy"
 
-    pnl = 0
-    if position:
-        pnl = float(position.get("unrealized_pnl", 0))
+    body = {
+        "timestamp": int(time.time()*1000),
+        "market": SYMBOL,
+        "side": side,
+        "order_type": "market_order",
+        "total_quantity": str(abs(float(pos["size"])))
+    }
 
-    return jsonify({
-        "symbol": SYMBOL,
-        "price": price,
-        "wallet_balance": wallet,
-        "available_balance": available,
-        "position": position,
-        "pnl": pnl
-    })
+    return post("/exchange/v1/derivatives/futures/orders/create", body)
 
-@app.route("/buy")
-def buy():
-    return jsonify(place_order("buy"))
-
-@app.route("/sell")
-def sell():
-    return jsonify(place_order("sell"))
+# ---------- ROUTES ----------
 
 @app.route("/")
 def home():
-    return send_from_directory(".", "index.html")
+    return render_template("index.html")
 
-# ================= RUN =================
+@app.route("/status")
+def status():
+    return jsonify({
+        "price": get_price(),
+        "wallet": get_wallet(),
+        "position": get_position()
+    })
+
+@app.route("/long", methods=["POST"])
+def long_trade():
+    return jsonify(place_order("buy"))
+
+@app.route("/short", methods=["POST"])
+def short_trade():
+    return jsonify(place_order("sell"))
+
+@app.route("/close", methods=["POST"])
+def close_trade():
+    return jsonify(close_position())
+
+# ---------- MAIN ----------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    set_leverage()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
