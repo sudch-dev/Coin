@@ -1,58 +1,52 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ORDI Futures — Pro</title>
-
-<style>
-body{
- background:#0b0f19;
- color:white;
- font-family:Arial;
- text-align:center;
-}
-.card{
- background:#121826;
- margin:20px;
- padding:20px;
- border-radius:12px;
-}
-.price{font-size:36px;color:#00e5ff}
-.balance{font-size:24px;color:#00ff9c}
-
-button{
- width:90%;
- padding:16px;
- margin:10px;
- font-size:18px;
- border:none;
- border-radius:10px;
- color:white;
-}
-
-.long{background:#00c853}
-.short{background:#ff1744}
-.close{background:#2979ff}
-</style>
+    <title>ORDI/USDT Futures</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        body {
+            background: #0b1220;
+            color: white;
+            font-family: Arial;
+            text-align: center;
+            padding: 20px;
+        }
+        .card {
+            background: #14213d;
+            margin: 20px 0;
+            padding: 20px;
+            border-radius: 10px;
+        }
+        button {
+            width: 90%;
+            padding: 15px;
+            margin: 10px;
+            font-size: 18px;
+            border: none;
+            border-radius: 10px;
+        }
+        .long { background: green; color: white; }
+        .short { background: red; color: white; }
+        .close { background: royalblue; color: white; }
+    </style>
 </head>
-
 <body>
 
-<h2>ORDI/USDT Futures</h2>
+<h1>ORDI/USDT Futures</h1>
 
 <div class="card">
-<div>Price</div>
-<div id="price" class="price">--</div>
+    <h3>Price</h3>
+    <div id="price">--</div>
 </div>
 
 <div class="card">
-<div>Wallet (USDT)</div>
-<div id="wallet" class="balance">--</div>
+    <h3>Wallet (USDT)</h3>
+    <div id="wallet">--</div>
 </div>
 
 <div class="card">
-<div>Position</div>
-<div id="position">None</div>
+    <h3>Position</h3>
+    <div id="position">NONE</div>
 </div>
 
 <button class="long" onclick="trade('long')">LONG</button>
@@ -60,28 +54,25 @@ button{
 <button class="close" onclick="trade('close')">CLOSE</button>
 
 <script>
-async function refresh(){
- const r = await fetch("/status");
- const d = await r.json();
-
- document.getElementById("price").innerText = d.price.toFixed(4);
- document.getElementById("wallet").innerText = d.wallet.toFixed(2);
-
- if(d.position){
-   document.getElementById("position").innerText =
-     d.position.side + " | Size: " + d.position.size;
- }else{
-   document.getElementById("position").innerText = "None";
- }
+async function update() {
+    try {
+        const res = await fetch("/status");
+        const data = await res.json();
+        document.getElementById("price").innerText = data.price;
+        document.getElementById("wallet").innerText = data.wallet;
+        document.getElementById("position").innerText = data.position;
+    } catch (e) {
+        console.log("Status error");
+    }
 }
 
-async function trade(type){
- await fetch("/" + type, {method:"POST"});
- setTimeout(refresh,1500);
+async function trade(type) {
+    await fetch("/" + type, { method: "POST" });
+    setTimeout(update, 1000);
 }
 
-setInterval(refresh,2000);
-refresh();
+setInterval(update, 3000);
+update();
 </script>
 
 </body>
