@@ -1,8 +1,11 @@
+import os
 import time
 import hmac
 import hashlib
+import json
 import requests
 import pandas as pd
+import threading
 from flask import Flask, jsonify, request, render_template
 
 # ================= CONFIG =================
@@ -15,22 +18,22 @@ BASE_URL = "https://api.coindcx.com"
 SYMBOL = "ORDIUSDT"
 LEVERAGE = 5
 
-RISK_PER_TRADE = 0.01        # 1% equity risk
-MAX_DAILY_LOSS = 0.03        # 3% kill switch
-TP_MULTIPLIER = 2.0          # RR 1:2
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.03
+TP_MULTIPLIER = 2.0
 
-CHECK_INTERVAL = 15          # seconds
+CHECK_INTERVAL = 15
 
 # ==========================================
 
 app = Flask(__name__)
 
+bot_running = False
 position = None
 entry_price = 0
-equity = 1000          # replace with real wallet fetch if desired
-day_pnl = 0
+equity = 1000.0
+day_pnl = 0.0
 trades = []
-running = True
 
 # ================= AUTH ====================
 
@@ -54,8 +57,7 @@ def private_post(endpoint, body):
 
 def get_price():
     r = requests.get(f"{BASE_URL}/exchange/ticker")
-    data = r.json()
-    for s in data:
+    for s in r.json():
         if s["market"] == SYMBOL:
             return float(s["last_price"])
     return None
@@ -66,11 +68,13 @@ def get_candles():
     df = pd.DataFrame(r.json(),
         columns=["time","open","high","low","close","volume"])
     df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     return df
 
 # ================= INDICATORS ==============
 
-def psar_signal(df):
+def trend_signal(df):
     return df["close"].iloc[-1] > df["close"].rolling(5).mean().iloc[-1]
 
 def atr(df):
@@ -81,10 +85,10 @@ def atr(df):
 
 def position_size(price, stop_dist):
     risk_amount = equity * RISK_PER_TRADE
-    qty = risk_amount / stop_dist
+    qty = risk_amount / stop_dist if stop_dist > 0 else 0
     return round(qty, 3)
 
-def check_kill():
+def kill_switch():
     return day_pnl <= -equity * MAX_DAILY_LOSS
 
 # ================= TRADING =================
@@ -107,43 +111,46 @@ def flatten():
         place_order("buy", 999999)
     position = None
 
-# ================= STRATEGY LOOP ===========
+# ================= BOT LOOP =================
 
 def run_bot():
-    global position, entry_price, day_pnl, equity
+    global position, entry_price, equity, day_pnl, bot_running
 
-    while running:
+    while bot_running:
         try:
 
-            if check_kill():
-                print("DAILY LOSS LIMIT HIT")
+            if kill_switch():
                 flatten()
+                bot_running = False
+                print("DAILY LOSS LIMIT HIT")
                 break
 
             price = get_price()
             df = get_candles()
 
-            signal_long = psar_signal(df)
+            if price is None or df.empty:
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            signal_long = trend_signal(df)
             vol = atr(df)
+            qty = position_size(price, vol)
 
-            stop_dist = vol
-            qty = position_size(price, stop_dist)
-
-            # ----- ENTRY -----
-            if position is None:
+            # ---- ENTRY ----
+            if position is None and qty > 0:
 
                 if signal_long:
                     place_order("buy", qty)
                     position = "LONG"
-                    entry_price = price
-
                 else:
                     place_order("sell", qty)
                     position = "SHORT"
-                    entry_price = price
 
-            # ----- EXIT -----
-            else:
+                entry_price = price
+
+            # ---- EXIT ----
+            elif position is not None:
+
                 pnl = (price - entry_price) * qty
                 if position == "SHORT":
                     pnl = -pnl
@@ -156,7 +163,8 @@ def run_bot():
                     trades.append({
                         "side": position,
                         "pnl": round(pnl,2),
-                        "price": price
+                        "price": price,
+                        "time": time.strftime("%H:%M:%S")
                     })
 
         except Exception as e:
@@ -164,30 +172,44 @@ def run_bot():
 
         time.sleep(CHECK_INTERVAL)
 
-# ================= UI ROUTES ===============
+# ================= ROUTES ==================
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
-@app.route("/status")
-def status():
-    return jsonify({
-        "position": position,
-        "entry": entry_price,
-        "equity": equity,
-        "day_pnl": day_pnl,
-        "trades": trades[-10:]
-    })
+@app.route("/start", methods=["POST"])
+def start_bot():
+    global bot_running
+    if not bot_running:
+        bot_running = True
+        threading.Thread(target=run_bot).start()
+    return jsonify({"status": "BOT STARTED"})
+
+@app.route("/stop", methods=["POST"])
+def stop_bot():
+    global bot_running
+    bot_running = False
+    return jsonify({"status": "BOT STOPPED"})
 
 @app.route("/flatten", methods=["POST"])
 def manual_flatten():
     flatten()
-    return jsonify({"status": "flattened"})
+    return jsonify({"status": "POSITION CLOSED"})
 
-# ===========================================
+@app.route("/status")
+def status():
+    return jsonify({
+        "running": bot_running,
+        "position": position,
+        "entry_price": entry_price,
+        "equity": round(equity,2),
+        "day_pnl": round(day_pnl,2),
+        "trades": trades[-10:]
+    })
+
+# ================= MAIN ====================
 
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=run_bot).start()
-    app.run(port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
