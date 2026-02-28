@@ -1,81 +1,48 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CoinDCX Futures Bot</title>
+    <title>CoinDCX Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { background-color: #0b0e11; color: #eaecef; }
-        .card { background-color: #1e2329; border-radius: 8px; padding: 1.5rem; }
-        .accent { color: #f0b90b; } /* CoinDCX/Exchange Yellow */
-    </style>
+    <style>body { background: #0b0e11; color: white; font-family: sans-serif; }</style>
 </head>
-<body class="p-8">
-    <div class="max-w-4xl mx-auto">
-        <h1 class="text-3xl font-bold mb-8 border-b border-gray-700 pb-4">
-            <span class="accent">CoinDCX</span> Futures Bot
-        </h1>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="card">
-                <p class="text-gray-400 text-sm">Wallet Balance</p>
-                <p id="equity" class="text-2xl font-mono">-- USDT</p>
+<body class="p-10">
+    <div class="max-w-2xl mx-auto bg-gray-900 p-8 rounded-xl shadow-2xl border border-gray-800">
+        <h1 class="text-2xl font-bold mb-6 text-yellow-500">CoinDCX Live Monitor</h1>
+        
+        <div class="grid grid-cols-2 gap-4 mb-8">
+            <div class="p-4 bg-black rounded">
+                <p class="text-gray-400 text-xs uppercase">Wallet (USDT)</p>
+                <p id="equity" class="text-xl font-mono">Loading...</p>
             </div>
-            <div class="card">
-                <p class="text-gray-400 text-sm">Mark Price</p>
-                <p id="mark" class="text-2xl font-mono accent">--</p>
-            </div>
-            <div class="card">
-                <p class="text-gray-400 text-sm">Unrealised PnL</p>
-                <p id="pnl" class="text-2xl font-mono">--</p>
+            <div class="p-4 bg-black rounded">
+                <p class="text-gray-400 text-xs uppercase">ORDI Price</p>
+                <p id="mark" class="text-xl font-mono text-yellow-400">Loading...</p>
             </div>
         </div>
 
-        <div class="card mb-8">
-            <h2 class="text-xl font-bold mb-4">Position Details</h2>
-            <div class="flex justify-between border-b border-gray-700 py-2">
-                <span>Side</span> <span id="side">--</span>
-            </div>
-            <div class="flex justify-between border-b border-gray-700 py-2">
-                <span>Size</span> <span id="size">--</span>
+        <div class="space-y-2 text-sm">
+            <div class="flex justify-between border-b border-gray-800 py-2">
+                <span>Position Side:</span> <span id="side">--</span>
             </div>
             <div class="flex justify-between py-2">
-                <span>Entry Price</span> <span id="entry">--</span>
+                <span>Unrealized PnL:</span> <span id="pnl" class="font-bold">--</span>
             </div>
-        </div>
-
-        <div class="flex gap-4">
-            <button onclick="controlBot('start')" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded font-bold transition">START BOT</button>
-            <button onclick="controlBot('stop')" class="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded font-bold transition">STOP BOT</button>
         </div>
     </div>
 
     <script>
-        async function updateStatus() {
+        async function refresh() {
             try {
                 const res = await fetch('/status');
-                const data = await res.json();
-                
-                document.getElementById('equity').innerText = data.equity + " USDT";
-                document.getElementById('mark').innerText = data.mark;
-                document.getElementById('side').innerText = data.side;
-                document.getElementById('size').innerText = data.size;
-                document.getElementById('entry').innerText = data.entry;
-                
-                const pnlEl = document.getElementById('pnl');
-                pnlEl.innerText = data.pnl + " USDT (" + data.roe + "%)";
-                pnlEl.className = data.pnl >= 0 ? "text-2xl font-mono text-green-500" : "text-2xl font-mono text-red-500";
-            } catch (e) { console.error("Update failed", e); }
+                const d = await res.json();
+                document.getElementById('equity').innerText = d.equity;
+                document.getElementById('mark').innerText = d.mark;
+                document.getElementById('side').innerText = d.side;
+                document.getElementById('pnl').innerText = d.pnl + " USDT";
+            } catch (e) { console.error("Update error"); }
         }
-
-        async function controlBot(action) {
-            await fetch('/' + action, { method: 'POST' });
-            alert("Bot " + action + "ed");
-        }
-
-        setInterval(updateStatus, 3000);
-        updateStatus();
+        setInterval(refresh, 5000);
+        refresh();
     </script>
 </body>
 </html>
