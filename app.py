@@ -1,293 +1,193 @@
-import os, time, threading, hmac, hashlib, requests, json
-from flask import Flask, render_template, jsonify
-from datetime import datetime
-from pytz import timezone
-from collections import deque
+import time
+import hmac
+import hashlib
+import requests
+import pandas as pd
+from flask import Flask, jsonify, request, render_template
+
+# ================= CONFIG =================
+
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+
+BASE_URL = "https://api.coindcx.com"
+
+SYMBOL = "ORDIUSDT"
+LEVERAGE = 5
+
+RISK_PER_TRADE = 0.01        # 1% equity risk
+MAX_DAILY_LOSS = 0.03        # 3% kill switch
+TP_MULTIPLIER = 2.0          # RR 1:2
+
+CHECK_INTERVAL = 15          # seconds
+
+# ==========================================
 
 app = Flask(__name__)
 
-API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET").encode()
-BASE_URL = "https://api.coindcx.com"
+position = None
+entry_price = 0
+equity = 1000          # replace with real wallet fetch if desired
+day_pnl = 0
+trades = []
+running = True
 
-PAIR = "ORDIUSDT"
-LEVERAGE = 5
-RISK_PER_TRADE = 0.005
-MAX_DAILY_LOSS = -0.03
+# ================= AUTH ====================
 
-IST = timezone("Asia/Kolkata")
-def ist_now(): return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+def sign(payload):
+    return hmac.new(
+        API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
-running = False
-status = {"msg": "Idle", "last": ""}
-scan_log, trade_log = [], []
-tick_logs, candle_logs = [], []
-
-# ================= AUTH =================
-
-def hmac_signature(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-
-# ================= DATA =================
-
-def fetch_price():
-    try:
-        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
-        if r.ok:
-            for x in r.json():
-                if x["market"] == PAIR:
-                    return float(x["last_price"])
-    except:
-        pass
-    return None
-
-# ================= FUTURES POSITION =================
-
-def get_position():
-    payload = json.dumps({"timestamp": int(time.time()*1000)})
-    sig = hmac_signature(payload)
-
+def private_post(endpoint, body):
+    payload = json.dumps(body)
     headers = {
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sig,
+        "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
+    return requests.post(BASE_URL + endpoint, data=payload, headers=headers).json()
 
-    try:
-        r = requests.post(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/positions",
-            headers=headers, data=payload, timeout=10
-        )
-        if r.ok:
-            for p in r.json():
-                if p.get("symbol") == PAIR:
-                    return p
-    except:
-        pass
+# ================= DATA ====================
 
+def get_price():
+    r = requests.get(f"{BASE_URL}/exchange/ticker")
+    data = r.json()
+    for s in data:
+        if s["market"] == SYMBOL:
+            return float(s["last_price"])
     return None
 
-# ================= WALLET =================
+def get_candles():
+    url = f"{BASE_URL}/market_data/candles?pair={SYMBOL}&interval=1m"
+    r = requests.get(url)
+    df = pd.DataFrame(r.json(),
+        columns=["time","open","high","low","close","volume"])
+    df["close"] = df["close"].astype(float)
+    return df
 
-def get_balance():
-    payload = json.dumps({"timestamp": int(time.time()*1000)})
-    sig = hmac_signature(payload)
+# ================= INDICATORS ==============
 
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sig,
-        "Content-Type": "application/json"
-    }
+def psar_signal(df):
+    return df["close"].iloc[-1] > df["close"].rolling(5).mean().iloc[-1]
 
-    try:
-        r = requests.post(
-            f"{BASE_URL}/exchange/v1/users/balances",
-            headers=headers, data=payload, timeout=10
-        )
-        if r.ok:
-            for b in r.json():
-                if b["currency"] == "USDT":
-                    return float(b["balance"])
-    except:
-        pass
+def atr(df):
+    tr = df["high"] - df["low"]
+    return tr.rolling(14).mean().iloc[-1]
 
-    return 0.0
+# ================= RISK ====================
 
-def get_equity():
-    eq = get_balance()
-    pos = get_position()
-    if pos:
-        eq += float(pos.get("unrealized_pnl", 0))
-    return eq
+def position_size(price, stop_dist):
+    risk_amount = equity * RISK_PER_TRADE
+    qty = risk_amount / stop_dist
+    return round(qty, 3)
 
-# ================= ORDER =================
+def check_kill():
+    return day_pnl <= -equity * MAX_DAILY_LOSS
+
+# ================= TRADING =================
 
 def place_order(side, qty):
-    payload = {
-        "symbol": PAIR,
+    body = {
         "side": side,
-        "type": "MARKET",
-        "quantity": str(qty),
-        "leverage": LEVERAGE,
+        "order_type": "market_order",
+        "market": SYMBOL,
+        "quantity": qty,
         "timestamp": int(time.time()*1000)
     }
+    return private_post("/exchange/v1/orders/create", body)
 
-    body = json.dumps(payload)
-    sig = hmac_signature(body)
+def flatten():
+    global position
+    if position == "LONG":
+        place_order("sell", 999999)
+    elif position == "SHORT":
+        place_order("buy", 999999)
+    position = None
 
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sig,
-        "Content-Type": "application/json"
-    }
+# ================= STRATEGY LOOP ===========
 
-    try:
-        r = requests.post(
-            f"{BASE_URL}/exchange/v1/derivatives/futures/orders/create",
-            headers=headers, data=body, timeout=10
-        )
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
-
-# ================= INDICATOR =================
-
-def aggregate_candles(price):
-    now = int(time.time())
-    tick_logs.append((now, price))
-    if len(tick_logs) > 500:
-        tick_logs[:] = tick_logs[-500:]
-
-    interval = 15
-    candles, c, w = [], None, None
-
-    for ts, p in sorted(tick_logs):
-        s = ts - ts % interval
-        if w != s:
-            if c: candles.append(c)
-            c = {"open": p, "high": p, "low": p, "close": p, "start": s}
-            w = s
-        else:
-            c["high"] = max(c["high"], p)
-            c["low"] = min(c["low"], p)
-            c["close"] = p
-
-    if c: candles.append(c)
-    candle_logs[:] = candles[-100:]
-
-def psar_flip():
-    if len(candle_logs) < 6:
-        return None
-
-    closes = [c["close"] for c in candle_logs[-5:]]
-    if closes[-1] > max(closes[:-1]):
-        return "BUY"
-    if closes[-1] < min(closes[:-1]):
-        return "SELL"
-    return None
-
-def atr():
-    if len(candle_logs) < 15:
-        return None
-    return sum(c["high"] - c["low"] for c in candle_logs[-14:]) / 14
-
-# ================= POSITION SIZE =================
-
-def compute_qty(entry, sl, equity):
-    risk = equity * RISK_PER_TRADE
-    rpu = abs(entry - sl)
-    if rpu <= 0: return 0
-    qty = risk / rpu
-    max_pos = (equity * LEVERAGE) / entry
-    return min(qty, max_pos)
-
-# ================= MANAGEMENT =================
-
-def manage_position(pos, price, atrv):
-    side = pos["side"]
-    entry = float(pos["entry_price"])
-    qty = float(pos["size"])
-
-    if side == "LONG":
-        sl = entry - 2.5 * atrv
-        tp = entry + 4 * atrv
-        if price <= sl or price >= tp:
-            place_order("SELL", qty)
-
-    if side == "SHORT":
-        sl = entry + 2.5 * atrv
-        tp = entry - 5 * atrv
-        if price >= sl or price <= tp:
-            place_order("BUY", qty)
-
-# ================= MAIN LOOP =================
-
-def scan_loop():
-    global running
+def run_bot():
+    global position, entry_price, day_pnl, equity
 
     while running:
-        price = fetch_price()
-        if not price:
-            time.sleep(2)
-            continue
+        try:
 
-        aggregate_candles(price)
-        atrv = atr()
+            if check_kill():
+                print("DAILY LOSS LIMIT HIT")
+                flatten()
+                break
 
-        pos = get_position()
+            price = get_price()
+            df = get_candles()
 
-        # Manage open position
-        if pos and float(pos.get("size", 0)) > 0:
-            if atrv:
-                manage_position(pos, price, atrv)
-            time.sleep(2)
-            continue
+            signal_long = psar_signal(df)
+            vol = atr(df)
 
-        # Entry
-        signal = psar_flip()
-        if signal and atrv:
-            entry = price
-            sl = entry - 2.5*atrv if signal=="BUY" else entry + 2.5*atrv
+            stop_dist = vol
+            qty = position_size(price, stop_dist)
 
-            equity = get_equity()
-            qty = compute_qty(entry, sl, equity)
+            # ----- ENTRY -----
+            if position is None:
 
-            if qty > 0:
-                side = "BUY" if signal=="BUY" else "SELL"
-                res = place_order(side, qty)
+                if signal_long:
+                    place_order("buy", qty)
+                    position = "LONG"
+                    entry_price = price
 
-                trade_log.append({
-                    "time": ist_now(),
-                    "side": side,
-                    "entry": entry,
-                    "qty": qty,
-                    "result": res
-                })
+                else:
+                    place_order("sell", qty)
+                    position = "SHORT"
+                    entry_price = price
 
-        status["msg"], status["last"] = "Running", ist_now()
-        time.sleep(3)
+            # ----- EXIT -----
+            else:
+                pnl = (price - entry_price) * qty
+                if position == "SHORT":
+                    pnl = -pnl
 
-# ================= ROUTES =================
+                if pnl > vol * TP_MULTIPLIER or pnl < -vol:
+                    flatten()
+                    day_pnl += pnl
+                    equity += pnl
+
+                    trades.append({
+                        "side": position,
+                        "pnl": round(pnl,2),
+                        "price": price
+                    })
+
+        except Exception as e:
+            print("ERROR:", e)
+
+        time.sleep(CHECK_INTERVAL)
+
+# ================= UI ROUTES ===============
 
 @app.route("/")
-def index():
+def home():
     return render_template("index.html")
 
-@app.route("/start", methods=["POST"])
-def start():
-    global running
-    if not running:
-        running = True
-        t = threading.Thread(target=scan_loop)
-        t.daemon = True
-        t.start()
-    return jsonify({"status":"started"})
-
-@app.route("/stop", methods=["POST"])
-def stop():
-    global running
-    running = False
-    return jsonify({"status":"stopped"})
-
 @app.route("/status")
-def status_api():
-    pos = get_position()
-    eq = get_equity()
-    bal = get_balance()
-
+def status():
     return jsonify({
-        "status": status["msg"],
-        "last": status["last"],
-        "equity": eq,
-        "balance": bal,
-        "position": pos,
-        "leverage": LEVERAGE,
-        "trades": trade_log[-10:][::-1],
-        "scans": scan_log[-20:][::-1]
+        "position": position,
+        "entry": entry_price,
+        "equity": equity,
+        "day_pnl": day_pnl,
+        "trades": trades[-10:]
     })
 
-@app.route("/ping")
-def ping(): return "pong"
+@app.route("/flatten", methods=["POST"])
+def manual_flatten():
+    flatten()
+    return jsonify({"status": "flattened"})
+
+# ===========================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    import threading
+    threading.Thread(target=run_bot).start()
+    app.run(port=5000)
