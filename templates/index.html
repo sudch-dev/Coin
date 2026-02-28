@@ -1,102 +1,103 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>CoinDCX Spot Trader</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTCINR Pro Bot</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background: #0b0e11; color: white; font-family: 'Inter', sans-serif; }
-        .card { background: #1e2329; border: 1px solid #2b3139; }
+        body { background-color: #0f172a; color: #f8fafc; }
+        .card { background-color: #1e293b; border: 1px solid #334155; }
+        .log-entry { font-family: 'Courier New', monospace; font-size: 0.85rem; }
     </style>
 </head>
-<body class="p-6 md:p-12">
-    <div class="max-w-xl mx-auto">
-        <div class="flex justify-between items-center mb-8">
-            <h1 class="text-2xl font-bold text-yellow-500">CoinDCX Spot Bot</h1>
-            <span id="connection" class="text-xs bg-green-900 text-green-300 px-2 py-1 rounded">LIVE</span>
-        </div>
+<body class="p-6">
+    <div class="max-w-4xl mx-auto">
+        <header class="flex justify-between items-center mb-8">
+            <h1 class="text-2xl font-bold text-blue-400 underline decoration-2">BTCINR Algo-Trader</h1>
+            <div id="status-badge" class="px-3 py-1 rounded-full bg-green-900 text-green-300 text-sm">System Live</div>
+        </header>
 
-        <!-- Price & Balance Grid -->
-        <div class="grid grid-cols-2 gap-4 mb-6">
-            <div class="card p-4 rounded-lg">
-                <p class="text-gray-400 text-xs uppercase mb-1">Available USDT</p>
-                <p id="equity" class="text-2xl font-mono text-white">0.00</p>
+        <!-- Portfolio Overview -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <div class="card p-4 rounded-xl shadow-lg">
+                <p class="text-gray-400 text-sm">INR Balance</p>
+                <h2 id="inr-bal" class="text-2xl font-mono">₹0.00</h2>
             </div>
-            <div class="card p-4 rounded-lg border-yellow-500/30">
-                <p class="text-gray-400 text-xs uppercase mb-1">ORDI Price</p>
-                <p id="mark" class="text-2xl font-mono text-yellow-400">0.00</p>
+            <div class="card p-4 rounded-xl shadow-lg">
+                <p class="text-gray-400 text-sm">BTC Balance</p>
+                <h2 id="btc-bal" class="text-2xl font-mono">0.00000000</h2>
+            </div>
+            <div class="card p-4 rounded-xl shadow-lg">
+                <p class="text-gray-400 text-sm">Live Price</p>
+                <h2 id="live-price" class="text-2xl font-mono text-yellow-400">₹0.00</h2>
             </div>
         </div>
 
         <!-- Trade Controls -->
-        <div class="card p-6 rounded-xl mb-6">
-            <label class="block text-xs text-gray-400 mb-2 uppercase">Order Quantity (ORDI)</label>
-            <input type="number" id="tradeQty" placeholder="0.0" step="0.1" 
-                   class="w-full bg-black border border-gray-700 rounded p-3 mb-6 text-xl font-mono focus:border-yellow-500 outline-none">
-            
-            <div class="grid grid-cols-2 gap-4">
-                <button onclick="placeOrder('buy')" 
-                        class="bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition uppercase tracking-wider">
-                    Market Buy
-                </button>
-                <button onclick="placeOrder('sell')" 
-                        class="bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-lg transition uppercase tracking-wider">
-                    Market Sell
-                </button>
+        <div class="card p-6 rounded-xl mb-8">
+            <h3 class="text-lg font-semibold mb-4">Manual Override / Quick Trade</h3>
+            <div class="flex gap-4">
+                <input id="trade-qty" type="number" step="0.0001" placeholder="Quantity in BTC" class="flex-1 bg-slate-900 border border-slate-700 p-2 rounded text-white outline-none focus:border-blue-500">
+                <button onclick="executeTrade('buy')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded font-bold transition">BUY</button>
+                <button onclick="executeTrade('sell')" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded font-bold transition">SELL</button>
             </div>
         </div>
 
-        <!-- Order Logs -->
-        <div class="card p-4 rounded-lg text-sm">
-            <p class="text-gray-500 mb-2 border-b border-gray-800 pb-1">System Logs</p>
-            <div id="logs" class="font-mono h-24 overflow-y-auto text-xs space-y-1">
-                <p class="text-blue-400">Waiting for live data...</p>
+        <!-- Professional Logs -->
+        <div class="card p-6 rounded-xl">
+            <h3 class="text-lg font-semibold mb-4">Trade Logs & Execution Status</h3>
+            <div id="log-container" class="space-y-2 max-h-64 overflow-y-auto pr-2">
+                <!-- Logs injected here -->
+                <p class="text-gray-500 italic">Waiting for execution data...</p>
             </div>
         </div>
     </div>
 
     <script>
-        function log(msg, color='text-gray-400') {
-            const logs = document.getElementById('logs');
-            const time = new Date().toLocaleTimeString();
-            logs.innerHTML = `<p class="${color}">[${time}] ${msg}</p>` + logs.innerHTML;
-        }
-
-        async function refresh() {
+        async function updateDashboard() {
             try {
-                const res = await fetch('/status');
-                const d = await res.json();
-                document.getElementById('equity').innerText = d.equity;
-                document.getElementById('mark').innerText = d.mark;
-            } catch (e) { log("Connection Error", "text-red-500"); }
-        }
-
-        async function placeOrder(side) {
-            const qty = document.getElementById('tradeQty').value;
-            if(!qty || qty <= 0) return alert("Enter a valid quantity");
-
-            log(`Initiating ${side.toUpperCase()} for ${qty} ORDI...`, "text-yellow-500");
-
-            try {
-                const response = await fetch('/trade', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ side: side, quantity: parseFloat(qty) })
-                });
-                const result = await response.json();
+                const response = await fetch('/api/portfolio');
+                const data = await response.json();
                 
-                if(result.status === "success" || result.id) {
-                    log(`${side.toUpperCase()} Success! ID: ${result.id || 'Market'}`, "text-green-500");
-                } else {
-                    log(`${side.toUpperCase()} Failed: ${result.message || JSON.stringify(result)}`, "text-red-500");
+                document.getElementById('inr-bal').innerText = `₹${data.inr.toLocaleString()}`;
+                document.getElementById('btc-bal').innerText = data.btc.toFixed(8);
+                document.getElementById('live-price').innerText = `₹${data.current_price.toLocaleString()}`;
+
+                const logContainer = document.getElementById('log-container');
+                if (data.logs.length > 0) {
+                    logContainer.innerHTML = data.logs.reverse().map(log => `
+                        <div class="log-entry border-b border-slate-800 pb-2">
+                            <span class="text-gray-500">[${log.time}]</span> 
+                            <span class="${log.side === 'buy' ? 'text-green-400' : 'text-red-400'} font-bold uppercase">${log.side}</span>
+                            <span class="text-blue-300">${log.qty} BTC</span> 
+                            <span class="text-gray-400">ID: ${log.order_id}</span>
+                            <span class="ml-2 px-1 rounded bg-slate-700 text-[10px]">${log.status}</span>
+                        </div>
+                    `).join('');
                 }
-            } catch (e) {
-                log("Order Execution Failed", "text-red-500");
+            } catch (err) {
+                console.error("Update failed", err);
             }
-            refresh();
         }
 
-        setInterval(refresh, 3000);
-        refresh();
+        async function executeTrade(side) {
+            const qty = document.getElementById('trade-qty').value;
+            if(!qty) return alert("Enter Quantity");
+            
+            const res = await fetch('/trade', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ side, quantity: qty })
+            });
+            const result = await res.json();
+            alert(JSON.stringify(result));
+            updateDashboard();
+        }
+
+        // Auto-refresh every 5 seconds
+        setInterval(updateDashboard, 5000);
+        updateDashboard();
     </script>
 </body>
 </html>
