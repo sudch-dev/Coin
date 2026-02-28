@@ -1,125 +1,81 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>CoinDCX Futures Pro Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-
-  <style>
-    body {
-      background: #0b0f17;
-      color: #e6edf3;
-      font-family: Arial;
-      padding: 15px;
-    }
-
-    h2 { color: #4cc9f0; }
-
-    .card {
-      background: #111826;
-      padding: 15px;
-      margin-bottom: 15px;
-      border-radius: 10px;
-    }
-
-    .row {
-      display: flex;
-      justify-content: space-between;
-      margin: 5px 0;
-    }
-
-    button {
-      padding: 10px;
-      margin: 5px;
-      border-radius: 6px;
-      border: none;
-      font-size: 16px;
-    }
-
-    .buy { background: #16c784; color: black; }
-    .sell { background: #ea3943; color: white; }
-    .stop { background: orange; color: black; }
-
-    .log {
-      background: black;
-      padding: 10px;
-      height: 150px;
-      overflow-y: auto;
-      font-size: 13px;
-    }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CoinDCX Futures Bot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0b0e11; color: #eaecef; }
+        .card { background-color: #1e2329; border-radius: 8px; padding: 1.5rem; }
+        .accent { color: #f0b90b; } /* CoinDCX/Exchange Yellow */
+    </style>
 </head>
+<body class="p-8">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-bold mb-8 border-b border-gray-700 pb-4">
+            <span class="accent">CoinDCX</span> Futures Bot
+        </h1>
 
-<body>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="card">
+                <p class="text-gray-400 text-sm">Wallet Balance</p>
+                <p id="equity" class="text-2xl font-mono">-- USDT</p>
+            </div>
+            <div class="card">
+                <p class="text-gray-400 text-sm">Mark Price</p>
+                <p id="mark" class="text-2xl font-mono accent">--</p>
+            </div>
+            <div class="card">
+                <p class="text-gray-400 text-sm">Unrealised PnL</p>
+                <p id="pnl" class="text-2xl font-mono">--</p>
+            </div>
+        </div>
 
-<h2>🚀 CoinDCX Futures Bot — ORDIUSDT</h2>
+        <div class="card mb-8">
+            <h2 class="text-xl font-bold mb-4">Position Details</h2>
+            <div class="flex justify-between border-b border-gray-700 py-2">
+                <span>Side</span> <span id="side">--</span>
+            </div>
+            <div class="flex justify-between border-b border-gray-700 py-2">
+                <span>Size</span> <span id="size">--</span>
+            </div>
+            <div class="flex justify-between py-2">
+                <span>Entry Price</span> <span id="entry">--</span>
+            </div>
+        </div>
 
-<div class="card">
-  <h3>🏦 Account</h3>
-  <div class="row"><span>Equity:</span><span id="equity">--</span></div>
-  <div class="row"><span>Available:</span><span id="available">--</span></div>
-  <div class="row"><span>Used Margin:</span><span id="margin">--</span></div>
-  <div class="row"><span>Unrealized P&L:</span><span id="upl">--</span></div>
-  <div class="row"><span>Realized Today:</span><span id="rpl">--</span></div>
-</div>
+        <div class="flex gap-4">
+            <button onclick="controlBot('start')" class="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded font-bold transition">START BOT</button>
+            <button onclick="controlBot('stop')" class="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded font-bold transition">STOP BOT</button>
+        </div>
+    </div>
 
-<div class="card">
-  <h3>📊 Position</h3>
-  <div class="row"><span>Side:</span><span id="side">--</span></div>
-  <div class="row"><span>Size:</span><span id="size">--</span></div>
-  <div class="row"><span>Entry:</span><span id="entry">--</span></div>
-  <div class="row"><span>Mark Price:</span><span id="mark">--</span></div>
-  <div class="row"><span>P&L:</span><span id="pnl">--</span></div>
-  <div class="row"><span>ROE %:</span><span id="roe">--</span></div>
-  <div class="row"><span>Liq Price:</span><span id="liq">--</span></div>
-</div>
+    <script>
+        async function updateStatus() {
+            try {
+                const res = await fetch('/status');
+                const data = await res.json();
+                
+                document.getElementById('equity').innerText = data.equity + " USDT";
+                document.getElementById('mark').innerText = data.mark;
+                document.getElementById('side').innerText = data.side;
+                document.getElementById('size').innerText = data.size;
+                document.getElementById('entry').innerText = data.entry;
+                
+                const pnlEl = document.getElementById('pnl');
+                pnlEl.innerText = data.pnl + " USDT (" + data.roe + "%)";
+                pnlEl.className = data.pnl >= 0 ? "text-2xl font-mono text-green-500" : "text-2xl font-mono text-red-500";
+            } catch (e) { console.error("Update failed", e); }
+        }
 
-<div class="card">
-  <h3>📋 Orders</h3>
-  <div id="orders">No active orders</div>
-</div>
+        async function controlBot(action) {
+            await fetch('/' + action, { method: 'POST' });
+            alert("Bot " + action + "ed");
+        }
 
-<div class="card">
-  <h3>⚡ Bot Control</h3>
-  <button class="buy" onclick="start()">START</button>
-  <button class="stop" onclick="stop()">STOP</button>
-</div>
-
-<div class="card">
-  <h3>📜 Logs</h3>
-  <div class="log" id="logs"></div>
-</div>
-
-<script>
-async function refresh() {
-  const res = await fetch('/status');
-  const d = await res.json();
-
-  document.getElementById("equity").innerText = d.equity;
-  document.getElementById("available").innerText = d.available;
-  document.getElementById("margin").innerText = d.margin;
-  document.getElementById("upl").innerText = d.upl;
-  document.getElementById("rpl").innerText = d.rpl;
-
-  document.getElementById("side").innerText = d.side;
-  document.getElementById("size").innerText = d.size;
-  document.getElementById("entry").innerText = d.entry;
-  document.getElementById("mark").innerText = d.mark;
-  document.getElementById("pnl").innerText = d.pnl;
-  document.getElementById("roe").innerText = d.roe;
-  document.getElementById("liq").innerText = d.liq;
-
-  document.getElementById("orders").innerText = d.orders;
-
-  document.getElementById("logs").innerText =
-    (d.logs || []).join("\n");
-}
-
-async function start() { await fetch('/start', {method:'POST'}); }
-async function stop() { await fetch('/stop', {method:'POST'}); }
-
-setInterval(refresh, 3000);
-refresh();
-</script>
-
+        setInterval(updateStatus, 3000);
+        updateStatus();
+    </script>
 </body>
 </html>
