@@ -1,215 +1,147 @@
 import os
 import time
+import json
 import hmac
 import hashlib
-import json
 import requests
-import pandas as pd
 import threading
-from flask import Flask, jsonify, request, render_template
-
-# ================= CONFIG =================
-
-API_KEY = "YOUR_API_KEY"
-API_SECRET = "YOUR_API_SECRET"
-
-BASE_URL = "https://api.coindcx.com"
-
-SYMBOL = "ORDIUSDT"
-LEVERAGE = 5
-
-RISK_PER_TRADE = 0.01
-MAX_DAILY_LOSS = 0.03
-TP_MULTIPLIER = 2.0
-
-CHECK_INTERVAL = 15
-
-# ==========================================
+from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
-bot_running = False
-position = None
-entry_price = 0
-equity = 1000.0
-day_pnl = 0.0
-trades = []
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET").encode()
 
-# ================= AUTH ====================
+BASE_URL = "https://api.coindcx.com"
 
+SYMBOL = "ORDIUSDT"  # Futures pair
+LEVERAGE = 5
+RISK_PER_TRADE = 0.02
+
+running = False
+status = "Idle"
+last_price = 0
+equity = 0
+position = {}
+
+# ---------- AUTH ----------
 def sign(payload):
-    return hmac.new(
-        API_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def private_post(endpoint, body):
-    payload = json.dumps(body)
+def post(endpoint, body):
+    payload = json.dumps(body, separators=(',', ':'))
     headers = {
         "X-AUTH-APIKEY": API_KEY,
         "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
-    return requests.post(BASE_URL + endpoint, data=payload, headers=headers).json()
+    r = requests.post(BASE_URL + endpoint, headers=headers, data=payload)
+    return r.json()
 
-# ================= DATA ====================
-
+# ---------- MARKET PRICE ----------
 def get_price():
+    global last_price
     r = requests.get(f"{BASE_URL}/exchange/ticker")
-    for s in r.json():
-        if s["market"] == SYMBOL:
-            return float(s["last_price"])
-    return None
+    for item in r.json():
+        if item["market"] == SYMBOL:
+            last_price = float(item["last_price"])
+            return last_price
+    return 0
 
-def get_candles():
-    url = f"{BASE_URL}/market_data/candles?pair={SYMBOL}&interval=1m"
-    r = requests.get(url)
-    df = pd.DataFrame(r.json(),
-        columns=["time","open","high","low","close","volume"])
-    df["close"] = df["close"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    return df
+# ---------- FUTURES EQUITY ----------
+def get_equity():
+    global equity
+    body = {"timestamp": int(time.time() * 1000)}
+    data = post("/exchange/v1/users/futures/balance", body)
+    equity = float(data.get("available_balance", 0))
+    return equity
 
-# ================= INDICATORS ==============
+# ---------- OPEN POSITION ----------
+def get_position():
+    global position
+    body = {"timestamp": int(time.time() * 1000)}
+    data = post("/exchange/v1/futures/positions", body)
+    for p in data:
+        if p["market"] == SYMBOL:
+            position = p
+            return p
+    position = {}
+    return {}
 
-def trend_signal(df):
-    return df["close"].iloc[-1] > df["close"].rolling(5).mean().iloc[-1]
-
-def atr(df):
-    tr = df["high"] - df["low"]
-    return tr.rolling(14).mean().iloc[-1]
-
-# ================= RISK ====================
-
-def position_size(price, stop_dist):
-    risk_amount = equity * RISK_PER_TRADE
-    qty = risk_amount / stop_dist if stop_dist > 0 else 0
-    return round(qty, 3)
-
-def kill_switch():
-    return day_pnl <= -equity * MAX_DAILY_LOSS
-
-# ================= TRADING =================
-
+# ---------- ORDER ----------
 def place_order(side, qty):
     body = {
+        "market": SYMBOL,
         "side": side,
         "order_type": "market_order",
-        "market": SYMBOL,
-        "quantity": qty,
-        "timestamp": int(time.time()*1000)
+        "total_quantity": str(qty),
+        "timestamp": int(time.time() * 1000)
     }
-    return private_post("/exchange/v1/orders/create", body)
+    return post("/exchange/v1/futures/orders/create", body)
 
-def flatten():
-    global position
-    if position == "LONG":
-        place_order("sell", 999999)
-    elif position == "SHORT":
-        place_order("buy", 999999)
-    position = None
+# ---------- SIMPLE PSAR-LIKE LOGIC ----------
+def strategy():
+    price = get_price()
+    eq = get_equity()
+    pos = get_position()
 
-# ================= BOT LOOP =================
+    if price == 0 or eq == 0:
+        return
 
-def run_bot():
-    global position, entry_price, equity, day_pnl, bot_running
+    qty = (eq * RISK_PER_TRADE * LEVERAGE) / price
 
-    while bot_running:
+    # Example logic: momentum breakout
+    if not pos:
+        place_order("buy", qty)
+
+    elif float(pos.get("size", 0)) > 0:
+        entry = float(pos["avg_price"])
+        if price > entry * 1.01:
+            place_order("sell", abs(float(pos["size"])))
+
+# ---------- BOT LOOP ----------
+def bot_loop():
+    global running, status
+    status = "Running"
+
+    while running:
         try:
-
-            if kill_switch():
-                flatten()
-                bot_running = False
-                print("DAILY LOSS LIMIT HIT")
-                break
-
-            price = get_price()
-            df = get_candles()
-
-            if price is None or df.empty:
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            signal_long = trend_signal(df)
-            vol = atr(df)
-            qty = position_size(price, vol)
-
-            # ---- ENTRY ----
-            if position is None and qty > 0:
-
-                if signal_long:
-                    place_order("buy", qty)
-                    position = "LONG"
-                else:
-                    place_order("sell", qty)
-                    position = "SHORT"
-
-                entry_price = price
-
-            # ---- EXIT ----
-            elif position is not None:
-
-                pnl = (price - entry_price) * qty
-                if position == "SHORT":
-                    pnl = -pnl
-
-                if pnl > vol * TP_MULTIPLIER or pnl < -vol:
-                    flatten()
-                    day_pnl += pnl
-                    equity += pnl
-
-                    trades.append({
-                        "side": position,
-                        "pnl": round(pnl,2),
-                        "price": price,
-                        "time": time.strftime("%H:%M:%S")
-                    })
-
+            strategy()
         except Exception as e:
-            print("ERROR:", e)
+            print("Error:", e)
+        time.sleep(10)
 
-        time.sleep(CHECK_INTERVAL)
+    status = "Stopped"
 
-# ================= ROUTES ==================
-
+# ---------- ROUTES ----------
 @app.route("/")
-def home():
+def index():
     return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
-def start_bot():
-    global bot_running
-    if not bot_running:
-        bot_running = True
-        threading.Thread(target=run_bot).start()
-    return jsonify({"status": "BOT STARTED"})
+def start():
+    global running
+    if not running:
+        running = True
+        threading.Thread(target=bot_loop).start()
+    return jsonify({"status": "started"})
 
 @app.route("/stop", methods=["POST"])
-def stop_bot():
-    global bot_running
-    bot_running = False
-    return jsonify({"status": "BOT STOPPED"})
-
-@app.route("/flatten", methods=["POST"])
-def manual_flatten():
-    flatten()
-    return jsonify({"status": "POSITION CLOSED"})
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
 
 @app.route("/status")
-def status():
+def get_status():
     return jsonify({
-        "running": bot_running,
-        "position": position,
-        "entry_price": entry_price,
-        "equity": round(equity,2),
-        "day_pnl": round(day_pnl,2),
-        "trades": trades[-10:]
+        "status": status,
+        "price": last_price,
+        "equity": equity,
+        "position": position
     })
 
-# ================= MAIN ====================
-
+# ---------- RENDER READY ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
