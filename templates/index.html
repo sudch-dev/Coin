@@ -1,78 +1,110 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>ORDI/USDT Futures</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-        body {
-            background: #0b1220;
-            color: white;
-            font-family: Arial;
-            text-align: center;
-            padding: 20px;
-        }
-        .card {
-            background: #14213d;
-            margin: 20px 0;
-            padding: 20px;
-            border-radius: 10px;
-        }
-        button {
-            width: 90%;
-            padding: 15px;
-            margin: 10px;
-            font-size: 18px;
-            border: none;
-            border-radius: 10px;
-        }
-        .long { background: green; color: white; }
-        .short { background: red; color: white; }
-        .close { background: royalblue; color: white; }
-    </style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORDI/USDT Futures</title>
+
+<style>
+body{
+  background:#071222;
+  color:white;
+  font-family:Arial;
+  text-align:center;
+  padding:20px;
+}
+
+.card{
+  background:#0d1f35;
+  margin:20px auto;
+  padding:25px;
+  border-radius:14px;
+  width:90%;
+  max-width:420px;
+  font-size:22px;
+}
+
+.value{
+  margin-top:10px;
+  font-weight:bold;
+  font-size:26px;
+  color:#00f0ff;
+}
+
+button{
+  width:90%;
+  max-width:420px;
+  padding:18px;
+  margin:14px auto;
+  border:none;
+  border-radius:12px;
+  font-size:22px;
+  font-weight:bold;
+  color:white;
+  display:block;
+}
+
+.long{ background:#00c853; }
+.short{ background:#ff1744; }
+.close{ background:#2979ff; }
+
+button:active{ opacity:0.8; }
+</style>
 </head>
+
 <body>
 
 <h1>ORDI/USDT Futures</h1>
 
 <div class="card">
-    <h3>Price</h3>
-    <div id="price">--</div>
+  Price
+  <div id="price" class="value">--</div>
 </div>
 
 <div class="card">
-    <h3>Wallet (USDT)</h3>
-    <div id="wallet">--</div>
+  Wallet (USDT)
+  <div id="wallet" class="value">--</div>
 </div>
 
 <div class="card">
-    <h3>Position</h3>
-    <div id="position">NONE</div>
+  Position
+  <div id="position" class="value">NONE</div>
 </div>
 
-<button class="long" onclick="trade('long')">LONG</button>
-<button class="short" onclick="trade('short')">SHORT</button>
-<button class="close" onclick="trade('close')">CLOSE</button>
+<button class="long" onclick="send('long')">LONG</button>
+<button class="short" onclick="send('short')">SHORT</button>
+<button class="close" onclick="send('close')">CLOSE</button>
 
 <script>
-async function update() {
-    try {
-        const res = await fetch("/status");
-        const data = await res.json();
-        document.getElementById("price").innerText = data.price;
-        document.getElementById("wallet").innerText = data.wallet;
-        document.getElementById("position").innerText = data.position;
-    } catch (e) {
-        console.log("Status error");
-    }
+async function update(){
+  try{
+    const r = await fetch("/status");
+    const d = await r.json();
+
+    document.getElementById("price").innerText =
+      d.price ? Number(d.price).toFixed(4) : "--";
+
+    document.getElementById("wallet").innerText =
+      d.wallet ? Number(d.wallet).toFixed(4) : "0";
+
+    document.getElementById("position").innerText =
+      d.position || "NONE";
+
+  }catch(e){
+    console.log("Update error", e);
+  }
 }
 
-async function trade(type) {
-    await fetch("/" + type, { method: "POST" });
+async function send(action){
+  try{
+    await fetch("/" + action, { method:"POST" });
     setTimeout(update, 1000);
+  }catch(e){
+    alert("Order failed");
+  }
 }
 
-setInterval(update, 3000);
 update();
+setInterval(update, 5000);
 </script>
 
 </body>
