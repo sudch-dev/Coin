@@ -8,183 +8,152 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET").encode()
 
-BASE_URL = "https://api.coindcx.com"
+BASE = "https://api.coindcx.com"
+
 SYMBOL = "ORDIUSDT"
 
+# ========= SIGNATURE =========
 
-# =========================
-# SIGNED REQUEST
-# =========================
-def signed_request(endpoint, body):
+def sign(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+def signed_post(endpoint, body):
     payload = json.dumps(body, separators=(',', ':'))
-
-    signature = hmac.new(
-        API_SECRET.encode(),
-        payload.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
     headers = {
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
+    r = requests.post(BASE + endpoint, headers=headers, data=payload, timeout=10)
+    return r.json()
 
-    response = requests.post(
-        BASE_URL + endpoint,
-        data=payload,
-        headers=headers
-    )
+# ========= PRICE =========
 
-    return response.json()
-
-
-# =========================
-# PRICE
-# =========================
 def get_price():
-    try:
-        r = requests.get(
-            f"{BASE_URL}/exchange/ticker",
-            params={"market": SYMBOL}
-        )
-        return float(r.json()["last_price"])
-    except:
-        return 0
+    r = requests.get(BASE + "/exchange/ticker", timeout=10)
+    for x in r.json():
+        if x["market"] == SYMBOL:
+            return float(x["last_price"])
+    return 0
 
+# ========= FUTURES WALLET =========
 
-# =========================
-# FUTURES WALLET (REAL)
-# =========================
 def get_wallet():
-    try:
-        body = {"timestamp": int(time.time() * 1000)}
-        res = signed_request(
-            "/exchange/v1/derivatives/futures/balance",
-            body
-        )
+    body = {"timestamp": int(time.time() * 1000)}
+    res = signed_post("/exchange/v1/derivatives/futures/balances", body)
 
-        if isinstance(res, list):
-            for asset in res:
-                if asset.get("currency") == "USDT":
-                    return float(asset.get("available_balance", 0))
+    usdt = 0
+    for x in res:
+        if x.get("currency") == "USDT":
+            usdt = float(x.get("balance", 0))
+    return usdt
 
-        return 0
+# ========= OPEN POSITION =========
 
-    except Exception as e:
-        print("Wallet Error:", e)
-        return 0
-
-
-# =========================
-# POSITION
-# =========================
 def get_position():
-    try:
-        body = {"timestamp": int(time.time() * 1000)}
-        res = signed_request(
-            "/exchange/v1/derivatives/futures/positions",
-            body
-        )
+    body = {"timestamp": int(time.time() * 1000)}
+    res = signed_post("/exchange/v1/derivatives/futures/positions", body)
 
-        if isinstance(res, list):
-            for p in res:
-                if p.get("symbol") == SYMBOL:
-                    size = float(p.get("size", 0))
+    side = "NONE"
+    size = 0
+    entry = 0
 
-                    if size > 0:
-                        return "LONG"
-                    elif size < 0:
-                        return "SHORT"
+    if isinstance(res, list):
+        for p in res:
+            if p.get("symbol") == SYMBOL:
+                size = float(p.get("size", 0))
+                entry = float(p.get("avg_price", 0))
 
-        return "NONE"
+                if size > 0:
+                    side = "LONG"
+                elif size < 0:
+                    side = "SHORT"
 
-    except Exception as e:
-        print("Position Error:", e)
-        return "NONE"
+    return side, abs(size), entry
 
+# ========= ACTIVE ORDERS =========
 
-# =========================
-# PLACE ORDER
-# =========================
-def place_order(side):
-    wallet = get_wallet()
-    price = get_price()
+def get_orders():
+    body = {"timestamp": int(time.time() * 1000)}
+    res = signed_post("/exchange/v1/derivatives/futures/orders", body)
 
-    if wallet <= 0 or price <= 0:
-        return {"error": "No balance or price"}
+    active = []
+    if isinstance(res, list):
+        for o in res:
+            if o.get("symbol") == SYMBOL and o.get("status") == "open":
+                active.append(o.get("side") + " " + str(o.get("price")))
+    return active
 
-    qty = round((wallet * 0.9) / price, 3)
-
-    body = {
-        "timestamp": int(time.time() * 1000),
-        "symbol": SYMBOL,
-        "side": side,
-        "type": "MARKET",
-        "quantity": str(qty)
-    }
-
-    return signed_request(
-        "/exchange/v1/derivatives/futures/orders/create",
-        body
-    )
-
-
-# =========================
-# CLOSE POSITION
-# =========================
-def close_position():
-    pos = get_position()
-
-    if pos == "LONG":
-        return place_order("SELL")
-    elif pos == "SHORT":
-        return place_order("BUY")
-
-    return {"message": "No position"}
-
-
-# =========================
-# ROUTES
-# =========================
-@app.route("/")
-def home():
-    return render_template("index.html")
-
+# ========= STATUS =========
 
 @app.route("/status")
 def status():
     try:
+        price = get_price()
+        wallet = get_wallet()
+        side, size, entry = get_position()
+        orders = get_orders()
+
+        pnl = 0
+        roe = 0
+        liq = "--"
+
+        if entry > 0:
+            pnl = (price - entry) * size if side == "LONG" else (entry - price) * size
+            roe = (pnl / wallet * 100) if wallet > 0 else 0
+
         return jsonify({
-            "price": get_price(),
-            "wallet": get_wallet(),
-            "position": get_position()
+            "equity": wallet,
+            "available": wallet,
+            "margin": "--",
+            "upl": round(pnl, 4),
+            "rpl": 0,
+
+            "side": side,
+            "size": size,
+            "entry": entry,
+            "mark": price,
+            "pnl": round(pnl, 4),
+            "roe": round(roe, 2),
+            "liq": liq,
+
+            "orders": orders,
+            "logs": ["System OK"]
         })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ========= CONTROL =========
 
-@app.route("/long", methods=["POST"])
-def long():
-    return jsonify(place_order("BUY"))
+running = False
 
+@app.route("/start", methods=["POST"])
+def start():
+    global running
+    running = True
+    return jsonify({"status": "started"})
 
-@app.route("/short", methods=["POST"])
-def short():
-    return jsonify(place_order("SELL"))
+@app.route("/stop", methods=["POST"])
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
 
+# ========= UI =========
 
-@app.route("/close", methods=["POST"])
-def close():
-    return jsonify(close_position())
+@app.route("/")
+def index():
+    return render_template("index.html")
 
+@app.route("/ping")
+def ping():
+    return "pong"
 
-# =========================
-# RUN (Render compatible)
-# =========================
+# ========= RUN =========
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
