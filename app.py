@@ -9,22 +9,27 @@ from flask import Flask, jsonify, render_template
 
 app = Flask(__name__)
 
+# ================= CONFIG =================
+
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 
 BASE_URL = "https://api.coindcx.com"
 
-SYMBOL = "ORDIUSDT"  # Futures pair
-LEVERAGE = 5
-RISK_PER_TRADE = 0.02
+SYMBOL = "ORDIUSDT"
+LEVERAGE = 3
+RISK_PER_TRADE = 0.01  # 1% risk (safe for small accounts)
+CHECK_INTERVAL = 10
 
 running = False
-status = "Idle"
+status_text = "Idle"
 last_price = 0
-equity = 0
-position = {}
+wallet_balance = 0
+available_balance = 0
+position_data = {}
 
-# ---------- AUTH ----------
+# ================= AUTH =================
+
 def sign(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
@@ -38,7 +43,8 @@ def post(endpoint, body):
     r = requests.post(BASE_URL + endpoint, headers=headers, data=payload)
     return r.json()
 
-# ---------- MARKET PRICE ----------
+# ================= MARKET =================
+
 def get_price():
     global last_price
     r = requests.get(f"{BASE_URL}/exchange/ticker")
@@ -48,72 +54,96 @@ def get_price():
             return last_price
     return 0
 
-# ---------- FUTURES EQUITY ----------
-def get_equity():
-    global equity
-    body = {"timestamp": int(time.time() * 1000)}
-    data = post("/exchange/v1/users/futures/balance", body)
-    equity = float(data.get("available_balance", 0))
-    return equity
+# ================= FUTURES ACCOUNT =================
 
-# ---------- OPEN POSITION ----------
-def get_position():
-    global position
+def get_account():
+    global wallet_balance, available_balance
+
     body = {"timestamp": int(time.time() * 1000)}
-    data = post("/exchange/v1/futures/positions", body)
-    for p in data:
-        if p["market"] == SYMBOL:
-            position = p
-            return p
-    position = {}
+    data = post("/exchange/v1/derivatives/account", body)
+
+    if "data" in data:
+        acc = data["data"]
+        wallet_balance = float(acc.get("wallet_balance", 0))
+        available_balance = float(acc.get("available_balance", 0))
+
+    return available_balance
+
+# ================= POSITION =================
+
+def get_position():
+    global position_data
+
+    body = {"timestamp": int(time.time() * 1000)}
+    data = post("/exchange/v1/derivatives/positions", body)
+
+    if "data" in data:
+        for p in data["data"]:
+            if p["market"] == SYMBOL:
+                position_data = p
+                return p
+
+    position_data = {}
     return {}
 
-# ---------- ORDER ----------
+# ================= ORDER =================
+
 def place_order(side, qty):
     body = {
         "market": SYMBOL,
         "side": side,
         "order_type": "market_order",
-        "total_quantity": str(qty),
+        "total_quantity": str(round(qty, 3)),
         "timestamp": int(time.time() * 1000)
     }
-    return post("/exchange/v1/futures/orders/create", body)
+    return post("/exchange/v1/derivatives/orders/create", body)
 
-# ---------- SIMPLE PSAR-LIKE LOGIC ----------
+# ================= STRATEGY =================
+
 def strategy():
     price = get_price()
-    eq = get_equity()
+    avail = get_account()
     pos = get_position()
 
-    if price == 0 or eq == 0:
+    if price == 0 or avail <= 1:
         return
 
-    qty = (eq * RISK_PER_TRADE * LEVERAGE) / price
+    qty = (wallet_balance * RISK_PER_TRADE * LEVERAGE) / price
 
-    # Example logic: momentum breakout
+    # Ensure minimum notional (safe for small account)
+    min_notional = 5
+    if qty * price < min_notional:
+        qty = min_notional / price
+
+    # ENTRY
     if not pos:
         place_order("buy", qty)
 
+    # EXIT (1% profit target)
     elif float(pos.get("size", 0)) > 0:
         entry = float(pos["avg_price"])
         if price > entry * 1.01:
             place_order("sell", abs(float(pos["size"])))
 
-# ---------- BOT LOOP ----------
+# ================= BOT LOOP =================
+
 def bot_loop():
-    global running, status
-    status = "Running"
+    global running, status_text
+
+    status_text = "Running"
 
     while running:
         try:
             strategy()
         except Exception as e:
             print("Error:", e)
-        time.sleep(10)
 
-    status = "Stopped"
+        time.sleep(CHECK_INTERVAL)
 
-# ---------- ROUTES ----------
+    status_text = "Stopped"
+
+# ================= ROUTES =================
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -132,16 +162,31 @@ def stop():
     running = False
     return jsonify({"status": "stopped"})
 
+@app.route("/flatten", methods=["POST"])
+def flatten():
+    pos = get_position()
+    if pos:
+        size = abs(float(pos.get("size", 0)))
+        side = "sell" if float(pos.get("size", 0)) > 0 else "buy"
+        place_order(side, size)
+    return jsonify({"status": "position closed"})
+
 @app.route("/status")
-def get_status():
+def status():
+    get_price()
+    get_account()
+    get_position()
+
     return jsonify({
-        "status": status,
+        "bot_status": status_text,
         "price": last_price,
-        "equity": equity,
-        "position": position
+        "wallet_balance": wallet_balance,
+        "available_balance": available_balance,
+        "position": position_data
     })
 
-# ---------- RENDER READY ----------
+# ================= RUN =================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
