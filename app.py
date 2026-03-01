@@ -1,50 +1,147 @@
+import os
+import time
+import threading
+import logging
+import requests
 import pandas as pd
 import pandas_ta as ta
+from flask import Flask, jsonify
 
-# ... (Previous imports and auth code) ...
+# ==============================
+# BASIC CONFIG
+# ==============================
+
+SYMBOL = "BTCUSDT"
+INTERVAL = "1m"
+BASE_URL = "https://api.coindcx.com"
+
+PORT = int(os.environ.get("PORT", 10000))
+
+# ==============================
+# LOGGING
+# ==============================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+# ==============================
+# FLASK APP (IMPORTANT FOR GUNICORN)
+# ==============================
+
+app = Flask(__name__)
+
+# ==============================
+# FETCH CANDLE DATA
+# ==============================
+
+def fetch_candles():
+    try:
+        url = f"{BASE_URL}/exchange/v1/candles?pair={SYMBOL}&interval={INTERVAL}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+
+        if not data:
+            return None
+
+        df = pd.DataFrame(data)
+
+        # Rename columns properly if needed
+        df.columns = ["time", "open", "high", "low", "close", "volume"]
+
+        df["close"] = df["close"].astype(float)
+
+        return df.tail(100)
+
+    except Exception as e:
+        logger.error(f"Fetch Error: {e}")
+        return None
+
+
+# ==============================
+# SIGNAL LOGIC
+# ==============================
 
 def get_live_signals():
-    """Fetches 1-minute candle data and calculates technical signals."""
-    # Note: In production, you would fetch the last 100 candles from CoinDCX API
-    # For this example, we assume 'df' is a pandas DataFrame of recent BTC prices
     try:
-        # 1. Fetch historical data (e.g., last 50 candles)
-        # ticker_data = requests.get(f"{BASE}/exchange/v1/candles?pair={SYMBOL}&interval=1m").json()
-        # df = pd.DataFrame(ticker_data)
-        
-        # 2. Calculate Indicators
+        df = fetch_candles()
+        if df is None or len(df) < 30:
+            return "HOLD"
+
         df['ema_fast'] = ta.ema(df['close'], length=9)
         df['ema_slow'] = ta.ema(df['close'], length=21)
         df['rsi'] = ta.rsi(df['close'], length=14)
-        
+
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        
-        # 3. Logic for "Pro" Signal
-        # BUY: Fast EMA crosses above Slow EMA AND RSI is in the 'sweet spot'
+
+        # BUY Condition
         if prev['ema_fast'] <= prev['ema_slow'] and last['ema_fast'] > last['ema_slow']:
             if 50 < last['rsi'] < 70:
                 return "BUY"
-        
-        # SELL: Fast EMA crosses below Slow EMA
+
+        # SELL Condition
         if prev['ema_fast'] >= prev['ema_slow'] and last['ema_fast'] < last['ema_slow']:
             return "SELL"
-            
+
     except Exception as e:
         logger.error(f"Signal Error: {e}")
+
     return "HOLD"
 
+
+# ==============================
+# MAIN BOT LOOP
+# ==============================
+
 def automation_loop():
-    """Main loop that runs continuously (Keep-Alive)"""
+    logger.info("Trading bot started...")
     while True:
-        signal = get_live_signals()
-        if signal != "HOLD":
-            logger.info(f"SIGNAL DETECTED: {signal}. Executing trade...")
-            # execute_trade_logic(signal) # Call your trade function here
-        
-        time.sleep(60) # Run every minute
-        
-        
+        try:
+            signal = get_live_signals()
+
+            if signal != "HOLD":
+                logger.info(f"SIGNAL DETECTED: {signal}")
+                # execute_trade(signal)  # Add your order logic here
+
+            time.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Loop Error: {e}")
+            time.sleep(10)
+
+
+# ==============================
+# BACKGROUND THREAD
+# ==============================
+
+def start_bot():
+    thread = threading.Thread(target=automation_loop)
+    thread.daemon = True
+    thread.start()
+
+start_bot()
+
+# ==============================
+# HEALTH CHECK ROUTES
+# ==============================
+
+@app.route("/")
+def home():
+    return "CoinDCX Trading Bot Running 🚀"
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "running"})
+
+
+# ==============================
+# DO NOT USE app.run() ON RENDER
+# Gunicorn will serve this app
+# ==============================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
