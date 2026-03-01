@@ -2,7 +2,6 @@ import os, time, threading, hmac, hashlib, requests, json
 from flask import Flask, render_template, jsonify
 from datetime import datetime
 from pytz import timezone
-from collections import deque
 
 app = Flask(__name__)
 
@@ -14,7 +13,7 @@ BASE_URL = "https://api.coindcx.com"
 PAIR = "BTCINR"
 
 CANDLE_INTERVAL = 15
-TRADE_COOLDOWN = 30
+COOLDOWN_SECONDS = 60
 
 IST = timezone("Asia/Kolkata")
 def ist_now(): return datetime.now(IST).strftime("%H:%M:%S")
@@ -25,7 +24,11 @@ status = {"msg": "Idle", "last": ""}
 
 tick_log = []
 candles = []
-exit_order = None
+
+# ----- Position State -----
+position = None      # None or "LONG"
+entry_price = None
+last_trade_time = 0
 
 # ===== AUTH =====
 def sign(payload):
@@ -65,8 +68,10 @@ def update_candles(price):
 
     if not candles or candles[-1]["start"] != window:
         candles.append({
-            "open": price, "high": price,
-            "low": price, "close": price,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
             "start": window
         })
     else:
@@ -78,17 +83,53 @@ def update_candles(price):
     if len(candles) > 100:
         candles.pop(0)
 
-# ===== PSAR SIGNAL =====
+# ===== REAL PSAR SIGNAL =====
 def psar_signal():
-    if len(candles) < 6:
+    if len(candles) < 10:
         return None
 
-    prev = candles[-3]["close"]
-    last = candles[-2]["close"]
+    af = 0.02
+    max_af = 0.2
 
-    if last > prev:
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+
+    psar = lows[0]
+    bull = True
+    ep = highs[0]
+
+    for i in range(1, len(candles)):
+        prev_psar = psar
+
+        if bull:
+            psar = prev_psar + af * (ep - prev_psar)
+            if lows[i] < psar:
+                bull = False
+                psar = ep
+                ep = lows[i]
+                af = 0.02
+        else:
+            psar = prev_psar + af * (ep - prev_psar)
+            if highs[i] > psar:
+                bull = True
+                psar = ep
+                ep = highs[i]
+                af = 0.02
+
+        if bull:
+            if highs[i] > ep:
+                ep = highs[i]
+                af = min(af + 0.02, max_af)
+        else:
+            if lows[i] < ep:
+                ep = lows[i]
+                af = min(af + 0.02, max_af)
+
+    last_close = candles[-1]["close"]
+
+    if last_close > psar:
         return "BUY"
-    elif last < prev:
+    elif last_close < psar:
         return "SELL"
 
     return None
@@ -106,7 +147,8 @@ def place_order(side, qty):
 
 # ===== ENGINE =====
 def bot_loop():
-    global running, error_message, exit_order
+    global running, error_message
+    global position, entry_price, last_trade_time
 
     while running:
         try:
@@ -116,36 +158,49 @@ def bot_loop():
                 continue
 
             update_candles(price)
+            now = time.time()
 
-            if exit_order:
-                side, tp, sl, qty = exit_order
-                if (side == "BUY" and (price >= tp or price <= sl)) or \
-                   (side == "SELL" and (price <= tp or price >= sl)):
-                    place_order("SELL" if side == "BUY" else "BUY", qty)
-                    exit_order = None
+            # ----- EXIT LOGIC -----
+            if position == "LONG":
+                if price >= entry_price * 1.01 or price <= entry_price * 0.995:
+                    bal = get_balances()
+                    btc_qty = bal.get("BTC", 0)
 
-            else:
+                    if btc_qty > 0.00001:
+                        res = place_order("sell", btc_qty)
+
+                        if res:
+                            position = None
+                            entry_price = None
+                            last_trade_time = now
+                            status["msg"] = f"Exited @ {price}"
+
+            # ----- ENTRY LOGIC -----
+            elif position is None and (now - last_trade_time > COOLDOWN_SECONDS):
                 signal = psar_signal()
                 bal = get_balances()
                 inr = bal.get("INR", 0)
 
-                if signal and inr > 100:
+                if signal == "BUY" and inr > 200:
                     qty = round((0.1 * inr) / price, 6)
+                    res = place_order("buy", qty)
 
-                    res = place_order(signal, qty)
+                    if res:
+                        position = "LONG"
+                        entry_price = price
+                        last_trade_time = now
+                        status["msg"] = f"Entered LONG @ {price}"
 
-                    tp = price * 1.01
-                    sl = price * 0.995
-
-                    exit_order = (signal, tp, sl, qty)
-
-            status["msg"] = "Running"
             status["last"] = ist_now()
 
         except Exception as e:
             error_message = str(e)
 
-        time.sleep(5)
+        # responsive stop
+        for _ in range(5):
+            if not running:
+                break
+            time.sleep(1)
 
     status["msg"] = "Idle"
 
