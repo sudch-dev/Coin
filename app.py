@@ -8,7 +8,7 @@ app = Flask(__name__)
 # ========= CONFIG =========
 
 API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET").encode()
+API_SECRET = os.environ.get("API_SECRET", "").encode()
 
 BASE_URL = "https://api.coindcx.com"
 PAIR = "BTCINR"
@@ -31,36 +31,57 @@ RISK_PER_TRADE = 0.08      # 8% of INR capital
 MIN_RESERVE = 200          # Keep ₹200 untouched
 COOLDOWN_SEC = 120         # 2-minute pause after exit
 
-# ========= AUTH =========
+# ========= AUTH & API WRAPPERS =========
 
 def sign(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-def signed_post(url, body):
+def signed_post(url, body, retries=3):
+    """Modified with increased timeout and retry logic to prevent 'Read timed out' errors."""
+    global error_message
     payload = json.dumps(body)
     headers = {
         "X-AUTH-APIKEY": API_KEY,
         "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
-    r = requests.post(url, headers=headers, data=payload, timeout=10)
-    return r.json() if r.ok else {}
+    
+    for i in range(retries):
+        try:
+            # Increased timeout from 10 to 30 seconds
+            r = requests.post(url, headers=headers, data=payload, timeout=30)
+            if r.ok:
+                error_message = "" # Clear errors on success
+                return r.json()
+            else:
+                error_message = f"API Error {r.status_code}: {r.text}"
+        except requests.exceptions.RequestException as e:
+            error_message = f"Retry {i+1}/{retries} - Connection Error: {str(e)}"
+            time.sleep(2) # Wait before retrying
+            
+    return {}
 
 # ========= PORTFOLIO =========
 
 def get_balances():
     body = {"timestamp": int(time.time()*1000)}
     data = signed_post(f"{BASE_URL}/exchange/v1/users/balances", body)
-    return {x["currency"]: float(x["balance"]) for x in data}
+    if isinstance(data, list):
+        return {x["currency"]: float(x["balance"]) for x in data}
+    return {}
 
 # ========= MARKET =========
 
 def get_price():
-    r = requests.get(f"{BASE_URL}/exchange/ticker")
-    if r.ok:
-        for x in r.json():
-            if x["market"] == PAIR:
-                return float(x["last_price"])
+    """Fetches current market price with error handling."""
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=15)
+        if r.ok:
+            for x in r.json():
+                if x["market"] == PAIR:
+                    return float(x["last_price"])
+    except:
+        pass
     return None
 
 # ========= VOLATILITY =========
@@ -74,7 +95,6 @@ def volatility():
 # ========= SIGNAL ENGINE =========
 
 def trade_signal(price):
-
     if len(prices) < 30:
         return None
 
@@ -98,6 +118,7 @@ def trade_signal(price):
 # ========= ORDER =========
 
 def place_order(side, qty):
+    if qty <= 0: return {}
     body = {
         "market": PAIR,
         "side": side.lower(),
@@ -125,9 +146,8 @@ def bot_loop():
 
             now = time.time()
 
-            # ===== ACTIVE TRADE =====
+            # ===== ACTIVE TRADE MANAGEMENT =====
             if entry:
-
                 side, qty, tp, sl = entry
 
                 if side == "BUY":
@@ -135,45 +155,39 @@ def bot_loop():
                         place_order("SELL", qty)
                         entry = None
                         cooldown_until = now + COOLDOWN_SEC
-
                 else:
                     if price <= tp or price >= sl:
                         place_order("BUY", qty)
                         entry = None
                         cooldown_until = now + COOLDOWN_SEC
 
-            # ===== NEW TRADE =====
+            # ===== NEW TRADE SEARCH =====
             else:
-
                 if now < cooldown_until:
-                    continue
+                    status["msg"] = "Cooldown"
+                else:
+                    signal = trade_signal(price)
+                    bal = get_balances()
+                    inr = bal.get("INR", 0)
 
-                signal = trade_signal(price)
-                bal = get_balances()
+                    if signal and inr > MIN_RESERVE:
+                        usable = inr - MIN_RESERVE
+                        trade_capital = usable * RISK_PER_TRADE
+                        qty = round(trade_capital / price, 6)
 
-                inr = bal.get("INR", 0)
+                        res = place_order(signal, qty)
+                        
+                        if res and "id" in res: # Confirm order success
+                            vol = volatility()
+                            tp = price + vol * 2 if signal == "BUY" else price - vol * 2
+                            sl = price - vol if signal == "BUY" else price + vol
+                            entry = (signal, qty, tp, sl)
 
-                if signal and inr > MIN_RESERVE:
-
-                    usable = inr - MIN_RESERVE
-                    trade_capital = usable * RISK_PER_TRADE
-
-                    qty = round(trade_capital / price, 6)
-
-                    res = place_order(signal, qty)
-
-                    vol = volatility()
-
-                    tp = price + vol * 2 if signal == "BUY" else price - vol * 2
-                    sl = price - vol if signal == "BUY" else price + vol
-
-                    entry = (signal, qty, tp, sl)
-
-            status["msg"] = "Running"
+            status["msg"] = "Running" if not entry else f"In Trade ({entry[0]})"
             status["last"] = ist_now()
 
         except Exception as e:
-            error_message = str(e)
+            error_message = f"Loop Error: {str(e)}"
 
         time.sleep(5)
 
@@ -215,17 +229,20 @@ def ping():
     return "pong"
     
 def self_keepalive():
+    """Prevents Render from sleeping."""
     while True:
         try:
-            requests.get("https://coin-4k37.onrender.com")
+            # Replace with your actual Render URL
+            requests.get("https://coin-4k37.onrender.com", timeout=10)
         except:
             pass
         time.sleep(240)
 
 threading.Thread(target=self_keepalive, daemon=True).start()
-    
 
 # ========= RUN =========
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    # Ensure port is an integer for Render
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
