@@ -1,15 +1,140 @@
-<h2>CoinDCX BTCINR Bot</h2>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>BTCINR MAX-PRO Bot</title>
 
-<button onclick="fetch('/start',{method:'POST'})">Start</button>
-<button onclick="fetch('/stop',{method:'POST'})">Stop</button>
+<style>
+body {
+    background:#0b0f17;
+    color:#e6edf3;
+    font-family:Segoe UI, Arial;
+    text-align:center;
+}
 
-<pre id="status"></pre>
+.container {
+    width:420px;
+    margin:auto;
+    margin-top:40px;
+    padding:25px;
+    background:#121826;
+    border-radius:14px;
+    box-shadow:0 0 20px rgba(0,0,0,0.6);
+}
+
+h1 { margin-bottom:5px; }
+.subtitle { color:#9aa4b2; margin-bottom:20px; }
+
+button {
+    padding:12px 28px;
+    margin:10px;
+    border:none;
+    border-radius:8px;
+    font-size:16px;
+    cursor:pointer;
+    font-weight:bold;
+}
+
+.start { background:#16a34a; color:white; }
+.stop { background:#dc2626; color:white; }
+
+.card {
+    margin-top:18px;
+    padding:14px;
+    background:#1a2235;
+    border-radius:10px;
+    text-align:left;
+}
+
+.label { color:#9aa4b2; }
+.value { font-size:18px; margin-top:4px; }
+
+.running { color:#22c55e; font-weight:bold; }
+.idle { color:#f87171; font-weight:bold; }
+
+.footer {
+    margin-top:20px;
+    font-size:12px;
+    color:#6b7280;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>BTCINR MAX-PRO</h1>
+<div class="subtitle">Institutional Trading Bot</div>
+
+<button class="start" onclick="startBot()">START</button>
+<button class="stop" onclick="stopBot()">STOP</button>
+
+<div class="card">
+    <div class="label">Status</div>
+    <div id="status" class="value idle">Idle</div>
+</div>
+
+<div class="card">
+    <div class="label">Last Update</div>
+    <div id="last" class="value">--:--:--</div>
+</div>
+
+<div class="card">
+    <div class="label">INR Balance</div>
+    <div id="inr" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">BTC Balance</div>
+    <div id="btc" class="value">0</div>
+</div>
+
+<div class="card">
+    <div class="label">Error</div>
+    <div id="error" class="value">None</div>
+</div>
+
+<div class="footer">MAX-PRO AI Engine</div>
+
+</div>
 
 <script>
-setInterval(async ()=>{
-  let r = await fetch('/status')
-  let j = await r.json()
-  document.getElementById('status').textContent =
-    JSON.stringify(j,null,2)
-},2000)
+
+function startBot() {
+    fetch("/start", {method:"POST"});
+}
+
+function stopBot() {
+    fetch("/stop", {method:"POST"});
+}
+
+function updateStatus() {
+    fetch("/status")
+    .then(r => r.json())
+    .then(data => {
+
+        const st = document.getElementById("status");
+
+        st.innerText = data.status;
+
+        if (data.status === "Running") {
+            st.className = "value running";
+        } else {
+            st.className = "value idle";
+        }
+
+        document.getElementById("last").innerText = data.last;
+        document.getElementById("inr").innerText = data.INR.toFixed(2);
+        document.getElementById("btc").innerText = data.BTC.toFixed(6);
+        document.getElementById("error").innerText = data.error || "None";
+    });
+}
+
+setInterval(updateStatus, 3000);
+updateStatus();
+
 </script>
+
+</body>
+</html>
