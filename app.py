@@ -1,36 +1,38 @@
-import os, time, threading, hmac, hashlib, requests, json
+import os, time, threading, hmac, hashlib, requests, json, statistics
 from flask import Flask, render_template, jsonify
 from datetime import datetime
 from pytz import timezone
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
+# ========= CONFIG =========
+
 API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET").encode()
 
 BASE_URL = "https://api.coindcx.com"
 PAIR = "BTCINR"
 
-CANDLE_INTERVAL = 15
-COOLDOWN_SECONDS = 60
-
 IST = timezone("Asia/Kolkata")
-def ist_now(): return datetime.now(IST).strftime("%H:%M:%S")
+
+def ist_now():
+    return datetime.now(IST).strftime("%H:%M:%S")
 
 running = False
 error_message = ""
 status = {"msg": "Idle", "last": ""}
 
-tick_log = []
-candles = []
+prices = []
+entry = None
+cooldown_until = 0
 
-# ----- Position State -----
-position = None      # None or "LONG"
-entry_price = None
-last_trade_time = 0
+# Risk parameters
+RISK_PER_TRADE = 0.08      # 8% of INR capital
+MIN_RESERVE = 200          # Keep ₹200 untouched
+COOLDOWN_SEC = 120         # 2-minute pause after exit
 
-# ===== AUTH =====
+# ========= AUTH =========
+
 def sign(payload):
     return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
@@ -44,13 +46,15 @@ def signed_post(url, body):
     r = requests.post(url, headers=headers, data=payload, timeout=10)
     return r.json() if r.ok else {}
 
-# ===== PORTFOLIO =====
+# ========= PORTFOLIO =========
+
 def get_balances():
-    body = {"timestamp": int(time.time() * 1000)}
+    body = {"timestamp": int(time.time()*1000)}
     data = signed_post(f"{BASE_URL}/exchange/v1/users/balances", body)
     return {x["currency"]: float(x["balance"]) for x in data}
 
-# ===== MARKET =====
+# ========= MARKET =========
+
 def get_price():
     r = requests.get(f"{BASE_URL}/exchange/ticker")
     if r.ok:
@@ -59,96 +63,54 @@ def get_price():
                 return float(x["last_price"])
     return None
 
-# ===== CANDLE BUILD =====
-def update_candles(price):
-    now = int(time.time())
-    tick_log.append((now, price))
+# ========= VOLATILITY =========
 
-    window = now - (now % CANDLE_INTERVAL)
+def volatility():
+    if len(prices) < 20:
+        return 0
+    returns = [prices[i] - prices[i-1] for i in range(-20, -1)]
+    return statistics.pstdev(returns)
 
-    if not candles or candles[-1]["start"] != window:
-        candles.append({
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price,
-            "start": window
-        })
-    else:
-        c = candles[-1]
-        c["high"] = max(c["high"], price)
-        c["low"] = min(c["low"], price)
-        c["close"] = price
+# ========= SIGNAL ENGINE =========
 
-    if len(candles) > 100:
-        candles.pop(0)
+def trade_signal(price):
 
-# ===== REAL PSAR SIGNAL =====
-def psar_signal():
-    if len(candles) < 10:
+    if len(prices) < 30:
         return None
 
-    af = 0.02
-    max_af = 0.2
+    short = sum(prices[-5:]) / 5
+    long = sum(prices[-20:]) / 20
+    vol = volatility()
 
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
+    # Regime filter: avoid dead markets
+    if vol < 5:
+        return None
 
-    psar = lows[0]
-    bull = True
-    ep = highs[0]
-
-    for i in range(1, len(candles)):
-        prev_psar = psar
-
-        if bull:
-            psar = prev_psar + af * (ep - prev_psar)
-            if lows[i] < psar:
-                bull = False
-                psar = ep
-                ep = lows[i]
-                af = 0.02
-        else:
-            psar = prev_psar + af * (ep - prev_psar)
-            if highs[i] > psar:
-                bull = True
-                psar = ep
-                ep = highs[i]
-                af = 0.02
-
-        if bull:
-            if highs[i] > ep:
-                ep = highs[i]
-                af = min(af + 0.02, max_af)
-        else:
-            if lows[i] < ep:
-                ep = lows[i]
-                af = min(af + 0.02, max_af)
-
-    last_close = candles[-1]["close"]
-
-    if last_close > psar:
+    # Momentum breakout
+    if short > long and price > max(prices[-10:-1]):
         return "BUY"
-    elif last_close < psar:
+
+    if short < long and price < min(prices[-10:-1]):
         return "SELL"
 
     return None
 
-# ===== ORDER =====
+# ========= ORDER =========
+
 def place_order(side, qty):
     body = {
         "market": PAIR,
         "side": side.lower(),
         "order_type": "market_order",
         "total_quantity": str(qty),
-        "timestamp": int(time.time() * 1000)
+        "timestamp": int(time.time()*1000)
     }
     return signed_post(f"{BASE_URL}/exchange/v1/orders/create", body)
 
-# ===== ENGINE =====
+# ========= ENGINE =========
+
 def bot_loop():
-    global running, error_message
-    global position, entry_price, last_trade_time
+    global running, error_message, entry, cooldown_until
 
     while running:
         try:
@@ -157,54 +119,68 @@ def bot_loop():
                 time.sleep(5)
                 continue
 
-            update_candles(price)
+            prices.append(price)
+            if len(prices) > 200:
+                prices.pop(0)
+
             now = time.time()
 
-            # ----- EXIT LOGIC -----
-            if position == "LONG":
-                if price >= entry_price * 1.01 or price <= entry_price * 0.995:
-                    bal = get_balances()
-                    btc_qty = bal.get("BTC", 0)
+            # ===== ACTIVE TRADE =====
+            if entry:
 
-                    if btc_qty > 0.00001:
-                        res = place_order("sell", btc_qty)
+                side, qty, tp, sl = entry
 
-                        if res:
-                            position = None
-                            entry_price = None
-                            last_trade_time = now
-                            status["msg"] = f"Exited @ {price}"
+                if side == "BUY":
+                    if price >= tp or price <= sl:
+                        place_order("SELL", qty)
+                        entry = None
+                        cooldown_until = now + COOLDOWN_SEC
 
-            # ----- ENTRY LOGIC -----
-            elif position is None and (now - last_trade_time > COOLDOWN_SECONDS):
-                signal = psar_signal()
+                else:
+                    if price <= tp or price >= sl:
+                        place_order("BUY", qty)
+                        entry = None
+                        cooldown_until = now + COOLDOWN_SEC
+
+            # ===== NEW TRADE =====
+            else:
+
+                if now < cooldown_until:
+                    continue
+
+                signal = trade_signal(price)
                 bal = get_balances()
+
                 inr = bal.get("INR", 0)
 
-                if signal == "BUY" and inr > 200:
-                    qty = round((0.1 * inr) / price, 6)
-                    res = place_order("buy", qty)
+                if signal and inr > MIN_RESERVE:
 
-                    if res:
-                        position = "LONG"
-                        entry_price = price
-                        last_trade_time = now
-                        status["msg"] = f"Entered LONG @ {price}"
+                    usable = inr - MIN_RESERVE
+                    trade_capital = usable * RISK_PER_TRADE
 
+                    qty = round(trade_capital / price, 6)
+
+                    res = place_order(signal, qty)
+
+                    vol = volatility()
+
+                    tp = price + vol * 2 if signal == "BUY" else price - vol * 2
+                    sl = price - vol if signal == "BUY" else price + vol
+
+                    entry = (signal, qty, tp, sl)
+
+            status["msg"] = "Running"
             status["last"] = ist_now()
 
         except Exception as e:
             error_message = str(e)
 
-        # responsive stop
-        for _ in range(5):
-            if not running:
-                break
-            time.sleep(1)
+        time.sleep(5)
 
     status["msg"] = "Idle"
 
-# ===== UI ROUTES =====
+# ========= ROUTES =========
+
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -237,6 +213,8 @@ def stat():
 @app.route("/ping")
 def ping():
     return "pong"
+
+# ========= RUN =========
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
