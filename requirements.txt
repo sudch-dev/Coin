@@ -3,3 +3,4 @@ requests
 gunicorn
 pandas
 pandas_ta
+pytz
