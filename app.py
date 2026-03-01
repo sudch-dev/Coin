@@ -1,15 +1,24 @@
 import os
 import time
+import json
+import hmac
+import hashlib
 import threading
 import logging
 import requests
 import pandas as pd
 import pandas_ta as ta
-from flask import Flask, jsonify
+
+from flask import Flask, jsonify, request, render_template
 
 # ==============================
-# BASIC CONFIG
+# ENV CONFIG
 # ==============================
+
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+KEEPALIVE_TOKEN = os.getenv("KEEPALIVE_TOKEN", "secret")
+FORCE_LIQUIDATE = os.getenv("FORCE_LIQUIDATE_ON_NEED") == "1"
 
 SYMBOL = "BTCUSDT"
 INTERVAL = "1m"
@@ -21,37 +30,73 @@ PORT = int(os.environ.get("PORT", 10000))
 # LOGGING
 # ==============================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==============================
-# FLASK APP (IMPORTANT FOR GUNICORN)
+# FLASK APP
 # ==============================
 
 app = Flask(__name__)
 
+bot_state = {
+    "running": True,
+    "last_signal": "NONE",
+    "last_trade": "NONE"
+}
+
 # ==============================
-# FETCH CANDLE DATA
+# COINDCX AUTH
+# ==============================
+
+def sign_payload(payload):
+    payload_json = json.dumps(payload, separators=(',', ':'))
+    signature = hmac.new(
+        API_SECRET.encode(),
+        payload_json.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return payload_json, signature
+
+# ==============================
+# PLACE ORDER
+# ==============================
+
+def place_order(side, price, quantity):
+    body = {
+        "side": side,
+        "order_type": "limit_order",
+        "price": price,
+        "quantity": quantity,
+        "market": SYMBOL,
+        "timestamp": int(time.time() * 1000)
+    }
+
+    payload, signature = sign_payload(body)
+
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": signature,
+        "Content-Type": "application/json"
+    }
+
+    url = f"{BASE_URL}/exchange/v1/orders/create"
+
+    response = requests.post(url, data=payload, headers=headers)
+
+    return response.json()
+
+# ==============================
+# FETCH CANDLES
 # ==============================
 
 def fetch_candles():
     try:
         url = f"{BASE_URL}/exchange/v1/candles?pair={SYMBOL}&interval={INTERVAL}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-
-        if not data:
-            return None
+        data = requests.get(url, timeout=10).json()
 
         df = pd.DataFrame(data)
-
-        # Rename columns properly if needed
         df.columns = ["time", "open", "high", "low", "close", "volume"]
-
         df["close"] = df["close"].astype(float)
 
         return df.tail(100)
@@ -60,87 +105,104 @@ def fetch_candles():
         logger.error(f"Fetch Error: {e}")
         return None
 
-
 # ==============================
-# SIGNAL LOGIC
+# SIGNAL ENGINE
 # ==============================
 
-def get_live_signals():
-    try:
-        df = fetch_candles()
-        if df is None or len(df) < 30:
-            return "HOLD"
+def get_signal():
+    df = fetch_candles()
+    if df is None or len(df) < 30:
+        return "HOLD"
 
-        df['ema_fast'] = ta.ema(df['close'], length=9)
-        df['ema_slow'] = ta.ema(df['close'], length=21)
-        df['rsi'] = ta.rsi(df['close'], length=14)
+    df['ema_fast'] = ta.ema(df['close'], length=9)
+    df['ema_slow'] = ta.ema(df['close'], length=21)
+    df['rsi'] = ta.rsi(df['close'], length=14)
 
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-        # BUY Condition
-        if prev['ema_fast'] <= prev['ema_slow'] and last['ema_fast'] > last['ema_slow']:
-            if 50 < last['rsi'] < 70:
-                return "BUY"
+    if prev['ema_fast'] <= prev['ema_slow'] and last['ema_fast'] > last['ema_slow']:
+        if 50 < last['rsi'] < 70:
+            return "BUY"
 
-        # SELL Condition
-        if prev['ema_fast'] >= prev['ema_slow'] and last['ema_fast'] < last['ema_slow']:
-            return "SELL"
-
-    except Exception as e:
-        logger.error(f"Signal Error: {e}")
+    if prev['ema_fast'] >= prev['ema_slow'] and last['ema_fast'] < last['ema_slow']:
+        return "SELL"
 
     return "HOLD"
 
-
 # ==============================
-# MAIN BOT LOOP
+# TRADING LOOP
 # ==============================
 
-def automation_loop():
-    logger.info("Trading bot started...")
+def trading_loop():
+    logger.info("Bot started")
+
     while True:
-        try:
-            signal = get_live_signals()
+        if bot_state["running"]:
 
-            if signal != "HOLD":
-                logger.info(f"SIGNAL DETECTED: {signal}")
-                # execute_trade(signal)  # Add your order logic here
+            signal = get_signal()
+            bot_state["last_signal"] = signal
 
-            time.sleep(60)
+            if signal == "BUY":
+                logger.info("BUY signal")
+                bot_state["last_trade"] = "BUY"
+                # place_order("buy", price, quantity)
 
-        except Exception as e:
-            logger.error(f"Loop Error: {e}")
-            time.sleep(10)
+            elif signal == "SELL":
+                logger.info("SELL signal")
+                bot_state["last_trade"] = "SELL"
 
+        time.sleep(60)
 
-# ==============================
-# BACKGROUND THREAD
-# ==============================
-
-def start_bot():
-    thread = threading.Thread(target=automation_loop)
-    thread.daemon = True
-    thread.start()
-
-start_bot()
+# Start background thread
+threading.Thread(target=trading_loop, daemon=True).start()
 
 # ==============================
-# HEALTH CHECK ROUTES
+# ROUTES
 # ==============================
 
 @app.route("/")
-def home():
-    return "CoinDCX Trading Bot Running 🚀"
+def dashboard():
+    return render_template("index.html", state=bot_state)
 
 @app.route("/health")
 def health():
     return jsonify({"status": "running"})
 
+@app.route("/status")
+def status():
+    return jsonify(bot_state)
+
+@app.route("/pause")
+def pause():
+    token = request.args.get("token")
+    if token != KEEPALIVE_TOKEN:
+        return "Unauthorized", 401
+
+    bot_state["running"] = False
+    return "Bot paused"
+
+@app.route("/resume")
+def resume():
+    token = request.args.get("token")
+    if token != KEEPALIVE_TOKEN:
+        return "Unauthorized", 401
+
+    bot_state["running"] = True
+    return "Bot resumed"
+
+@app.route("/liquidate")
+def liquidate():
+    token = request.args.get("token")
+    if token != KEEPALIVE_TOKEN:
+        return "Unauthorized", 401
+
+    if FORCE_LIQUIDATE:
+        return "Liquidation triggered"
+    return "Liquidation disabled"
 
 # ==============================
-# DO NOT USE app.run() ON RENDER
-# Gunicorn will serve this app
+# LOCAL RUN (not used on Render)
 # ==============================
 
 if __name__ == "__main__":
