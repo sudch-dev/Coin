@@ -1,21 +1,108 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>CoinDCX Trading Bot</title>
+    <title>Trading Bot Dashboard</title>
+
     <style>
-        body { font-family: Arial; background:#111; color:#eee; text-align:center; }
-        .card { margin:40px auto; padding:20px; width:400px; background:#222; border-radius:10px; }
-        h1 { color:#00ffcc; }
+        body {
+            background: #0f172a;
+            color: white;
+            font-family: Arial;
+            text-align: center;
+        }
+
+        .container {
+            margin-top: 60px;
+        }
+
+        .card {
+            background: #1e293b;
+            padding: 25px;
+            border-radius: 12px;
+            width: 420px;
+            margin: auto;
+            box-shadow: 0 0 20px rgba(0,0,0,0.6);
+        }
+
+        h1 {
+            color: #22c55e;
+        }
+
+        .value {
+            font-size: 22px;
+            margin: 10px 0;
+        }
+
+        .price {
+            font-size: 28px;
+            color: #38bdf8;
+        }
+
+        .running {
+            color: #22c55e;
+        }
+
+        .stopped {
+            color: #ef4444;
+        }
+
+        button {
+            margin: 8px;
+            padding: 10px 18px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        .pause { background: #ef4444; }
+        .resume { background: #22c55e; }
     </style>
+
+    <script>
+        async function update() {
+            const res = await fetch('/status');
+            const data = await res.json();
+
+            document.getElementById("running").innerText = data.running;
+            document.getElementById("signal").innerText = data.last_signal;
+            document.getElementById("trade").innerText = data.last_trade;
+            document.getElementById("price").innerText = data.price;
+        }
+
+        setInterval(update, 3000);
+    </script>
+
 </head>
-<body>
 
-<div class="card">
-    <h1>🚀 CoinDCX Bot</h1>
+<body onload="update()">
 
-    <p><b>Running:</b> {{ state.running }}</p>
-    <p><b>Last Signal:</b> {{ state.last_signal }}</p>
-    <p><b>Last Trade:</b> {{ state.last_trade }}</p>
+<div class="container">
+
+    <div class="card">
+        <h1>🚀 CoinDCX Bot</h1>
+
+        <div class="value">
+            Status:
+            <span id="running"></span>
+        </div>
+
+        <div class="value">
+            Price:
+            <span id="price" class="price"></span>
+        </div>
+
+        <div class="value">
+            Last Signal:
+            <span id="signal"></span>
+        </div>
+
+        <div class="value">
+            Last Trade:
+            <span id="trade"></span>
+        </div>
+
+    </div>
 
 </div>
 
