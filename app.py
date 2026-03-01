@@ -213,6 +213,17 @@ def stat():
 @app.route("/ping")
 def ping():
     return "pong"
+    
+def self_keepalive():
+    while True:
+        try:
+            requests.get("https://coin-4k37.onrender.com")
+        except:
+            pass
+        time.sleep(240)
+
+threading.Thread(target=self_keepalive, daemon=True).start()
+    
 
 # ========= RUN =========
 
