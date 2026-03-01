@@ -1,128 +1,208 @@
 import os
 import time
-import threading
+import hmac
+import json
+import hashlib
 import logging
 import requests
-import pandas as pd
-import pandas_ta as ta
-from flask import Flask, render_template, jsonify
+from flask import Flask, jsonify
+
+# ===============================
+# CONFIG
+# ===============================
+
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+
+BASE_URL = "https://api.coindcx.com"
+
+SYMBOL = "BTCUSDT"
+TRADE_AMOUNT_USDT = 10
+
+# ===============================
+# LOGGING
+# ===============================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+# ===============================
+# FLASK APP
+# ===============================
 
 app = Flask(__name__)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("coinbot")
+bot_status = {
+    "running": False,
+    "last_price": None,
+    "last_action": "NONE",
+    "pnl": 0
+}
 
-SYMBOL = "BTCUSDT"
-BASE = "https://public.coindcx.com"
+# ===============================
+# AUTH HELPERS
+# ===============================
 
-latest_signal = "HOLD"
+def sign(payload):
+    signature = hmac.new(
+        API_SECRET.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return signature
 
+def private_post(endpoint, body):
+    payload = json.dumps(body, separators=(',', ':'))
 
-# -----------------------------
-# Fetch market data
-# -----------------------------
-def fetch_candles():
-    url = f"{BASE}/market_data/candles?pair={SYMBOL}&interval=1m"
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sign(payload),
+        "Content-Type": "application/json"
+    }
 
-    try:
-        r = requests.get(url, timeout=10)
+    r = requests.post(BASE_URL + endpoint, data=payload, headers=headers)
+    return r.json()
 
-        if r.status_code != 200:
-            raise Exception("Bad API status")
+# ===============================
+# MARKET DATA
+# ===============================
 
-        data = r.json()
+def get_price():
+    url = f"{BASE_URL}/exchange/ticker"
+    r = requests.get(url)
 
-        if not isinstance(data, list) or len(data) == 0:
-            raise Exception("Empty candle data")
+    data = r.json()
 
-        df = pd.DataFrame(data)
+    for coin in data:
+        if coin["market"] == SYMBOL:
+            return float(coin["last_price"])
 
-        df.rename(columns={
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume"
-        }, inplace=True)
+    return None
 
-        df["close"] = df["close"].astype(float)
+# ===============================
+# ORDER FUNCTIONS
+# ===============================
 
-        return df.tail(100)
+def place_market_order(side):
+    body = {
+        "side": side,
+        "order_type": "market_order",
+        "market": SYMBOL,
+        "total_quantity": TRADE_AMOUNT_USDT,
+        "timestamp": int(time.time() * 1000)
+    }
 
-    except Exception as e:
-        logger.error(f"Fetch Error: {e}")
-        return None
+    return private_post("/exchange/v1/orders/create", body)
 
+# ===============================
+# SIMPLE STRATEGY
+# ===============================
 
-# -----------------------------
-# Signal logic
-# -----------------------------
-def get_live_signals():
-    global latest_signal
+last_price = None
 
-    df = fetch_candles()
-    if df is None or len(df) < 30:
-        return "HOLD"
+def strategy_loop():
+    global last_price
 
-    df["ema_fast"] = ta.ema(df["close"], length=9)
-    df["ema_slow"] = ta.ema(df["close"], length=21)
-    df["rsi"] = ta.rsi(df["close"], length=14)
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
-        if 50 < last["rsi"] < 70:
-            latest_signal = "BUY"
-            return "BUY"
-
-    if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]:
-        latest_signal = "SELL"
-        return "SELL"
-
-    latest_signal = "HOLD"
-    return "HOLD"
-
-
-# -----------------------------
-# Background loop
-# -----------------------------
-def automation_loop():
     while True:
-        signal = get_live_signals()
+        try:
+            price = get_price()
 
-        if signal != "HOLD":
-            logger.info(f"SIGNAL: {signal}")
+            if price is None:
+                time.sleep(10)
+                continue
 
-        time.sleep(60)
+            bot_status["last_price"] = price
 
+            if last_price:
+                change = (price - last_price) / last_price
 
-# Start bot thread
-threading.Thread(target=automation_loop, daemon=True).start()
+                # BUY condition
+                if change < -0.002:
+                    place_market_order("buy")
+                    bot_status["last_action"] = "BUY"
 
+                # SELL condition
+                elif change > 0.002:
+                    place_market_order("sell")
+                    bot_status["last_action"] = "SELL"
 
-# -----------------------------
-# Routes
-# -----------------------------
+            last_price = price
+
+        except Exception as e:
+            logging.error(f"Bot error: {e}")
+
+        time.sleep(15)
+
+# ===============================
+# BACKGROUND BOT START
+# ===============================
+
+from threading import Thread
+
+def start_bot():
+    if not bot_status["running"]:
+        bot_status["running"] = True
+        Thread(target=strategy_loop, daemon=True).start()
+
+# ===============================
+# ROUTES
+# ===============================
+
 @app.route("/")
 def home():
-    return render_template("index.html")
+    return f"""
+    <html>
+    <head>
+        <title>CoinDCX Pro Bot</title>
+        <style>
+            body {{
+                background:#0f172a;
+                color:#e2e8f0;
+                font-family:Arial;
+                text-align:center;
+                padding-top:60px;
+            }}
+            .card {{
+                background:#1e293b;
+                padding:30px;
+                border-radius:12px;
+                display:inline-block;
+            }}
+            h1 {{color:#38bdf8;}}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🚀 CoinDCX Pro Bot</h1>
+            <p>Status: {"RUNNING" if bot_status["running"] else "STOPPED"}</p>
+            <p>Last Price: {bot_status["last_price"]}</p>
+            <p>Last Action: {bot_status["last_action"]}</p>
+            <p><a href="/start" style="color:#22c55e;">Start Bot</a></p>
+            <p><a href="/status" style="color:#facc15;">API Status</a></p>
+        </div>
+    </body>
+    </html>
+    """
 
+@app.route("/start")
+def start():
+    start_bot()
+    return jsonify({"message": "Bot started"})
 
-@app.route("/api/status")
+@app.route("/status")
 def status():
-    return jsonify({
-        "signal": latest_signal,
-        "symbol": SYMBOL
-    })
-
+    return jsonify(bot_status)
 
 @app.route("/health")
 def health():
     return "OK", 200
 
+# ===============================
+# RENDER PORT HANDLING
+# ===============================
 
-# Render port binding
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
