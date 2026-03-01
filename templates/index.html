@@ -1,110 +1,68 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Trading Bot Dashboard</title>
+    <title>Crypto Signal Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 
     <style>
         body {
+            font-family: Arial;
             background: #0f172a;
             color: white;
-            font-family: Arial;
             text-align: center;
-        }
-
-        .container {
-            margin-top: 60px;
+            padding-top: 40px;
         }
 
         .card {
             background: #1e293b;
-            padding: 25px;
-            border-radius: 12px;
-            width: 420px;
+            width: 320px;
             margin: auto;
-            box-shadow: 0 0 20px rgba(0,0,0,0.6);
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
         }
 
-        h1 {
-            color: #22c55e;
+        h1 { margin-bottom: 10px; }
+
+        #signal {
+            font-size: 40px;
+            margin-top: 20px;
+            font-weight: bold;
         }
 
-        .value {
-            font-size: 22px;
-            margin: 10px 0;
-        }
-
-        .price {
-            font-size: 28px;
-            color: #38bdf8;
-        }
-
-        .running {
-            color: #22c55e;
-        }
-
-        .stopped {
-            color: #ef4444;
-        }
-
-        button {
-            margin: 8px;
-            padding: 10px 18px;
-            border: none;
-            border-radius: 6px;
-            font-size: 16px;
-            cursor: pointer;
-        }
-
-        .pause { background: #ef4444; }
-        .resume { background: #22c55e; }
+        .buy { color: #22c55e; }
+        .sell { color: #ef4444; }
+        .hold { color: #facc15; }
     </style>
-
-    <script>
-        async function update() {
-            const res = await fetch('/status');
-            const data = await res.json();
-
-            document.getElementById("running").innerText = data.running;
-            document.getElementById("signal").innerText = data.last_signal;
-            document.getElementById("trade").innerText = data.last_trade;
-            document.getElementById("price").innerText = data.price;
-        }
-
-        setInterval(update, 3000);
-    </script>
-
 </head>
 
-<body onload="update()">
+<body>
 
-<div class="container">
-
-    <div class="card">
-        <h1>🚀 CoinDCX Bot</h1>
-
-        <div class="value">
-            Status:
-            <span id="running"></span>
-        </div>
-
-        <div class="value">
-            Price:
-            <span id="price" class="price"></span>
-        </div>
-
-        <div class="value">
-            Last Signal:
-            <span id="signal"></span>
-        </div>
-
-        <div class="value">
-            Last Trade:
-            <span id="trade"></span>
-        </div>
-
-    </div>
-
+<div class="card">
+    <h1>📈 Signal Bot</h1>
+    <p id="symbol">Loading...</p>
+    <div id="signal">...</div>
 </div>
+
+<script>
+async function update() {
+    const r = await fetch("/api/status");
+    const d = await r.json();
+
+    document.getElementById("symbol").innerText = d.symbol;
+
+    const el = document.getElementById("signal");
+    el.innerText = d.signal;
+
+    el.className =
+        d.signal === "BUY" ? "buy" :
+        d.signal === "SELL" ? "sell" :
+        "hold";
+}
+
+setInterval(update, 3000);
+update();
+</script>
 
 </body>
 </html>
