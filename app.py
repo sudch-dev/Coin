@@ -1,293 +1,187 @@
-import os
-import time
-import threading
-import requests
-import hmac
-import hashlib
-import json
-import pandas as pd
-import pandas_ta as ta
-from flask import Flask, jsonify, render_template_string
-
-# ================= ENV CONFIG =================
-
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-
-if not API_KEY or not API_SECRET:
-    raise Exception("API_KEY and API_SECRET must be set in environment variables")
-
-BASE = "https://api.coindcx.com"
-SYMBOL = "BTCINR"
-
-TRADE_INR = 1000          # INR per trade
-PROFIT_TARGET = 0.01      # 1%
-
-# ================= GLOBAL STATE =================
-
-bot_running = False
-status = "Stopped"
-last_error = ""
-last_action = "None"
-entry_price = 0
-
-# ================= AUTH =================
-
-def sign(payload):
-    body = json.dumps(payload, separators=(',', ':'))
-    signature = hmac.new(
-        API_SECRET.encode(),
-        body.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    return body, signature
-
-def private_api(endpoint, payload):
-    payload["timestamp"] = int(time.time() * 1000)
-    body, signature = sign(payload)
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature
-    }
-
-    r = requests.post(BASE + endpoint, data=body, headers=headers, timeout=10)
-    return r.json()
-
-# ================= MARKET DATA =================
-
-def get_price():
-    r = requests.get(f"{BASE}/exchange/ticker", timeout=10)
-    for t in r.json():
-        if t["market"] == SYMBOL:
-            return float(t["last_price"])
-    return None
-
-def get_candles():
-    url = f"{BASE}/exchange/v1/candles?pair={SYMBOL}&interval=1m"
-    res = requests.get(url, timeout=10)
-    data = res.json()
-
-    # FIX: Check if data is a list to avoid "scalar values" index error
-    if not isinstance(data, list):
-        raise Exception(f"API Error: {data}")
-
-    df = pd.DataFrame(data)
-    
-    # Ensure columns exist before assignment
-    df.columns = ["time","open","high","low","close","volume"]
-    
-    # FIX: Robust numeric conversion
-    df["close"] = pd.to_numeric(df["close"], errors='coerce')
-    return df
-
-# ================= ACCOUNT =================
-
-def get_balances():
-    data = private_api("/exchange/v1/users/balances", {})
-    # Handle cases where API might return an error message instead of list
-    if isinstance(data, list):
-        return {b["currency"]: float(b["balance"]) for b in data}
-    return {"Error": "Could not fetch balances"}
-
-def get_orders():
-    return private_api("/exchange/v1/orders/active_orders", {})
-
-def get_trades():
-    return private_api("/exchange/v1/orders/trade_history", {"limit": 10})
-
-# ================= ORDER =================
-
-def place_order(side, price):
-    global last_action
-
-    qty = round(TRADE_INR / price, 6)
-
-    payload = {
-        "side": side,
-        "order_type": "market_order",
-        "market": SYMBOL,
-        "total_quantity": qty
-    }
-
-    res = private_api("/exchange/v1/orders/create", payload)
-
-    if isinstance(res, dict) and "id" in res:
-        last_action = f"{side.upper()} @ ₹{price:.0f}"
-    else:
-        raise Exception(str(res))
-
-# ================= STRATEGY =================
-
-def strategy():
-    global entry_price
-
-    df = get_candles()
-
-    df["ema_fast"] = ta.ema(df["close"], length=9)
-    df["ema_slow"] = ta.ema(df["close"], length=21)
-    df["rsi"] = ta.rsi(df["close"], length=14)
-
-    last = df.iloc[-1]
-
-    price = last["close"]
-    fast = last["ema_fast"]
-    slow = last["ema_slow"]
-    rsi = last["rsi"]
-
-    bal = get_balances()
-    inr = bal.get("INR", 0)
-    btc = bal.get("BTC", 0)
-
-    # ===== BUY =====
-    if btc < 0.0001:
-        if fast > slow and 45 < rsi < 65 and inr > TRADE_INR:
-            place_order("buy", price)
-            entry_price = price
-
-    # ===== SELL =====
-    else:
-        # Avoid division by zero if entry_price isn't set
-        if entry_price == 0:
-            entry_price = price 
-            
-        profit = (price - entry_price) / entry_price
-
-        if rsi > 72 or fast < slow or profit > PROFIT_TARGET:
-            place_order("sell", price)
-            entry_price = 0
-
-# ================= BOT LOOP =================
-
-def bot_loop():
-    global bot_running, status, last_error
-
-    status = "Running"
-
-    while bot_running:
-        try:
-            strategy()
-            last_error = ""
-        except Exception as e:
-            last_error = str(e)
-            status = "Error"
-
-        time.sleep(60)
-
-    status = "Stopped"
-
-# ================= UI =================
+import os, time, threading, hmac, hashlib, requests, json
+from flask import Flask, render_template, jsonify
+from datetime import datetime
+from pytz import timezone
+from collections import deque
 
 app = Flask(__name__)
 
-UI = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>BTCINR Pro Bot</title>
-<style>
-body{background:#0f172a;color:white;font-family:Arial}
-.card{background:#1e293b;padding:20px;margin:20px;border-radius:12px}
-button{padding:12px 20px;font-size:16px;margin:5px;border:none;border-radius:8px;cursor:pointer}
-.start{background:#16a34a;color:white}
-.stop{background:#dc2626;color:white}
-pre{white-space:pre-wrap;background:#0f172a;padding:10px;border-radius:5px}
-</style>
-</head>
-<body>
+# ===== CONFIG =====
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET").encode()
 
-<h1>BTCINR Trading Bot</h1>
+BASE_URL = "https://api.coindcx.com"
+PAIR = "BTCINR"
 
-<div class="card">
-<h2>Status: <span id="status"></span></h2>
-<p>Last Action: <span id="action"></span></p>
-<p style="color:#f87171">Error: <span id="error"></span></p>
+CANDLE_INTERVAL = 15
+TRADE_COOLDOWN = 30
 
-<button class="start" onclick="fetch('/start')">START</button>
-<button class="stop" onclick="fetch('/stop')">STOP</button>
-</div>
+IST = timezone("Asia/Kolkata")
+def ist_now(): return datetime.now(IST).strftime("%H:%M:%S")
 
-<div class="card">
-<h2>Portfolio</h2>
-<pre id="portfolio"></pre>
-</div>
+running = False
+error_message = ""
+status = {"msg": "Idle", "last": ""}
 
-<div class="card">
-<h2>Orders</h2>
-<pre id="orders"></pre>
-</div>
+tick_log = []
+candles = []
+exit_order = None
 
-<div class="card">
-<h2>Trades</h2>
-<pre id="trades"></pre>
-</div>
+# ===== AUTH =====
+def sign(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
 
-<script>
-async function refresh(){
-  try {
-      const s = await fetch('/status').then(r=>r.json())
-      document.getElementById('status').innerText = s.status
-      document.getElementById('action').innerText = s.action
-      document.getElementById('error').innerText = s.error
+def signed_post(url, body):
+    payload = json.dumps(body)
+    headers = {
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": sign(payload),
+        "Content-Type": "application/json"
+    }
+    r = requests.post(url, headers=headers, data=payload, timeout=10)
+    return r.json() if r.ok else {}
 
-      document.getElementById('portfolio').innerText =
-        JSON.stringify(await fetch('/portfolio').then(r=>r.json()),null,2)
+# ===== PORTFOLIO =====
+def get_balances():
+    body = {"timestamp": int(time.time() * 1000)}
+    data = signed_post(f"{BASE_URL}/exchange/v1/users/balances", body)
+    return {x["currency"]: float(x["balance"]) for x in data}
 
-      document.getElementById('orders').innerText =
-        JSON.stringify(await fetch('/orders').then(r=>r.json()),null,2)
+# ===== MARKET =====
+def get_price():
+    r = requests.get(f"{BASE_URL}/exchange/ticker")
+    if r.ok:
+        for x in r.json():
+            if x["market"] == PAIR:
+                return float(x["last_price"])
+    return None
 
-      document.getElementById('trades').innerText =
-        JSON.stringify(await fetch('/trades').then(r=>r.json()),null,2)
-  } catch (e) { console.log("Refresh failed", e) }
-}
+# ===== CANDLE BUILD =====
+def update_candles(price):
+    now = int(time.time())
+    tick_log.append((now, price))
 
-setInterval(refresh, 5000)
-refresh()
-</script>
+    window = now - (now % CANDLE_INTERVAL)
 
-</body>
-</html>
-"""
+    if not candles or candles[-1]["start"] != window:
+        candles.append({
+            "open": price, "high": price,
+            "low": price, "close": price,
+            "start": window
+        })
+    else:
+        c = candles[-1]
+        c["high"] = max(c["high"], price)
+        c["low"] = min(c["low"], price)
+        c["close"] = price
 
+    if len(candles) > 100:
+        candles.pop(0)
+
+# ===== PSAR SIGNAL =====
+def psar_signal():
+    if len(candles) < 6:
+        return None
+
+    prev = candles[-3]["close"]
+    last = candles[-2]["close"]
+
+    if last > prev:
+        return "BUY"
+    elif last < prev:
+        return "SELL"
+
+    return None
+
+# ===== ORDER =====
+def place_order(side, qty):
+    body = {
+        "market": PAIR,
+        "side": side.lower(),
+        "order_type": "market_order",
+        "total_quantity": str(qty),
+        "timestamp": int(time.time() * 1000)
+    }
+    return signed_post(f"{BASE_URL}/exchange/v1/orders/create", body)
+
+# ===== ENGINE =====
+def bot_loop():
+    global running, error_message, exit_order
+
+    while running:
+        try:
+            price = get_price()
+            if not price:
+                time.sleep(5)
+                continue
+
+            update_candles(price)
+
+            if exit_order:
+                side, tp, sl, qty = exit_order
+                if (side == "BUY" and (price >= tp or price <= sl)) or \
+                   (side == "SELL" and (price <= tp or price >= sl)):
+                    place_order("SELL" if side == "BUY" else "BUY", qty)
+                    exit_order = None
+
+            else:
+                signal = psar_signal()
+                bal = get_balances()
+                inr = bal.get("INR", 0)
+
+                if signal and inr > 100:
+                    qty = round((0.1 * inr) / price, 6)
+
+                    res = place_order(signal, qty)
+
+                    tp = price * 1.01
+                    sl = price * 0.995
+
+                    exit_order = (signal, tp, sl, qty)
+
+            status["msg"] = "Running"
+            status["last"] = ist_now()
+
+        except Exception as e:
+            error_message = str(e)
+
+        time.sleep(5)
+
+    status["msg"] = "Idle"
+
+# ===== UI ROUTES =====
 @app.route("/")
 def home():
-    return render_template_string(UI)
+    return render_template("index.html")
 
-@app.route("/start")
+@app.route("/start", methods=["POST"])
 def start():
-    global bot_running
-    if not bot_running:
-        bot_running = True
-        threading.Thread(target=bot_loop).start()
-    return "Bot started"
+    global running
+    if not running:
+        running = True
+        threading.Thread(target=bot_loop, daemon=True).start()
+    return jsonify({"status": "started"})
 
-@app.route("/stop")
+@app.route("/stop", methods=["POST"])
 def stop():
-    global bot_running
-    bot_running = False
-    return "Bot stopped"
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
 
 @app.route("/status")
 def stat():
+    bal = get_balances()
     return jsonify({
-        "status": status,
-        "action": last_action,
-        "error": last_error
+        "status": status["msg"],
+        "last": status["last"],
+        "INR": bal.get("INR", 0),
+        "BTC": bal.get("BTC", 0),
+        "error": error_message
     })
 
-@app.route("/portfolio")
-def portfolio():
-    return jsonify(get_balances())
-
-@app.route("/orders")
-def orders():
-    return jsonify(get_orders())
-
-@app.route("/trades")
-def trades():
-    return jsonify(get_trades())
+@app.route("/ping")
+def ping():
+    return "pong"
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000)
