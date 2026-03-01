@@ -1,68 +1,15 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Crypto Signal Bot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+<h2>CoinDCX BTCINR Bot</h2>
 
-    <style>
-        body {
-            font-family: Arial;
-            background: #0f172a;
-            color: white;
-            text-align: center;
-            padding-top: 40px;
-        }
+<button onclick="fetch('/start',{method:'POST'})">Start</button>
+<button onclick="fetch('/stop',{method:'POST'})">Stop</button>
 
-        .card {
-            background: #1e293b;
-            width: 320px;
-            margin: auto;
-            padding: 25px;
-            border-radius: 15px;
-            box-shadow: 0 0 20px rgba(0,0,0,0.5);
-        }
-
-        h1 { margin-bottom: 10px; }
-
-        #signal {
-            font-size: 40px;
-            margin-top: 20px;
-            font-weight: bold;
-        }
-
-        .buy { color: #22c55e; }
-        .sell { color: #ef4444; }
-        .hold { color: #facc15; }
-    </style>
-</head>
-
-<body>
-
-<div class="card">
-    <h1>📈 Signal Bot</h1>
-    <p id="symbol">Loading...</p>
-    <div id="signal">...</div>
-</div>
+<pre id="status"></pre>
 
 <script>
-async function update() {
-    const r = await fetch("/api/status");
-    const d = await r.json();
-
-    document.getElementById("symbol").innerText = d.symbol;
-
-    const el = document.getElementById("signal");
-    el.innerText = d.signal;
-
-    el.className =
-        d.signal === "BUY" ? "buy" :
-        d.signal === "SELL" ? "sell" :
-        "hold";
-}
-
-setInterval(update, 3000);
-update();
+setInterval(async ()=>{
+  let r = await fetch('/status')
+  let j = await r.json()
+  document.getElementById('status').textContent =
+    JSON.stringify(j,null,2)
+},2000)
 </script>
-
-</body>
-</html>
