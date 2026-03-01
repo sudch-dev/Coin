@@ -66,19 +66,30 @@ def get_price():
 
 def get_candles():
     url = f"{BASE}/exchange/v1/candles?pair={SYMBOL}&interval=1m"
-    data = requests.get(url, timeout=10).json()
+    res = requests.get(url, timeout=10)
+    data = res.json()
+
+    # FIX: Check if data is a list to avoid "scalar values" index error
+    if not isinstance(data, list):
+        raise Exception(f"API Error: {data}")
 
     df = pd.DataFrame(data)
+    
+    # Ensure columns exist before assignment
     df.columns = ["time","open","high","low","close","volume"]
-    df["close"] = df["close"].astype(float)
+    
+    # FIX: Robust numeric conversion
+    df["close"] = pd.to_numeric(df["close"], errors='coerce')
     return df
 
 # ================= ACCOUNT =================
 
 def get_balances():
     data = private_api("/exchange/v1/users/balances", {})
-    bal = {b["currency"]: float(b["balance"]) for b in data}
-    return bal
+    # Handle cases where API might return an error message instead of list
+    if isinstance(data, list):
+        return {b["currency"]: float(b["balance"]) for b in data}
+    return {"Error": "Could not fetch balances"}
 
 def get_orders():
     return private_api("/exchange/v1/orders/active_orders", {})
@@ -102,7 +113,7 @@ def place_order(side, price):
 
     res = private_api("/exchange/v1/orders/create", payload)
 
-    if "id" in res:
+    if isinstance(res, dict) and "id" in res:
         last_action = f"{side.upper()} @ ₹{price:.0f}"
     else:
         raise Exception(str(res))
@@ -137,6 +148,10 @@ def strategy():
 
     # ===== SELL =====
     else:
+        # Avoid division by zero if entry_price isn't set
+        if entry_price == 0:
+            entry_price = price 
+            
         profit = (price - entry_price) / entry_price
 
         if rsi > 72 or fast < slow or profit > PROFIT_TARGET:
@@ -174,10 +189,10 @@ UI = """
 <style>
 body{background:#0f172a;color:white;font-family:Arial}
 .card{background:#1e293b;padding:20px;margin:20px;border-radius:12px}
-button{padding:12px 20px;font-size:16px;margin:5px;border:none;border-radius:8px}
+button{padding:12px 20px;font-size:16px;margin:5px;border:none;border-radius:8px;cursor:pointer}
 .start{background:#16a34a;color:white}
 .stop{background:#dc2626;color:white}
-pre{white-space:pre-wrap}
+pre{white-space:pre-wrap;background:#0f172a;padding:10px;border-radius:5px}
 </style>
 </head>
 <body>
@@ -187,7 +202,7 @@ pre{white-space:pre-wrap}
 <div class="card">
 <h2>Status: <span id="status"></span></h2>
 <p>Last Action: <span id="action"></span></p>
-<p>Error: <span id="error"></span></p>
+<p style="color:#f87171">Error: <span id="error"></span></p>
 
 <button class="start" onclick="fetch('/start')">START</button>
 <button class="stop" onclick="fetch('/stop')">STOP</button>
@@ -210,22 +225,25 @@ pre{white-space:pre-wrap}
 
 <script>
 async function refresh(){
-  const s = await fetch('/status').then(r=>r.json())
-  document.getElementById('status').innerText = s.status
-  document.getElementById('action').innerText = s.action
-  document.getElementById('error').innerText = s.error
+  try {
+      const s = await fetch('/status').then(r=>r.json())
+      document.getElementById('status').innerText = s.status
+      document.getElementById('action').innerText = s.action
+      document.getElementById('error').innerText = s.error
 
-  document.getElementById('portfolio').innerText =
-    JSON.stringify(await fetch('/portfolio').then(r=>r.json()),null,2)
+      document.getElementById('portfolio').innerText =
+        JSON.stringify(await fetch('/portfolio').then(r=>r.json()),null,2)
 
-  document.getElementById('orders').innerText =
-    JSON.stringify(await fetch('/orders').then(r=>r.json()),null,2)
+      document.getElementById('orders').innerText =
+        JSON.stringify(await fetch('/orders').then(r=>r.json()),null,2)
 
-  document.getElementById('trades').innerText =
-    JSON.stringify(await fetch('/trades').then(r=>r.json()),null,2)
+      document.getElementById('trades').innerText =
+        JSON.stringify(await fetch('/trades').then(r=>r.json()),null,2)
+  } catch (e) { console.log("Refresh failed", e) }
 }
 
 setInterval(refresh, 5000)
+refresh()
 </script>
 
 </body>
@@ -269,10 +287,6 @@ def orders():
 @app.route("/trades")
 def trades():
     return jsonify(get_trades())
-
-# ================= RUN =================
-
-import os
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
