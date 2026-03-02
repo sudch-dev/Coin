@@ -1,133 +1,76 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>BTCINR MAX-PRO Bot</title>
-
-<style>
-body {
-    background:#0b0f17;
-    color:#e6edf3;
-    font-family:Segoe UI, Arial;
-    text-align:center;
-}
-
-.container {
-    width:420px;
-    margin:auto;
-    margin-top:40px;
-    padding:25px;
-    background:#121826;
-    border-radius:14px;
-    box-shadow:0 0 20px rgba(0,0,0,0.6);
-}
-
-h1 { margin-bottom:5px; }
-.subtitle { color:#9aa4b2; margin-bottom:20px; }
-
-button {
-    padding:12px 28px;
-    margin:10px;
-    border:none;
-    border-radius:8px;
-    font-size:16px;
-    cursor:pointer;
-    font-weight:bold;
-}
-
-.start { background:#16a34a; color:white; }
-.stop { background:#dc2626; color:white; }
-
-.card {
-    margin-top:18px;
-    padding:14px;
-    background:#1a2235;
-    border-radius:10px;
-    text-align:left;
-}
-
-.label { color:#9aa4b2; }
-.value { font-size:18px; margin-top:4px; }
-
-.running { color:#22c55e; font-weight:bold; }
-.idle { color:#f87171; font-weight:bold; }
-
-.footer {
-    margin-top:20px;
-    font-size:12px;
-    color:#6b7280;
-}
-</style>
+    <title>AI ML Crypto Engine</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: Arial;
+            background: #111;
+            color: #eee;
+            text-align: center;
+            padding: 30px;
+        }
+        h1 { color: #00ff99; }
+        button {
+            padding: 12px 25px;
+            margin: 10px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .start { background: #00cc66; color: white; }
+        .stop { background: #cc3333; color: white; }
+        .box {
+            margin-top: 30px;
+            padding: 20px;
+            background: #222;
+            border-radius: 10px;
+            display: inline-block;
+            min-width: 300px;
+        }
+        .status { font-size: 20px; margin: 10px 0; }
+        .label { color: #aaa; }
+    </style>
 </head>
-
 <body>
 
-<div class="container">
+<h1>🚀 AI/ML Crypto Trading Engine</h1>
+<p>Exchange: CoinDCX India (Spot INR)</p>
 
-<h1>BTCINR MAX-PRO</h1>
-<div class="subtitle">Institutional Trading Bot</div>
+<button class="start" onclick="startBot()">Start Bot</button>
+<button class="stop" onclick="stopBot()">Stop Bot</button>
 
-<button class="start" onclick="startBot()">START</button>
-<button class="stop" onclick="stopBot()">STOP</button>
-
-<div class="card">
-    <div class="label">Status</div>
-    <div id="status" class="value idle">Idle</div>
-</div>
-
-<div class="card">
-    <div class="label">Last Update</div>
-    <div id="last" class="value">--:--:--</div>
-</div>
-
-<div class="card">
-    <div class="label">INR Balance</div>
-    <div id="inr" class="value">0</div>
-</div>
-
-<div class="card">
-    <div class="label">BTC Balance</div>
-    <div id="btc" class="value">0</div>
-</div>
-
-<div class="card">
-    <div class="label">Error</div>
-    <div id="error" class="value">None</div>
-</div>
-
-<div class="footer">MAX-PRO AI Engine</div>
-
+<div class="box">
+    <div class="status" id="botStatus">Status: Idle</div>
+    <div><span class="label">Last Update:</span> <span id="lastUpdate">--</span></div>
+    <div><span class="label">INR Balance:</span> ₹<span id="inrBalance">0</span></div>
+    <div><span class="label">Error:</span> <span id="errorMsg">None</span></div>
 </div>
 
 <script>
 
 function startBot() {
-    fetch("/start", {method:"POST"});
+    fetch('/start', {method: 'POST'})
+    .then(res => res.json())
+    .then(data => alert("Bot Started"));
 }
 
 function stopBot() {
-    fetch("/stop", {method:"POST"});
+    fetch('/stop', {method: 'POST'})
+    .then(res => res.json())
+    .then(data => alert("Bot Stopped"));
 }
 
 function updateStatus() {
-    fetch("/status")
-    .then(r => r.json())
+    fetch('/status')
+    .then(res => res.json())
     .then(data => {
-
-        const st = document.getElementById("status");
-
-        st.innerText = data.status;
-
-        if (data.status === "Running") {
-            st.className = "value running";
-        } else {
-            st.className = "value idle";
-        }
-
-        document.getElementById("last").innerText = data.last;
-        document.getElementById("inr").innerText = data.INR.toFixed(2);
-        document.getElementById("btc").innerText = data.BTC.toFixed(6);
-        document.getElementById("error").innerText = data.error || "None";
+        document.getElementById("botStatus").innerText = "Status: " + data.status;
+        document.getElementById("lastUpdate").innerText = data.last;
+        document.getElementById("inrBalance").innerText = data.INR.toFixed(2);
+        document.getElementById("errorMsg").innerText = data.error || "None";
     });
 }
 
