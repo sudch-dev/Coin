@@ -255,7 +255,7 @@ def ping():
 def self_keepalive():
     while True:
         try:
-            requests.get("https://smc-trading.onrender.com/ping", timeout=10)
+            requests.get("https://coin-4k37.onrender.com", timeout=10)
         except:
             pass
         time.sleep(240)
