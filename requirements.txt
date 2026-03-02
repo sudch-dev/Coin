@@ -4,3 +4,4 @@ gunicorn
 pandas
 pandas_ta
 pytz
+numpy
