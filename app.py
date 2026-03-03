@@ -1,259 +1,205 @@
-import os, time, threading, hmac, hashlib, requests, json
+import os
+import time
+import threading
+import requests
+import numpy as np
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime
-from pytz import timezone
-import numpy as np
-import websocket
+import pytz
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
-
-API_KEY = os.environ.get("API_KEY")
-API_SECRET = os.environ.get("API_SECRET", "").encode()
-
-BASE_URL = "https://api.coindcx.com"
-WS_URL = "wss://stream.coindcx.com"
-
-IST = timezone("Asia/Kolkata")
-
+# ===== CONFIG =====
+IST = pytz.timezone("Asia/Kolkata")
+PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
 running = False
 investment_capital = 0
+entry_positions = {}
+trade_log = []
+market_snapshot = {}
 error_message = ""
 
-price_data = {}
-entry_positions = {}
-markets = []
+price_data = {pair: [] for pair in PAIRS}
 
-trade_history = []
-realised_pnl = 0
-wins = 0
-losses = 0
+# ===== HELPERS =====
 
-MAX_OPEN_TRADES = 3
-RISK_PER_TRADE = 0.10
-FEE_RATE = 0.006  # approx 0.6% round trip
-
-# ================= AUTH =================
-
-def sign(payload):
-    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
-
-def signed_post(endpoint, body):
-    global error_message
-    payload = json.dumps(body)
-    headers = {
-        "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": sign(payload),
-        "Content-Type": "application/json"
-    }
-    try:
-        r = requests.post(BASE_URL + endpoint, headers=headers, data=payload, timeout=10)
-        if r.ok:
-            error_message = ""
-            return r.json()
-        else:
-            error_message = f"{r.status_code}: {r.text}"
-    except Exception as e:
-        error_message = str(e)
-    return {}
-
-# ================= MARKET =================
-
-def get_inr_markets():
-    try:
-        r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
-        if not r.ok:
-            return []
-        return [x["market"] for x in r.json() if x["market"].endswith("INR")]
-    except:
-        return []
-
-def volatility(prices):
-    if len(prices) < 20:
-        return 0
-    return np.std(np.diff(prices[-20:]))
-
-def micro_breakout(prices):
-    if len(prices) < 30:
+def ema(data, period):
+    if len(data) < period:
         return None
-    last = prices[-1]
-    high = max(prices[-10:-1])
-    if last > high:
-        return "BUY"
+    return np.mean(data[-period:])
+
+def detect_bos(pair):
+    if len(price_data[pair]) < 10:
+        return None
+    highs = price_data[pair][-10:]
+    if highs[-1] > max(highs[:-1]):
+        return "bullish"
+    if highs[-1] < min(highs[:-1]):
+        return "bearish"
     return None
 
-def fee_filter(price, vol):
-    expected_move = vol * 3
-    estimated_fee = price * FEE_RATE
-    return expected_move > estimated_fee
+def detect_choch(pair):
+    if len(price_data[pair]) < 20:
+        return None
+    recent = price_data[pair][-20:]
+    if recent[-1] > max(recent[:10]):
+        return "bullish"
+    if recent[-1] < min(recent[:10]):
+        return "bearish"
+    return None
 
-# ================= ORDER =================
+def order_block(pair):
+    if len(price_data[pair]) < 5:
+        return None
+    last_candles = price_data[pair][-5:]
+    return np.mean(last_candles)
 
-def place_order(pair, side, qty):
-    body = {
-        "market": pair,
-        "side": side.lower(),
-        "order_type": "market_order",
-        "total_quantity": str(qty),
-        "price_per_unit": "0",
-        "timestamp": int(time.time()*1000)
+def get_price(pair):
+    try:
+        url = f"https://public.coindcx.com/market_data/orderbook?pair={pair}"
+        r = requests.get(url)
+        data = r.json()
+        return float(data["bids"][0]["price"])
+    except:
+        return None
+
+# ===== TRADE EXECUTION (SIMULATION SAFE) =====
+
+def execute_trade(pair, side, price):
+    global investment_capital
+
+    risk_per_trade = investment_capital * 0.01
+    qty = risk_per_trade / price
+
+    sl = price * (0.995 if side == "long" else 1.005)
+    tp = price * (1.018 if side == "long" else 0.982)
+
+    entry_positions[pair] = {
+        "side": side,
+        "qty": qty,
+        "entry": price,
+        "tp": tp,
+        "sl": sl
     }
-    return signed_post("/exchange/v1/orders/create", body)
 
-# ================= PNL =================
+    trade_log.append({
+        "time": datetime.now(IST).strftime("%H:%M:%S"),
+        "pair": pair,
+        "side": side,
+        "entry": price
+    })
 
-def calculate_open_pnl():
-    total = 0
-    for pair in entry_positions:
-        side, qty, entry_price, tp, sl = entry_positions[pair]
-        if pair in price_data and price_data[pair]:
-            current = price_data[pair][-1]
-            pnl = (current - entry_price) * qty
-            total += pnl
-    return round(total, 2)
+# ===== STRATEGY LOOP =====
 
-def win_rate():
-    total = wins + losses
-    if total == 0:
-        return 0
-    return round((wins / total) * 100, 2)
-
-# ================= TICK =================
-
-def process_tick(pair, price):
-    global realised_pnl, wins, losses
-
-    if pair not in price_data:
-        price_data[pair] = []
-
-    price_data[pair].append(price)
-    if len(price_data[pair]) > 120:
-        price_data[pair].pop(0)
-
-    # Manage open position
-    if pair in entry_positions:
-        side, qty, entry_price, tp, sl = entry_positions[pair]
-
-        if price >= tp or price <= sl:
-            place_order(pair, "SELL", qty)
-
-            pnl = (price - entry_price) * qty
-            pnl -= (entry_price * qty * FEE_RATE)
-
-            realised_pnl += pnl
-
-            if pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trade_history.append({
-                "pair": pair,
-                "entry": entry_price,
-                "exit": price,
-                "pnl": round(pnl, 2),
-                "time": datetime.now(IST).strftime("%H:%M:%S")
-            })
-
-            del entry_positions[pair]
-        return
-
-    if len(entry_positions) >= MAX_OPEN_TRADES:
-        return
-
-    signal = micro_breakout(price_data[pair])
-    if not signal:
-        return
-
-    vol = volatility(price_data[pair])
-    if vol == 0:
-        return
-
-    if not fee_filter(price, vol):
-        return
-
-    capital = investment_capital * RISK_PER_TRADE
-    qty = round(capital / price, 6)
-    if qty <= 0:
-        return
-
-    res = place_order(pair, "BUY", qty)
-    if "id" in res:
-        tp = price + vol * 3
-        sl = price - vol * 1.5
-        entry_positions[pair] = ("BUY", qty, price, tp, sl)
-
-# ================= WEBSOCKET =================
-
-def start_ws():
-    def on_message(ws, message):
-        data = json.loads(message)
-        if "data" not in data:
-            return
-        pair = data.get("s")
-        price = float(data.get("p", 0))
-        if pair in markets:
-            process_tick(pair, price)
-
-    def on_open(ws):
-        subs = {
-            "action": "subscribe",
-            "channels": [{"name": "ticker", "symbols": markets}]
-        }
-        ws.send(json.dumps(subs))
+def trading_loop():
+    global running, error_message
 
     while running:
         try:
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_message=on_message,
-                on_open=on_open
-            )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except:
+            for pair in PAIRS:
+                price = get_price(pair)
+                if not price:
+                    continue
+
+                price_data[pair].append(price)
+                if len(price_data[pair]) > 100:
+                    price_data[pair].pop(0)
+
+                market_snapshot[pair] = {
+                    "price": price
+                }
+
+                if pair in entry_positions:
+                    check_exit(pair, price)
+                    continue
+
+                if len(price_data[pair]) < 21:
+                    continue
+
+                ema9 = ema(price_data[pair], 9)
+                ema21 = ema(price_data[pair], 21)
+
+                bos = detect_bos(pair)
+                choch = detect_choch(pair)
+
+                ob = order_block(pair)
+
+                # LONG SETUP
+                if ema9 and ema21 and ema9 > ema21 and bos == "bullish" and price > ob:
+                    execute_trade(pair, "long", price)
+
+                # SHORT SETUP
+                if ema9 and ema21 and ema9 < ema21 and bos == "bearish" and price < ob:
+                    execute_trade(pair, "short", price)
+
             time.sleep(5)
 
-# ================= ROUTES =================
+        except Exception as e:
+            error_message = str(e)
+            time.sleep(5)
+
+def check_exit(pair, price):
+    global investment_capital
+
+    pos = entry_positions[pair]
+
+    if pos["side"] == "long":
+        if price >= pos["tp"] or price <= pos["sl"]:
+            pnl = (price - pos["entry"]) * pos["qty"]
+            close_trade(pair, pnl)
+
+    if pos["side"] == "short":
+        if price <= pos["tp"] or price >= pos["sl"]:
+            pnl = (pos["entry"] - price) * pos["qty"]
+            close_trade(pair, pnl)
+
+def close_trade(pair, pnl):
+    global investment_capital
+    investment_capital += pnl
+
+    trade_log.append({
+        "time": datetime.now(IST).strftime("%H:%M:%S"),
+        "pair": pair,
+        "side": "CLOSE",
+        "pnl": round(pnl, 2)
+    })
+
+    del entry_positions[pair]
+
+# ===== ROUTES =====
 
 @app.route("/")
 def home():
     return render_template("index.html")
 
-@app.route("/set_capital", methods=["POST"])
-def set_capital():
-    global investment_capital
-    data = request.json
-    investment_capital = float(data.get("capital", 0))
-    return jsonify({"status": "capital_set"})
-
 @app.route("/start", methods=["POST"])
 def start():
-    global running, markets
+    global running
     if not running:
         running = True
-        markets = get_inr_markets()
-        threading.Thread(target=start_ws, daemon=True).start()
-    return jsonify({"status": "started"})
+        threading.Thread(target=trading_loop, daemon=True).start()
+    return "Started"
 
 @app.route("/stop", methods=["POST"])
 def stop():
     global running
     running = False
-    return jsonify({"status": "stopped"})
+    return "Stopped"
+
+@app.route("/set_capital", methods=["POST"])
+def set_capital():
+    global investment_capital
+    investment_capital = float(request.json["capital"])
+    return "Capital Set"
 
 @app.route("/dashboard")
 def dashboard():
     return jsonify({
         "running": running,
-        "capital": investment_capital,
-        "open_trades": entry_positions,
-        "open_pnl": calculate_open_pnl(),
-        "realised_pnl": round(realised_pnl, 2),
-        "win_rate": win_rate(),
-        "wins": wins,
-        "losses": losses,
-        "trade_history": trade_history[-20:],
+        "capital": round(investment_capital, 2),
+        "positions": entry_positions,
+        "market": market_snapshot,
+        "log": trade_log[-20:],
         "error": error_message
     })
 
@@ -261,20 +207,19 @@ def dashboard():
 def ping():
     return "pong"
 
-# ========= KEEP ALIVE =========
+# ===== KEEP ALIVE =====
 
 def self_keepalive():
     while True:
         try:
-            requests.get("https://coin-4k37.onrender.com", timeout=10)
+            requests.get("https://your-render-url.onrender.com/ping")
         except:
             pass
         time.sleep(240)
 
 threading.Thread(target=self_keepalive, daemon=True).start()
 
-# ================= RUN =================
+# ===== MAIN =====
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
