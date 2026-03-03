@@ -9,7 +9,6 @@ import pytz
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
 IST = pytz.timezone("Asia/Kolkata")
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
 
@@ -19,43 +18,91 @@ entry_positions = {}
 trade_log = []
 market_snapshot = {}
 error_message = ""
+market_bias = {}
+structure_levels = {}
 
 price_data = {pair: [] for pair in PAIRS}
+volume_data = {pair: [] for pair in PAIRS}
 
-# ================= HELPERS =================
+# ================= DATA FETCH =================
 
-def ema(data, period):
-    if len(data) < period:
-        return None
-    weights = np.exp(np.linspace(-1., 0., period))
-    weights /= weights.sum()
-    return np.convolve(data[-period:], weights, mode='valid')[0]
-
-def detect_bos(pair):
-    if len(price_data[pair]) < 12:
-        return None
-    window = price_data[pair][-12:]
-    if window[-1] > max(window[:-1]):
-        return "bullish"
-    if window[-1] < min(window[:-1]):
-        return "bearish"
-    return None
-
-def order_block(pair):
-    if len(price_data[pair]) < 6:
-        return None
-    return np.mean(price_data[pair][-6:-1])
-
-def get_price(pair):
+def get_market_data(pair):
     try:
         url = f"https://public.coindcx.com/market_data/orderbook?pair={pair}"
         r = requests.get(url, timeout=5)
         data = r.json()
-        return float(data["bids"][0]["price"])
+        price = float(data["bids"][0]["price"])
+        volume = float(data["bids"][0]["quantity"])
+        return price, volume
     except:
+        return None, None
+
+# ================= STRUCTURE DETECTION =================
+
+def detect_swings(pair):
+    data = price_data[pair]
+    if len(data) < 5:
+        return None, None
+
+    window = data[-5:]
+    center = window[2]
+
+    if center > window[0] and center > window[1] and center > window[3] and center > window[4]:
+        return "swing_high", center
+
+    if center < window[0] and center < window[1] and center < window[3] and center < window[4]:
+        return "swing_low", center
+
+    return None, None
+
+def detect_bos(pair, price):
+    level = structure_levels.get(pair)
+    if not level:
         return None
 
-# ================= TRADE ENGINE =================
+    if price > level["high"]:
+        return "bullish"
+
+    if price < level["low"]:
+        return "bearish"
+
+    return None
+
+def detect_choch(pair, price):
+    bias = market_bias.get(pair)
+    level = structure_levels.get(pair)
+
+    if not bias or not level:
+        return None
+
+    if bias == "bullish" and price < level["low"]:
+        return "bearish"
+
+    if bias == "bearish" and price > level["high"]:
+        return "bullish"
+
+    return None
+
+def liquidity_sweep(pair, price):
+    level = structure_levels.get(pair)
+    if not level:
+        return False
+
+    if price > level["high"] * 1.002:
+        return True
+
+    if price < level["low"] * 0.998:
+        return True
+
+    return False
+
+def volume_spike(pair):
+    if len(volume_data[pair]) < 10:
+        return False
+    avg = np.mean(volume_data[pair][-10:])
+    return volume_data[pair][-1] > avg * 1.5
+
+# ================= TRADE EXECUTION =================
 
 def execute_trade(pair, side, price):
     global investment_capital
@@ -63,22 +110,13 @@ def execute_trade(pair, side, price):
     if investment_capital <= 0:
         return
 
-    risk_amount = investment_capital * 0.01
-    qty = risk_amount / price
-
-    if side == "long":
-        sl = price * 0.995
-        tp = price * 1.018
-    else:
-        sl = price * 1.005
-        tp = price * 0.982
+    risk = investment_capital * 0.01
+    qty = risk / price
 
     entry_positions[pair] = {
         "side": side,
         "qty": qty,
-        "entry": price,
-        "tp": tp,
-        "sl": sl
+        "entry": price
     }
 
     trade_log.append({
@@ -88,23 +126,15 @@ def execute_trade(pair, side, price):
         "pnl": "-"
     })
 
-def check_exit(pair, price):
+def close_trade(pair, price):
     global investment_capital
 
     pos = entry_positions[pair]
 
     if pos["side"] == "long":
-        if price >= pos["tp"] or price <= pos["sl"]:
-            pnl = (price - pos["entry"]) * pos["qty"]
-            close_trade(pair, pnl)
-
-    if pos["side"] == "short":
-        if price <= pos["tp"] or price >= pos["sl"]:
-            pnl = (pos["entry"] - price) * pos["qty"]
-            close_trade(pair, pnl)
-
-def close_trade(pair, pnl):
-    global investment_capital
+        pnl = (price - pos["entry"]) * pos["qty"]
+    else:
+        pnl = (pos["entry"] - price) * pos["qty"]
 
     investment_capital += pnl
 
@@ -117,7 +147,7 @@ def close_trade(pair, pnl):
 
     del entry_positions[pair]
 
-# ================= STRATEGY LOOP =================
+# ================= MAIN LOOP =================
 
 def trading_loop():
     global running, error_message
@@ -126,38 +156,60 @@ def trading_loop():
         try:
             for pair in PAIRS:
 
-                price = get_price(pair)
+                price, volume = get_market_data(pair)
                 if not price:
                     continue
 
                 price_data[pair].append(price)
-                if len(price_data[pair]) > 200:
-                    price_data[pair].pop(0)
+                volume_data[pair].append(volume)
 
-                market_snapshot[pair] = {"price": price}
+                if len(price_data[pair]) > 300:
+                    price_data[pair].pop(0)
+                    volume_data[pair].pop(0)
+
+                swing_type, swing_level = detect_swings(pair)
+                if swing_type:
+                    if pair not in structure_levels:
+                        structure_levels[pair] = {"high": price, "low": price}
+
+                    if swing_type == "swing_high":
+                        structure_levels[pair]["high"] = swing_level
+                    if swing_type == "swing_low":
+                        structure_levels[pair]["low"] = swing_level
+
+                bos = detect_bos(pair, price)
+                choch = detect_choch(pair, price)
+
+                # CHOCH → square off
+                if pair in entry_positions and choch:
+                    close_trade(pair, price)
+                    market_bias[pair] = None
+                    continue
+
+                # BOS → maintain bias
+                if bos:
+                    market_bias[pair] = bos
+
+                bias = market_bias.get(pair)
+
+                market_snapshot[pair] = {
+                    "price": price,
+                    "bias": bias
+                }
+
+                if not bias:
+                    continue
 
                 if pair in entry_positions:
-                    check_exit(pair, price)
                     continue
 
-                if len(price_data[pair]) < 21:
-                    continue
+                if liquidity_sweep(pair, price) and volume_spike(pair):
 
-                ema9 = ema(price_data[pair], 9)
-                ema21 = ema(price_data[pair], 21)
-                bos = detect_bos(pair)
-                ob = order_block(pair)
+                    if bias == "bullish":
+                        execute_trade(pair, "long", price)
 
-                if not ema9 or not ema21 or not bos or not ob:
-                    continue
-
-                # LONG SETUP
-                if ema9 > ema21 and bos == "bullish" and price > ob:
-                    execute_trade(pair, "long", price)
-
-                # SHORT SETUP
-                if ema9 < ema21 and bos == "bearish" and price < ob:
-                    execute_trade(pair, "short", price)
+                    if bias == "bearish":
+                        execute_trade(pair, "short", price)
 
             time.sleep(5)
 
@@ -198,7 +250,7 @@ def dashboard():
         "capital": round(investment_capital, 2),
         "positions": entry_positions,
         "market": market_snapshot,
-        "log": trade_log[-25:],
+        "log": trade_log[-30:],
         "error": error_message
     })
 
@@ -211,14 +263,12 @@ def ping():
 def self_keepalive():
     while True:
         try:
-            requests.get("https://your-render-url.onrender.com/ping")
+            requests.get("https://coin-4k37.onrender.com/ping")
         except:
             pass
         time.sleep(240)
 
 threading.Thread(target=self_keepalive, daemon=True).start()
-
-# ================= MAIN =================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
