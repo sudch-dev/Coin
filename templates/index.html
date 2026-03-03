@@ -1,171 +1,183 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Institutional SMC Engine</title>
-<style>
-body{
-    background:#0f172a;
-    color:#e2e8f0;
-    font-family:Arial;
-}
-.container{
-    width:95%;
-    margin:auto;
-}
-h1{
-    text-align:center;
-}
-button{
-    padding:10px 20px;
-    margin:5px;
-    border:none;
-    background:#2563eb;
-    color:white;
-    cursor:pointer;
-}
-button:hover{
-    background:#1d4ed8;
-}
-input{
-    padding:8px;
-    margin:5px;
-    width:150px;
-}
-table{
-    width:100%;
-    margin-top:20px;
-    border-collapse:collapse;
-}
-th,td{
-    padding:8px;
-    border-bottom:1px solid #334155;
-    text-align:center;
-}
-th{
-    background:#1e293b;
-}
-.green{ color:#22c55e; }
-.red{ color:#ef4444; }
-</style>
+    <title>Institutional SMC Engine</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #e2e8f0;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .card {
+            background-color: #1e293b;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 10px;
+        }
+
+        input {
+            padding: 10px;
+            width: 200px;
+            border-radius: 5px;
+            border: none;
+            margin-right: 10px;
+        }
+
+        button {
+            padding: 10px 15px;
+            border-radius: 5px;
+            border: none;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+
+        .start-btn { background-color: #16a34a; color: white; }
+        .stop-btn { background-color: #dc2626; color: white; }
+
+        .status-running { color: #22c55e; font-weight: bold; }
+        .status-stopped { color: #ef4444; font-weight: bold; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 8px;
+            border-bottom: 1px solid #334155;
+            text-align: left;
+        }
+
+        th {
+            background-color: #334155;
+        }
+
+        .log-box {
+            max-height: 200px;
+            overflow-y: auto;
+            background-color: #0f172a;
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
 </head>
 <body>
 
-<div class="container">
+<h1>Institutional SMC Live Engine</h1>
 
-<h1>SMC Institutional Engine – CoinDCX INR</h1>
-
-<div>
+<div class="card">
+    <h3>Engine Control</h3>
     <input type="number" id="capital" placeholder="Enter Capital (INR)">
-    <button onclick="setCapital()">Set Capital</button>
-    <button onclick="startBot()">Start</button>
-    <button onclick="stopBot()">Stop</button>
+    <button class="start-btn" onclick="startEngine()">Start</button>
+    <button class="stop-btn" onclick="stopEngine()">Stop</button>
+    <p>Status: <span id="status">Checking...</span></p>
 </div>
 
-<h3>Account Status</h3>
-<p>Running: <span id="running">-</span></p>
-<p>Capital: ₹<span id="capitalDisplay">0</span></p>
+<div class="card">
+    <h3>Active Positions</h3>
+    <table id="positionsTable">
+        <thead>
+            <tr>
+                <th>Pair</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Entry</th>
+                <th>TP</th>
+                <th>Continuation</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
 
-<h3>Open Positions</h3>
-<table id="positionsTable">
-<tr>
-<th>Pair</th>
-<th>Side</th>
-<th>Entry</th>
-<th>Qty</th>
-</tr>
-</table>
-
-<h3>Market Structure</h3>
-<table id="marketTable">
-<tr>
-<th>Pair</th>
-<th>Price</th>
-<th>Bias</th>
-</tr>
-</table>
-
-<h3>Trade Log</h3>
-<table id="logTable">
-<tr>
-<th>Time</th>
-<th>Pair</th>
-<th>Side</th>
-<th>PnL</th>
-</tr>
-</table>
-
+<div class="card">
+    <h3>Recent Trade Log</h3>
+    <div class="log-box" id="logBox"></div>
 </div>
 
 <script>
 
-function setCapital(){
-    let capital = document.getElementById("capital").value;
-    fetch("/set_capital",{
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({capital:capital})
+const baseURL = "https://coin-4k37.onrender.com";
+
+function startEngine() {
+    const capital = document.getElementById("capital").value;
+
+    fetch(baseURL + "/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capital: capital })
+    })
+    .then(res => res.json())
+    .then(data => {
+        alert("Engine Started");
+        updateStatus();
     });
 }
 
-function startBot(){
-    fetch("/start",{method:"POST"});
+function stopEngine() {
+    fetch(baseURL + "/stop")
+    .then(res => res.json())
+    .then(data => {
+        alert("Engine Stopped");
+        updateStatus();
+    });
 }
 
-function stopBot(){
-    fetch("/stop",{method:"POST"});
-}
+function updateStatus() {
+    fetch(baseURL + "/status")
+    .then(res => res.json())
+    .then(data => {
 
-function updateDashboard(){
-    fetch("/dashboard")
-    .then(res=>res.json())
-    .then(data=>{
-
-        document.getElementById("running").innerText = data.running;
-        document.getElementById("capitalDisplay").innerText = data.capital;
-
-        // Positions
-        let posTable = document.getElementById("positionsTable");
-        posTable.innerHTML = "<tr><th>Pair</th><th>Side</th><th>Entry</th><th>Qty</th></tr>";
-        for(let pair in data.positions){
-            let pos = data.positions[pair];
-            posTable.innerHTML += `<tr>
-            <td>${pair}</td>
-            <td class="${pos.side=='long'?'green':'red'}">${pos.side}</td>
-            <td>${pos.entry.toFixed(2)}</td>
-            <td>${pos.qty.toFixed(6)}</td>
-            </tr>`;
+        const statusEl = document.getElementById("status");
+        if (data.running) {
+            statusEl.innerText = "RUNNING";
+            statusEl.className = "status-running";
+        } else {
+            statusEl.innerText = "STOPPED";
+            statusEl.className = "status-stopped";
         }
 
-        // Market
-        let market = document.getElementById("marketTable");
-        market.innerHTML = "<tr><th>Pair</th><th>Price</th><th>Bias</th></tr>";
-        for(let pair in data.market){
-            let bias = data.market[pair].bias;
-            market.innerHTML += `<tr>
-            <td>${pair}</td>
-            <td>${data.market[pair].price.toFixed(2)}</td>
-            <td class="${bias=='bullish'?'green':bias=='bearish'?'red':''}">
-                ${bias?bias:'-'}
-            </td>
-            </tr>`;
+        // Update Positions
+        const tbody = document.querySelector("#positionsTable tbody");
+        tbody.innerHTML = "";
+
+        for (let pair in data.positions) {
+            const pos = data.positions[pair];
+            const row = `
+                <tr>
+                    <td>${pair}</td>
+                    <td>${pos.side}</td>
+                    <td>${pos.qty}</td>
+                    <td>${pos.entry.toFixed(2)}</td>
+                    <td>${pos.tp.toFixed(2)}</td>
+                    <td>${pos.continuation}</td>
+                </tr>
+            `;
+            tbody.innerHTML += row;
         }
 
-        // Logs
-        let log = document.getElementById("logTable");
-        log.innerHTML = "<tr><th>Time</th><th>Pair</th><th>Side</th><th>PnL</th></tr>";
-        data.log.forEach(t=>{
-            log.innerHTML += `<tr>
-            <td>${t.time}</td>
-            <td>${t.pair}</td>
-            <td>${t.side}</td>
-            <td class="${t.pnl>0?'green':t.pnl<0?'red':''}">${t.pnl}</td>
-            </tr>`;
+        // Update Logs
+        const logBox = document.getElementById("logBox");
+        logBox.innerHTML = "";
+
+        data.recent_log.reverse().forEach(log => {
+            logBox.innerHTML += `<div>${log.event} - ${log.pair}</div>`;
         });
 
     });
 }
 
-setInterval(updateDashboard, 4000);
+setInterval(updateStatus, 3000);
+updateStatus();
 
 </script>
 
