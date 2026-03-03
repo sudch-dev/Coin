@@ -9,9 +9,10 @@ import pytz
 
 app = Flask(__name__)
 
-# ===== CONFIG =====
+# ================= CONFIG =================
 IST = pytz.timezone("Asia/Kolkata")
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
+
 running = False
 investment_capital = 0
 entry_positions = {}
@@ -21,58 +22,56 @@ error_message = ""
 
 price_data = {pair: [] for pair in PAIRS}
 
-# ===== HELPERS =====
+# ================= HELPERS =================
 
 def ema(data, period):
     if len(data) < period:
         return None
-    return np.mean(data[-period:])
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    return np.convolve(data[-period:], weights, mode='valid')[0]
 
 def detect_bos(pair):
-    if len(price_data[pair]) < 10:
+    if len(price_data[pair]) < 12:
         return None
-    highs = price_data[pair][-10:]
-    if highs[-1] > max(highs[:-1]):
+    window = price_data[pair][-12:]
+    if window[-1] > max(window[:-1]):
         return "bullish"
-    if highs[-1] < min(highs[:-1]):
-        return "bearish"
-    return None
-
-def detect_choch(pair):
-    if len(price_data[pair]) < 20:
-        return None
-    recent = price_data[pair][-20:]
-    if recent[-1] > max(recent[:10]):
-        return "bullish"
-    if recent[-1] < min(recent[:10]):
+    if window[-1] < min(window[:-1]):
         return "bearish"
     return None
 
 def order_block(pair):
-    if len(price_data[pair]) < 5:
+    if len(price_data[pair]) < 6:
         return None
-    last_candles = price_data[pair][-5:]
-    return np.mean(last_candles)
+    return np.mean(price_data[pair][-6:-1])
 
 def get_price(pair):
     try:
         url = f"https://public.coindcx.com/market_data/orderbook?pair={pair}"
-        r = requests.get(url)
+        r = requests.get(url, timeout=5)
         data = r.json()
         return float(data["bids"][0]["price"])
     except:
         return None
 
-# ===== TRADE EXECUTION (SIMULATION SAFE) =====
+# ================= TRADE ENGINE =================
 
 def execute_trade(pair, side, price):
     global investment_capital
 
-    risk_per_trade = investment_capital * 0.01
-    qty = risk_per_trade / price
+    if investment_capital <= 0:
+        return
 
-    sl = price * (0.995 if side == "long" else 1.005)
-    tp = price * (1.018 if side == "long" else 0.982)
+    risk_amount = investment_capital * 0.01
+    qty = risk_amount / price
+
+    if side == "long":
+        sl = price * 0.995
+        tp = price * 1.018
+    else:
+        sl = price * 1.005
+        tp = price * 0.982
 
     entry_positions[pair] = {
         "side": side,
@@ -86,57 +85,8 @@ def execute_trade(pair, side, price):
         "time": datetime.now(IST).strftime("%H:%M:%S"),
         "pair": pair,
         "side": side,
-        "entry": price
+        "pnl": "-"
     })
-
-# ===== STRATEGY LOOP =====
-
-def trading_loop():
-    global running, error_message
-
-    while running:
-        try:
-            for pair in PAIRS:
-                price = get_price(pair)
-                if not price:
-                    continue
-
-                price_data[pair].append(price)
-                if len(price_data[pair]) > 100:
-                    price_data[pair].pop(0)
-
-                market_snapshot[pair] = {
-                    "price": price
-                }
-
-                if pair in entry_positions:
-                    check_exit(pair, price)
-                    continue
-
-                if len(price_data[pair]) < 21:
-                    continue
-
-                ema9 = ema(price_data[pair], 9)
-                ema21 = ema(price_data[pair], 21)
-
-                bos = detect_bos(pair)
-                choch = detect_choch(pair)
-
-                ob = order_block(pair)
-
-                # LONG SETUP
-                if ema9 and ema21 and ema9 > ema21 and bos == "bullish" and price > ob:
-                    execute_trade(pair, "long", price)
-
-                # SHORT SETUP
-                if ema9 and ema21 and ema9 < ema21 and bos == "bearish" and price < ob:
-                    execute_trade(pair, "short", price)
-
-            time.sleep(5)
-
-        except Exception as e:
-            error_message = str(e)
-            time.sleep(5)
 
 def check_exit(pair, price):
     global investment_capital
@@ -155,6 +105,7 @@ def check_exit(pair, price):
 
 def close_trade(pair, pnl):
     global investment_capital
+
     investment_capital += pnl
 
     trade_log.append({
@@ -166,7 +117,55 @@ def close_trade(pair, pnl):
 
     del entry_positions[pair]
 
-# ===== ROUTES =====
+# ================= STRATEGY LOOP =================
+
+def trading_loop():
+    global running, error_message
+
+    while running:
+        try:
+            for pair in PAIRS:
+
+                price = get_price(pair)
+                if not price:
+                    continue
+
+                price_data[pair].append(price)
+                if len(price_data[pair]) > 200:
+                    price_data[pair].pop(0)
+
+                market_snapshot[pair] = {"price": price}
+
+                if pair in entry_positions:
+                    check_exit(pair, price)
+                    continue
+
+                if len(price_data[pair]) < 21:
+                    continue
+
+                ema9 = ema(price_data[pair], 9)
+                ema21 = ema(price_data[pair], 21)
+                bos = detect_bos(pair)
+                ob = order_block(pair)
+
+                if not ema9 or not ema21 or not bos or not ob:
+                    continue
+
+                # LONG SETUP
+                if ema9 > ema21 and bos == "bullish" and price > ob:
+                    execute_trade(pair, "long", price)
+
+                # SHORT SETUP
+                if ema9 < ema21 and bos == "bearish" and price < ob:
+                    execute_trade(pair, "short", price)
+
+            time.sleep(5)
+
+        except Exception as e:
+            error_message = str(e)
+            time.sleep(5)
+
+# ================= ROUTES =================
 
 @app.route("/")
 def home():
@@ -199,7 +198,7 @@ def dashboard():
         "capital": round(investment_capital, 2),
         "positions": entry_positions,
         "market": market_snapshot,
-        "log": trade_log[-20:],
+        "log": trade_log[-25:],
         "error": error_message
     })
 
@@ -207,7 +206,7 @@ def dashboard():
 def ping():
     return "pong"
 
-# ===== KEEP ALIVE =====
+# ================= KEEP ALIVE =================
 
 def self_keepalive():
     while True:
@@ -219,7 +218,7 @@ def self_keepalive():
 
 threading.Thread(target=self_keepalive, daemon=True).start()
 
-# ===== MAIN =====
+# ================= MAIN =================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
