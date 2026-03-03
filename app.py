@@ -1,178 +1,170 @@
 import os
+import time
 import json
 import hmac
-import time
 import hashlib
 import threading
 import requests
-import websocket
-from flask import Flask, render_template, jsonify, request
-from datetime import datetime
-
-# ================= CONFIG =================
+from flask import Flask, jsonify, request
+from collections import deque
 
 app = Flask(__name__)
 
+# ==============================
+# ENV VARIABLES
+# ==============================
+
 API_KEY = os.getenv("API_KEY")
-SECRET_KEY = os.getenv("API_SECRET")
+API_SECRET = os.getenv("API_SECRET")
 
 BASE_URL = "https://api.coindcx.com"
-WS_URL = "wss://stream.coindcx.com"
 RENDER_URL = "https://coin-4k37.onrender.com"
+
+# ==============================
+# GLOBAL STATE
+# ==============================
+
+capital = 0
+positions = {}
+trade_log = []
+trend_state = {}
+order_blocks = {}
+candles = {}
+current_candle = {}
+running = False
 
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
 
-capital = 0.0
-positions = {}
-bias = {}
-structure = {}
-order_blocks = {}
-trade_log = []
+# ==============================
+# KEEP ALIVE
+# ==============================
 
-candles = {p: [] for p in PAIRS}
-current_candle = {}
+def self_keepalive():
+    while True:
+        try:
+            requests.get(f"{RENDER_URL}/ping", timeout=5)
+        except:
+            pass
+        time.sleep(240)
 
-# ================= AUTH =================
+@app.route("/ping")
+def ping():
+    return "pong"
+
+# ==============================
+# AUTH SIGNING
+# ==============================
 
 def sign_payload(payload):
-    secret_bytes = bytes(SECRET_KEY, encoding='utf-8')
-    json_payload = json.dumps(payload, separators=(',', ':'))
-    signature = hmac.new(secret_bytes, json_payload.encode(), hashlib.sha256).hexdigest()
-    return json_payload, signature
+    payload_json = json.dumps(payload, separators=(',', ':'))
+    signature = hmac.new(
+        API_SECRET.encode(),
+        payload_json.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    return signature, payload_json
 
-# ================= ORDER =================
+# ==============================
+# ORDER EXECUTION
+# ==============================
 
-def place_market_order(pair, side, qty):
+def place_market_order(pair, side, quantity):
+
+    endpoint = "/exchange/v1/orders/create"
+    url = BASE_URL + endpoint
+
     payload = {
         "side": side,
         "order_type": "market_order",
         "market": pair,
-        "total_quantity": qty,
+        "total_quantity": quantity,
         "timestamp": int(time.time() * 1000)
     }
 
-    json_payload, signature = sign_payload(payload)
+    signature, payload_json = sign_payload(payload)
 
     headers = {
-        "Content-Type": "application/json",
         "X-AUTH-APIKEY": API_KEY,
-        "X-AUTH-SIGNATURE": signature
+        "X-AUTH-SIGNATURE": signature,
+        "Content-Type": "application/json"
     }
 
-    r = requests.post(BASE_URL + "/exchange/v1/orders/create",
-                      data=json_payload,
-                      headers=headers)
+    response = requests.post(url, headers=headers, data=payload_json)
+    return response.json()
 
-    return r.json()
+# ==============================
+# EMA CALCULATION
+# ==============================
 
-# ================= SWING DETECTION =================
-
-def detect_swings(pair):
-    if len(candles[pair]) < 5:
+def calculate_ema(pair, period):
+    if len(candles[pair]) < period:
         return None
 
-    window = candles[pair][-5:]
-    center = window[2]
+    closes = [c["close"] for c in list(candles[pair])[-period:]]
+    k = 2 / (period + 1)
+    ema = closes[0]
 
-    highs = [c["high"] for c in window]
-    lows = [c["low"] for c in window]
+    for price in closes[1:]:
+        ema = price * k + ema * (1 - k)
 
-    if center["high"] == max(highs):
-        return ("swing_high", center["high"])
+    return ema
 
-    if center["low"] == min(lows):
-        return ("swing_low", center["low"])
-
-    return None
-
-# ================= STRUCTURE ENGINE =================
+# ==============================
+# STRUCTURE DETECTION
+# ==============================
 
 def process_structure(pair):
 
-    if len(candles[pair]) < 6:
+    if len(candles[pair]) < 5:
         return
 
-    swing = detect_swings(pair)
-    if not swing:
-        return
+    last = candles[pair][-1]
+    prev = candles[pair][-2]
 
-    swing_type, level = swing
+    high_break = last["high"] > prev["high"]
+    low_break = last["low"] < prev["low"]
 
-    if pair not in structure:
-        structure[pair] = {"last_high": None, "last_low": None}
+    if pair not in trend_state:
+        trend_state[pair] = {"bias": None, "confirmed": False}
 
-    if pair not in bias:
-        bias[pair] = None
+    state = trend_state[pair]
 
-    prev_high = structure[pair]["last_high"]
-    prev_low = structure[pair]["last_low"]
-    last_close = candles[pair][-1]["close"]
+    if high_break:
+        if state["bias"] == "bearish":
+            state["confirmed"] = False  # CHoCH
+            trade_log.append({"event": "CHoCH", "pair": pair})
+        state["bias"] = "bullish"
+        state["confirmed"] = True
+        trade_log.append({"event": "BoS Bullish", "pair": pair})
 
-    # ----------------- BoS -----------------
-
-    if prev_high and last_close > prev_high:
-
-        if bias[pair] != "bullish":
-            trade_log.append({"event": "BoS Bullish", "pair": pair})
-
-        bias[pair] = "bullish"
-        mark_order_block(pair, "bullish")
-
-    elif prev_low and last_close < prev_low:
-
-        if bias[pair] != "bearish":
-            trade_log.append({"event": "BoS Bearish", "pair": pair})
-
-        bias[pair] = "bearish"
-        mark_order_block(pair, "bearish")
-
-    # ----------------- CHoCH -----------------
-
-    if bias[pair] == "bullish" and prev_low and last_close < prev_low:
-        trade_log.append({"event": "CHoCH Bearish", "pair": pair})
-        force_close(pair)
-        bias[pair] = "bearish"
-        order_blocks.pop(pair, None)
-
-    elif bias[pair] == "bearish" and prev_high and last_close > prev_high:
-        trade_log.append({"event": "CHoCH Bullish", "pair": pair})
-        force_close(pair)
-        bias[pair] = "bullish"
-        order_blocks.pop(pair, None)
-
-    # Update swings AFTER detection
-    if swing_type == "swing_high":
-        structure[pair]["last_high"] = level
-
-    if swing_type == "swing_low":
-        structure[pair]["last_low"] = level
-
-# ================= ORDER BLOCK =================
-
-def mark_order_block(pair, direction):
-
-    if len(candles[pair]) < 2:
-        return
-
-    last_candle = candles[pair][-2]
-
-    if direction == "bullish" and last_candle["close"] < last_candle["open"]:
         order_blocks[pair] = {
-            "low": last_candle["low"],
-            "high": last_candle["high"],
-            "type": "bullish"
+            "type": "bullish",
+            "low": prev["low"],
+            "high": prev["high"]
         }
 
-    if direction == "bearish" and last_candle["close"] > last_candle["open"]:
+    elif low_break:
+        if state["bias"] == "bullish":
+            state["confirmed"] = False
+            trade_log.append({"event": "CHoCH", "pair": pair})
+        state["bias"] = "bearish"
+        state["confirmed"] = True
+        trade_log.append({"event": "BoS Bearish", "pair": pair})
+
         order_blocks[pair] = {
-            "low": last_candle["low"],
-            "high": last_candle["high"],
-            "type": "bearish"
+            "type": "bearish",
+            "low": prev["low"],
+            "high": prev["high"]
         }
 
-# ================= ENTRY ENGINE =================
+# ==============================
+# ENTRY LOGIC
+# ==============================
 
 def check_entry(pair):
+
+    if not running:
+        return
 
     if capital <= 0:
         return
@@ -180,151 +172,155 @@ def check_entry(pair):
     if pair in positions:
         return
 
-    if pair not in order_blocks:
+    state = trend_state.get(pair)
+    if not state or not state["confirmed"]:
         return
 
-    if bias.get(pair) is None:
+    if pair not in order_blocks:
         return
 
     ob = order_blocks[pair]
     last_price = candles[pair][-1]["close"]
 
-    # Trade ONLY in direction of bias
-    if ob["type"] != bias[pair]:
+    ema_fast = calculate_ema(pair, 9)
+    ema_slow = calculate_ema(pair, 21)
+
+    if not ema_fast or not ema_slow:
+        return
+
+    if state["bias"] == "bullish" and ema_fast <= ema_slow:
+        return
+
+    if state["bias"] == "bearish" and ema_fast >= ema_slow:
+        return
+
+    if ob["type"] != state["bias"]:
         return
 
     if ob["low"] <= last_price <= ob["high"]:
 
-        risk_amount = capital * 0.01
-        qty = round(risk_amount / last_price, 6)
+        risk = capital * 0.01
+        qty = round(risk / last_price, 6)
 
-        side = "buy" if bias[pair] == "bullish" else "sell"
-
+        side = "buy" if state["bias"] == "bullish" else "sell"
         order = place_market_order(pair, side, qty)
 
         if "id" in order:
             positions[pair] = {
                 "side": side,
                 "qty": qty,
-                "entry": last_price
+                "entry": last_price,
+                "tp": last_price * 1.01 if side == "buy" else last_price * 0.99,
+                "continuation": False
             }
+            trade_log.append({"event": "ENTRY", "pair": pair})
 
-            trade_log.append({
-                "event": "ENTRY",
-                "pair": pair,
-                "side": side,
-                "price": last_price
-            })
-
-# ================= EXIT =================
+# ==============================
+# EXIT LOGIC
+# ==============================
 
 def force_close(pair):
+    pos = positions[pair]
+    side = "sell" if pos["side"] == "buy" else "buy"
+    place_market_order(pair, side, pos["qty"])
+    del positions[pair]
+
+def manage_position(pair):
 
     if pair not in positions:
         return
 
     pos = positions[pair]
-    side = "sell" if pos["side"] == "buy" else "buy"
+    last_price = candles[pair][-1]["close"]
+    state = trend_state.get(pair)
 
-    place_market_order(pair, side, pos["qty"])
+    # Continuation via BoS
+    if state and state["confirmed"]:
+        if (pos["side"] == "buy" and state["bias"] == "bullish") or \
+           (pos["side"] == "sell" and state["bias"] == "bearish"):
+            pos["continuation"] = True
 
-    trade_log.append({
-        "event": "EXIT",
-        "pair": pair
-    })
-
-    del positions[pair]
-
-# ================= WEBSOCKET =================
-
-def on_message(ws, message):
-
-    data = json.loads(message)
-    if "data" not in data:
+    # CHoCH Exit
+    if state and not state["confirmed"]:
+        force_close(pair)
+        trade_log.append({"event": "EXIT CHoCH", "pair": pair})
         return
 
-    pair = data["data"]["symbol"]
-    if pair not in PAIRS:
-        return
+    # Opposite OB
+    if pair in order_blocks:
+        ob = order_blocks[pair]
+        if ob["type"] != state["bias"]:
+            if ob["low"] <= last_price <= ob["high"]:
+                force_close(pair)
+                trade_log.append({"event": "EXIT Opp OB", "pair": pair})
+                return
 
-    price = float(data["data"]["price"])
-    timestamp = int(data["data"]["timestamp"]) // 1000
-    minute = timestamp - (timestamp % 60)
+    # TP Logic
+    if pos["side"] == "buy" and last_price >= pos["tp"]:
+        if not pos["continuation"]:
+            force_close(pair)
+            trade_log.append({"event": "EXIT TP", "pair": pair})
 
-    if pair not in current_candle or current_candle[pair]["time"] != minute:
+    if pos["side"] == "sell" and last_price <= pos["tp"]:
+        if not pos["continuation"]:
+            force_close(pair)
+            trade_log.append({"event": "EXIT TP", "pair": pair})
 
-        if pair in current_candle:
-            candles[pair].append(current_candle[pair])
-            process_structure(pair)
-            check_entry(pair)
+# ==============================
+# PRICE SIMULATION LOOP (Replace with WebSocket in production)
+# ==============================
 
-        current_candle[pair] = {
-            "time": minute,
-            "open": price,
-            "high": price,
-            "low": price,
-            "close": price
-        }
+def engine_loop():
+    global candles, running
 
-    else:
-        c = current_candle[pair]
-        c["high"] = max(c["high"], price)
-        c["low"] = min(c["low"], price)
-        c["close"] = price
+    for p in PAIRS:
+        candles[p] = deque(maxlen=200)
 
-def on_close(ws, close_status_code, close_msg):
-    time.sleep(5)
-    start_ws()
-
-def start_ws():
-    ws = websocket.WebSocketApp(
-        WS_URL,
-        on_message=on_message,
-        on_close=on_close
-    )
-    threading.Thread(target=ws.run_forever, daemon=True).start()
-
-# ================= KEEP ALIVE =================
-
-def self_keepalive():
     while True:
-        try:
-            requests.get(f"{RENDER_URL}/ping")
-        except:
-            pass
-        time.sleep(240)
+        if running:
+            for pair in PAIRS:
+                price = 100 + (time.time() % 50)  # placeholder
+                candle = {"open": price, "high": price+1, "low": price-1, "close": price}
+                candles[pair].append(candle)
 
-# ================= ROUTES =================
+                process_structure(pair)
+                check_entry(pair)
+                manage_position(pair)
 
-@app.route("/")
-def home():
-    return render_template("index.html")
+        time.sleep(5)
 
-@app.route("/set_capital", methods=["POST"])
-def set_capital():
-    global capital
-    capital = float(request.json["capital"])
-    return "Capital Set"
+# ==============================
+# ROUTES
+# ==============================
 
-@app.route("/dashboard")
-def dashboard():
+@app.route("/start", methods=["POST"])
+def start():
+    global running, capital
+    data = request.json
+    capital = float(data.get("capital", 0))
+    running = True
+    return jsonify({"status": "running", "capital": capital})
+
+@app.route("/stop")
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
+
+@app.route("/status")
+def status():
     return jsonify({
+        "running": running,
         "capital": capital,
         "positions": positions,
-        "bias": bias,
-        "structure": structure,
-        "order_blocks": order_blocks,
-        "recent_log": trade_log[-30:]
+        "recent_log": trade_log[-10:]
     })
 
-@app.route("/ping")
-def ping():
-    return "pong"
-
-# ================= START =================
-
-start_ws()
-threading.Thread(target=self_keepalive, daemon=True).start()
+# ==============================
+# MAIN
+# ==============================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(target=self_keepalive, daemon=True).start()
+    threading.Thread(target=engine_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
