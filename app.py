@@ -1,66 +1,40 @@
 import os
 import time
-import json
-import hmac
-import hashlib
 import threading
 import requests
-from flask import Flask, jsonify, request, send_from_directory
-from collections import deque
+import numpy as np
+import hmac
+import hashlib
+import json
+from flask import Flask, render_template, jsonify, request
+from datetime import datetime
+import pytz
 
 app = Flask(__name__)
 
-# ==============================
-# ENV VARIABLES
-# ==============================
+# ================= CONFIG =================
 
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 BASE_URL = "https://api.coindcx.com"
-RENDER_URL = "https://coin-4k37.onrender.com"
-
-# ==============================
-# GLOBAL STATE
-# ==============================
-
-capital = 0
-positions = {}
-trade_log = []
-trend_state = {}
-order_blocks = {}
-candles = {}
-running = False
+IST = pytz.timezone("Asia/Kolkata")
 
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
 
-# ==============================
-# KEEP ALIVE
-# ==============================
+running = False
+investment_capital = 0
+entry_positions = {}
+trade_log = []
+market_snapshot = {}
+error_message = ""
+market_bias = {}
+structure_levels = {}
 
-def self_keepalive():
-    while True:
-        try:
-            requests.get(f"{RENDER_URL}/ping", timeout=5)
-        except:
-            pass
-        time.sleep(240)
+price_data = {pair: [] for pair in PAIRS}
+volume_data = {pair: [] for pair in PAIRS}
 
-@app.route("/ping")
-def ping():
-    return "pong"
-
-# ==============================
-# ROOT ROUTE (UI FIX)
-# ==============================
-
-@app.route("/")
-def home():
-    return send_from_directory(".", "index.html")
-
-# ==============================
-# AUTH SIGNING
-# ==============================
+# ================= SIGNING =================
 
 def sign_payload(payload):
     payload_json = json.dumps(payload, separators=(',', ':'))
@@ -71,9 +45,7 @@ def sign_payload(payload):
     ).hexdigest()
     return signature, payload_json
 
-# ==============================
-# ORDER EXECUTION
-# ==============================
+# ================= LIVE ORDER EXECUTION =================
 
 def place_market_order(pair, side, quantity):
 
@@ -96,240 +68,261 @@ def place_market_order(pair, side, quantity):
         "Content-Type": "application/json"
     }
 
-    response = requests.post(url, headers=headers, data=payload_json)
-    return response.json()
+    r = requests.post(url, headers=headers, data=payload_json)
+    return r.json()
 
-# ==============================
-# EMA
-# ==============================
+# ================= DATA FETCH =================
 
-def calculate_ema(pair, period):
-    if len(candles[pair]) < period:
+def get_market_data(pair):
+    try:
+        url = f"https://public.coindcx.com/market_data/orderbook?pair={pair}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        price = float(data["bids"][0]["price"])
+        volume = float(data["bids"][0]["quantity"])
+        return price, volume
+    except:
+        return None, None
+
+# ================= STRUCTURE LOGIC (UNCHANGED) =================
+
+def detect_swings(pair):
+    data = price_data[pair]
+    if len(data) < 5:
+        return None, None
+
+    window = data[-5:]
+    center = window[2]
+
+    if center > window[0] and center > window[1] and center > window[3] and center > window[4]:
+        return "swing_high", center
+
+    if center < window[0] and center < window[1] and center < window[3] and center < window[4]:
+        return "swing_low", center
+
+    return None, None
+
+def detect_bos(pair, price):
+    level = structure_levels.get(pair)
+    if not level:
         return None
 
-    closes = [c["close"] for c in list(candles[pair])[-period:]]
-    k = 2 / (period + 1)
-    ema = closes[0]
+    if price > level["high"]:
+        return "bullish"
 
-    for price in closes[1:]:
-        ema = price * k + ema * (1 - k)
+    if price < level["low"]:
+        return "bearish"
 
-    return ema
+    return None
 
-# ==============================
-# STRUCTURE (BoS / CHoCH / OB)
-# ==============================
+def detect_choch(pair, price):
+    bias = market_bias.get(pair)
+    level = structure_levels.get(pair)
 
-def process_structure(pair):
+    if not bias or not level:
+        return None
 
-    if len(candles[pair]) < 5:
+    if bias == "bullish" and price < level["low"]:
+        return "bearish"
+
+    if bias == "bearish" and price > level["high"]:
+        return "bullish"
+
+    return None
+
+def liquidity_sweep(pair, price):
+    level = structure_levels.get(pair)
+    if not level:
+        return False
+
+    if price > level["high"] * 1.002:
+        return True
+
+    if price < level["low"] * 0.998:
+        return True
+
+    return False
+
+def volume_spike(pair):
+    if len(volume_data[pair]) < 10:
+        return False
+    avg = np.mean(volume_data[pair][-10:])
+    return volume_data[pair][-1] > avg * 1.5
+
+# ================= TRADE EXECUTION =================
+
+def execute_trade(pair, side, price):
+    global investment_capital
+
+    if investment_capital <= 0:
         return
 
-    last = candles[pair][-1]
-    prev = candles[pair][-2]
+    risk = investment_capital * 0.01
+    qty = round(risk / price, 6)
 
-    high_break = last["high"] > prev["high"]
-    low_break = last["low"] < prev["low"]
+    order_side = "buy" if side == "long" else "sell"
+    response = place_market_order(pair, order_side, qty)
 
-    if pair not in trend_state:
-        trend_state[pair] = {"bias": None, "confirmed": False}
-
-    state = trend_state[pair]
-
-    if high_break:
-        if state["bias"] == "bearish":
-            state["confirmed"] = False
-            trade_log.append({"event": "CHoCH", "pair": pair})
-
-        state["bias"] = "bullish"
-        state["confirmed"] = True
-        trade_log.append({"event": "BoS Bullish", "pair": pair})
-
-        order_blocks[pair] = {
-            "type": "bullish",
-            "low": prev["low"],
-            "high": prev["high"]
-        }
-
-    elif low_break:
-        if state["bias"] == "bullish":
-            state["confirmed"] = False
-            trade_log.append({"event": "CHoCH", "pair": pair})
-
-        state["bias"] = "bearish"
-        state["confirmed"] = True
-        trade_log.append({"event": "BoS Bearish", "pair": pair})
-
-        order_blocks[pair] = {
-            "type": "bearish",
-            "low": prev["low"],
-            "high": prev["high"]
-        }
-
-# ==============================
-# ENTRY (OB + EMA)
-# ==============================
-
-def check_entry(pair):
-
-    if not running:
+    if "id" not in response:
         return
 
-    if capital <= 0:
-        return
+    entry_positions[pair] = {
+        "side": side,
+        "qty": qty,
+        "entry": price
+    }
 
-    if pair in positions:
-        return
+    trade_log.append({
+        "time": datetime.now(IST).strftime("%H:%M:%S"),
+        "pair": pair,
+        "side": side,
+        "pnl": "-"
+    })
 
-    state = trend_state.get(pair)
-    if not state or not state["confirmed"]:
-        return
+def close_trade(pair, price):
+    global investment_capital
 
-    if pair not in order_blocks:
-        return
+    pos = entry_positions[pair]
 
-    ob = order_blocks[pair]
-    last_price = candles[pair][-1]["close"]
+    exit_side = "sell" if pos["side"] == "long" else "buy"
+    place_market_order(pair, exit_side, pos["qty"])
 
-    ema_fast = calculate_ema(pair, 9)
-    ema_slow = calculate_ema(pair, 21)
+    if pos["side"] == "long":
+        pnl = (price - pos["entry"]) * pos["qty"]
+    else:
+        pnl = (pos["entry"] - price) * pos["qty"]
 
-    if not ema_fast or not ema_slow:
-        return
+    investment_capital += pnl
 
-    if state["bias"] == "bullish" and ema_fast <= ema_slow:
-        return
+    trade_log.append({
+        "time": datetime.now(IST).strftime("%H:%M:%S"),
+        "pair": pair,
+        "side": "CLOSE",
+        "pnl": round(pnl, 2)
+    })
 
-    if state["bias"] == "bearish" and ema_fast >= ema_slow:
-        return
+    del entry_positions[pair]
 
-    if ob["type"] != state["bias"]:
-        return
+# ================= MAIN LOOP =================
 
-    if ob["low"] <= last_price <= ob["high"]:
+def trading_loop():
+    global running, error_message
 
-        risk = capital * 0.01
-        qty = round(risk / last_price, 6)
-
-        side = "buy" if state["bias"] == "bullish" else "sell"
-        order = place_market_order(pair, side, qty)
-
-        if "id" in order:
-            positions[pair] = {
-                "side": side,
-                "qty": qty,
-                "entry": last_price,
-                "tp": last_price * 1.01 if side == "buy" else last_price * 0.99,
-                "continuation": False
-            }
-            trade_log.append({"event": "ENTRY", "pair": pair})
-
-# ==============================
-# EXIT LOGIC
-# ==============================
-
-def force_close(pair):
-    pos = positions[pair]
-    side = "sell" if pos["side"] == "buy" else "buy"
-    place_market_order(pair, side, pos["qty"])
-    del positions[pair]
-
-def manage_position(pair):
-
-    if pair not in positions:
-        return
-
-    pos = positions[pair]
-    last_price = candles[pair][-1]["close"]
-    state = trend_state.get(pair)
-
-    # Continuation via BoS
-    if state and state["confirmed"]:
-        if (pos["side"] == "buy" and state["bias"] == "bullish") or \
-           (pos["side"] == "sell" and state["bias"] == "bearish"):
-            pos["continuation"] = True
-
-    # CHoCH Exit
-    if state and not state["confirmed"]:
-        force_close(pair)
-        trade_log.append({"event": "EXIT CHoCH", "pair": pair})
-        return
-
-    # Opposite OB Exit
-    if pair in order_blocks:
-        ob = order_blocks[pair]
-        if ob["type"] != state["bias"]:
-            if ob["low"] <= last_price <= ob["high"]:
-                force_close(pair)
-                trade_log.append({"event": "EXIT Opp OB", "pair": pair})
-                return
-
-    # TP Exit (if no continuation)
-    if pos["side"] == "buy" and last_price >= pos["tp"]:
-        if not pos["continuation"]:
-            force_close(pair)
-            trade_log.append({"event": "EXIT TP", "pair": pair})
-
-    if pos["side"] == "sell" and last_price <= pos["tp"]:
-        if not pos["continuation"]:
-            force_close(pair)
-            trade_log.append({"event": "EXIT TP", "pair": pair})
-
-# ==============================
-# ENGINE LOOP
-# ==============================
-
-def engine_loop():
-    global candles
-
-    for p in PAIRS:
-        candles[p] = deque(maxlen=200)
-
-    while True:
-        if running:
+    while running:
+        try:
             for pair in PAIRS:
-                price = 100 + (time.time() % 50)  # placeholder live feed
-                candle = {"open": price, "high": price+1, "low": price-1, "close": price}
-                candles[pair].append(candle)
 
-                process_structure(pair)
-                check_entry(pair)
-                manage_position(pair)
+                price, volume = get_market_data(pair)
+                if not price:
+                    continue
 
-        time.sleep(5)
+                price_data[pair].append(price)
+                volume_data[pair].append(volume)
 
-# ==============================
-# CONTROL ROUTES
-# ==============================
+                if len(price_data[pair]) > 300:
+                    price_data[pair].pop(0)
+                    volume_data[pair].pop(0)
+
+                swing_type, swing_level = detect_swings(pair)
+                if swing_type:
+                    if pair not in structure_levels:
+                        structure_levels[pair] = {"high": price, "low": price}
+
+                    if swing_type == "swing_high":
+                        structure_levels[pair]["high"] = swing_level
+                    if swing_type == "swing_low":
+                        structure_levels[pair]["low"] = swing_level
+
+                bos = detect_bos(pair, price)
+                choch = detect_choch(pair, price)
+
+                if pair in entry_positions and choch:
+                    close_trade(pair, price)
+                    market_bias[pair] = None
+                    continue
+
+                if bos:
+                    market_bias[pair] = bos
+
+                bias = market_bias.get(pair)
+
+                market_snapshot[pair] = {
+                    "price": price,
+                    "bias": bias
+                }
+
+                if not bias:
+                    continue
+
+                if pair in entry_positions:
+                    continue
+
+                if liquidity_sweep(pair, price) and volume_spike(pair):
+
+                    if bias == "bullish":
+                        execute_trade(pair, "long", price)
+
+                    if bias == "bearish":
+                        execute_trade(pair, "short", price)
+
+            time.sleep(5)
+
+        except Exception as e:
+            error_message = str(e)
+            time.sleep(5)
+
+# ================= ROUTES =================
+
+@app.route("/")
+def home():
+    return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
 def start():
-    global running, capital
-    data = request.json
-    capital = float(data.get("capital", 0))
-    running = True
-    return jsonify({"status": "running", "capital": capital})
+    global running
+    if not running:
+        running = True
+        threading.Thread(target=trading_loop, daemon=True).start()
+    return "Started"
 
-@app.route("/stop")
+@app.route("/stop", methods=["POST"])
 def stop():
     global running
     running = False
-    return jsonify({"status": "stopped"})
+    return "Stopped"
 
-@app.route("/status")
-def status():
+@app.route("/set_capital", methods=["POST"])
+def set_capital():
+    global investment_capital
+    investment_capital = float(request.json["capital"])
+    return "Capital Set"
+
+@app.route("/dashboard")
+def dashboard():
     return jsonify({
         "running": running,
-        "capital": capital,
-        "positions": positions,
-        "recent_log": trade_log[-10:]
+        "capital": round(investment_capital, 2),
+        "positions": entry_positions,
+        "market": market_snapshot,
+        "log": trade_log[-30:],
+        "error": error_message
     })
 
-# ==============================
-# MAIN
-# ==============================
+@app.route("/ping")
+def ping():
+    return "pong"
+
+# ================= KEEP ALIVE =================
+
+def self_keepalive():
+    while True:
+        try:
+            requests.get("https://coin-4k37.onrender.com/ping")
+        except:
+            pass
+        time.sleep(240)
+
+threading.Thread(target=self_keepalive, daemon=True).start()
 
 if __name__ == "__main__":
-    threading.Thread(target=self_keepalive, daemon=True).start()
-    threading.Thread(target=engine_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
