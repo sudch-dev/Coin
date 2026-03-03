@@ -5,7 +5,7 @@ import hmac
 import hashlib
 import threading
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from collections import deque
 
 app = Flask(__name__)
@@ -30,7 +30,6 @@ trade_log = []
 trend_state = {}
 order_blocks = {}
 candles = {}
-current_candle = {}
 running = False
 
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
@@ -50,6 +49,14 @@ def self_keepalive():
 @app.route("/ping")
 def ping():
     return "pong"
+
+# ==============================
+# ROOT ROUTE (UI FIX)
+# ==============================
+
+@app.route("/")
+def home():
+    return send_from_directory(".", "index.html")
 
 # ==============================
 # AUTH SIGNING
@@ -93,7 +100,7 @@ def place_market_order(pair, side, quantity):
     return response.json()
 
 # ==============================
-# EMA CALCULATION
+# EMA
 # ==============================
 
 def calculate_ema(pair, period):
@@ -110,7 +117,7 @@ def calculate_ema(pair, period):
     return ema
 
 # ==============================
-# STRUCTURE DETECTION
+# STRUCTURE (BoS / CHoCH / OB)
 # ==============================
 
 def process_structure(pair):
@@ -131,8 +138,9 @@ def process_structure(pair):
 
     if high_break:
         if state["bias"] == "bearish":
-            state["confirmed"] = False  # CHoCH
+            state["confirmed"] = False
             trade_log.append({"event": "CHoCH", "pair": pair})
+
         state["bias"] = "bullish"
         state["confirmed"] = True
         trade_log.append({"event": "BoS Bullish", "pair": pair})
@@ -147,6 +155,7 @@ def process_structure(pair):
         if state["bias"] == "bullish":
             state["confirmed"] = False
             trade_log.append({"event": "CHoCH", "pair": pair})
+
         state["bias"] = "bearish"
         state["confirmed"] = True
         trade_log.append({"event": "BoS Bearish", "pair": pair})
@@ -158,7 +167,7 @@ def process_structure(pair):
         }
 
 # ==============================
-# ENTRY LOGIC
+# ENTRY (OB + EMA)
 # ==============================
 
 def check_entry(pair):
@@ -246,7 +255,7 @@ def manage_position(pair):
         trade_log.append({"event": "EXIT CHoCH", "pair": pair})
         return
 
-    # Opposite OB
+    # Opposite OB Exit
     if pair in order_blocks:
         ob = order_blocks[pair]
         if ob["type"] != state["bias"]:
@@ -255,7 +264,7 @@ def manage_position(pair):
                 trade_log.append({"event": "EXIT Opp OB", "pair": pair})
                 return
 
-    # TP Logic
+    # TP Exit (if no continuation)
     if pos["side"] == "buy" and last_price >= pos["tp"]:
         if not pos["continuation"]:
             force_close(pair)
@@ -267,11 +276,11 @@ def manage_position(pair):
             trade_log.append({"event": "EXIT TP", "pair": pair})
 
 # ==============================
-# PRICE SIMULATION LOOP (Replace with WebSocket in production)
+# ENGINE LOOP
 # ==============================
 
 def engine_loop():
-    global candles, running
+    global candles
 
     for p in PAIRS:
         candles[p] = deque(maxlen=200)
@@ -279,7 +288,7 @@ def engine_loop():
     while True:
         if running:
             for pair in PAIRS:
-                price = 100 + (time.time() % 50)  # placeholder
+                price = 100 + (time.time() % 50)  # placeholder live feed
                 candle = {"open": price, "high": price+1, "low": price-1, "close": price}
                 candles[pair].append(candle)
 
@@ -290,7 +299,7 @@ def engine_loop():
         time.sleep(5)
 
 # ==============================
-# ROUTES
+# CONTROL ROUTES
 # ==============================
 
 @app.route("/start", methods=["POST"])
