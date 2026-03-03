@@ -1,5 +1,5 @@
-import os, time, threading, hmac, hashlib, requests, json, statistics
-from flask import Flask, render_template, jsonify
+import os, time, threading, hmac, hashlib, requests, json
+from flask import Flask, render_template, jsonify, request
 from datetime import datetime
 from pytz import timezone
 import numpy as np
@@ -12,9 +12,6 @@ API_KEY = os.environ.get("API_KEY")
 API_SECRET = os.environ.get("API_SECRET", "").encode()
 
 BASE_URL = "https://api.coindcx.com"
-
-PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
-
 IST = timezone("Asia/Kolkata")
 
 def ist_now():
@@ -23,14 +20,19 @@ def ist_now():
 running = False
 error_message = ""
 status = {"msg": "Idle", "last": ""}
+investment_capital = 0
 
-price_data = {p: [] for p in PAIRS}
-entry = None
-cooldown_until = 0
+price_data = {}
+entry_positions = {}
+cooldown = {}
 
-RISK_PER_TRADE = 0.08
+RISK_PER_TRADE = 0.15
 MIN_RESERVE = 200
 COOLDOWN_SEC = 120
+MAX_DAILY_LOSS = 0.03
+
+equity_start = 0
+daily_loss_lock = False
 
 # ========= AUTH =========
 
@@ -40,13 +42,11 @@ def sign(payload):
 def signed_post(endpoint, body):
     global error_message
     payload = json.dumps(body)
-
     headers = {
         "X-AUTH-APIKEY": API_KEY,
         "X-AUTH-SIGNATURE": sign(payload),
         "Content-Type": "application/json"
     }
-
     try:
         r = requests.post(BASE_URL + endpoint, headers=headers, data=payload, timeout=20)
         if r.ok:
@@ -56,7 +56,6 @@ def signed_post(endpoint, body):
             error_message = f"{r.status_code}: {r.text}"
     except Exception as e:
         error_message = str(e)
-
     return {}
 
 # ========= BALANCES =========
@@ -68,19 +67,29 @@ def get_balances():
         return {x["currency"]: float(x["balance"]) for x in data}
     return {}
 
-# ========= MARKET =========
+# ========= MARKET DISCOVERY =========
 
-def get_all_prices():
-    prices = {}
+def get_inr_markets():
     try:
         r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
-        if r.ok:
-            for x in r.json():
-                if x["market"] in PAIRS:
-                    prices[x["market"]] = float(x["last_price"])
+        if not r.ok:
+            return []
+        markets = []
+        for x in r.json():
+            if x["market"].endswith("INR"):
+                markets.append(x["market"])
+        return markets
     except:
-        pass
-    return prices
+        return []
+
+def get_prices():
+    try:
+        r = requests.get(BASE_URL + "/exchange/ticker", timeout=10)
+        if not r.ok:
+            return {}
+        return {x["market"]: float(x["last_price"]) for x in r.json()}
+    except:
+        return {}
 
 # ========= FEATURES =========
 
@@ -90,30 +99,42 @@ def volatility(prices):
     returns = np.diff(prices[-20:])
     return np.std(returns)
 
-def build_features(prices):
-    if len(prices) < 30:
-        return None
+def detect_regime(prices):
+    if len(prices) < 80:
+        return "neutral"
 
-    short = np.mean(prices[-5:])
-    long = np.mean(prices[-20:])
-    momentum = prices[-1] - prices[-10]
+    ma20 = np.mean(prices[-20:])
+    ma50 = np.mean(prices[-50:])
+    slope = ma20 - ma50
     vol = volatility(prices)
-    breakout = prices[-1] - max(prices[-10:-1])
 
-    return np.array([short-long, momentum, vol, breakout])
+    if slope > vol:
+        return "uptrend"
+    elif slope < -vol:
+        return "downtrend"
+    else:
+        return "range"
 
-# ========= AI/ML SCORING =========
+def volatility_cluster(prices):
+    if len(prices) < 60:
+        return False
+    return volatility(prices[-30:]) > volatility(prices[-60:-30]) * 1.2
 
-def ml_score(features):
-    """
-    Lightweight logistic-style scoring
-    (acts like trained model)
-    """
-    weights = np.array([0.8, 0.6, 0.5, 0.7])
-    score = np.dot(features, weights)
+def fee_filter(price, vol):
+    expected_move = vol * 3
+    estimated_fee = price * 0.006
+    return expected_move > estimated_fee
 
-    prob = 1 / (1 + np.exp(-score / 100))
-    return prob
+def opportunity_score(prices):
+    if len(prices) < 80:
+        return 0
+    vol = volatility(prices)
+    regime = detect_regime(prices)
+    trend_strength = abs(np.mean(prices[-20:]) - np.mean(prices[-50:]))
+    score = trend_strength * 0.5 + vol * 0.5
+    if regime == "uptrend":
+        score *= 1.2
+    return score
 
 # ========= ORDER =========
 
@@ -131,96 +152,122 @@ def place_order(pair, side, qty):
 # ========= BOT LOOP =========
 
 def bot_loop():
-    global running, entry, cooldown_until, error_message
+    global running, status, investment_capital, equity_start, daily_loss_lock
+
+    markets = get_inr_markets()
+
+    for m in markets:
+        price_data[m] = []
+        cooldown[m] = 0
+
+    bal = get_balances()
+    equity_start = bal.get("INR", 0)
 
     while running:
-        try:
-            all_prices = get_all_prices()
-            if not all_prices:
-                time.sleep(5)
+
+        prices = get_prices()
+        now = time.time()
+
+        # update history
+        for m in markets:
+            if m in prices:
+                price_data[m].append(prices[m])
+                if len(price_data[m]) > 200:
+                    price_data[m].pop(0)
+
+        bal = get_balances()
+        current_equity = bal.get("INR", 0)
+
+        # Kill switch
+        if equity_start > 0:
+            dd = (equity_start - current_equity) / equity_start
+            if dd > MAX_DAILY_LOSS:
+                daily_loss_lock = True
+                status["msg"] = "Daily Loss Limit Hit"
+                break
+
+        # Manage open trades
+        for pair in list(entry_positions.keys()):
+            price = prices.get(pair)
+            if not price:
                 continue
 
-            # Update price history
-            for p, price in all_prices.items():
-                price_data[p].append(price)
-                if len(price_data[p]) > 200:
-                    price_data[p].pop(0)
+            side, qty, tp, sl = entry_positions[pair]
 
-            now = time.time()
+            if price >= tp or price <= sl:
+                place_order(pair, "SELL", qty)
+                del entry_positions[pair]
+                cooldown[pair] = now + COOLDOWN_SEC
 
-            # ===== MANAGE ACTIVE TRADE =====
-            if entry:
-                pair, side, qty, tp, sl = entry
-                price = all_prices.get(pair)
+        if daily_loss_lock:
+            break
 
-                if price:
-                    if side == "BUY":
-                        if price >= tp or price <= sl:
-                            place_order(pair, "SELL", qty)
-                            entry = None
-                            cooldown_until = now + COOLDOWN_SEC
-                    else:
-                        if price <= tp or price >= sl:
-                            place_order(pair, "BUY", qty)
-                            entry = None
-                            cooldown_until = now + COOLDOWN_SEC
+        # Scan opportunities
+        scored = []
+        for m in markets:
+            if now < cooldown[m]:
+                continue
 
-            # ===== NEW TRADE SEARCH =====
-            else:
-                if now < cooldown_until:
-                    status["msg"] = "Cooldown"
+            if m not in price_data:
+                continue
 
-                else:
-                    best_pair = None
-                    best_prob = 0
+            score = opportunity_score(price_data[m])
+            if score > 0:
+                scored.append((m, score))
 
-                    for p in PAIRS:
-                        feats = build_features(price_data[p])
-                        if feats is None:
-                            continue
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:3]
 
-                        prob = ml_score(feats)
+        if investment_capital > 0 and top:
+            total_score = sum(x[1] for x in top)
 
-                        if prob > best_prob:
-                            best_prob = prob
-                            best_pair = p
+            for m, score in top:
+                if m in entry_positions:
+                    continue
 
-                    if best_pair and best_prob > 0.7:
-                        price = all_prices[best_pair]
-                        bal = get_balances()
+                price = prices.get(m)
+                if not price:
+                    continue
 
-                        inr = bal.get("INR", 0)
-                        base_asset = best_pair.replace("INR", "")
-                        asset_bal = bal.get(base_asset, 0)
+                vol = volatility(price_data[m])
+                if not volatility_cluster(price_data[m]):
+                    continue
+                if not fee_filter(price, vol):
+                    continue
+                if detect_regime(price_data[m]) != "uptrend":
+                    continue
 
-                        usable = max(0, inr - MIN_RESERVE)
-                        capital = usable * RISK_PER_TRADE
-                        qty = round(capital / price, 6)
+                weight = score / total_score
+                capital = investment_capital * weight
+                qty = round((capital * RISK_PER_TRADE) / price, 6)
 
-                        res = place_order(best_pair, "BUY", qty)
+                if qty <= 0:
+                    continue
 
-                        if "id" in res:
-                            vol = volatility(price_data[best_pair])
-                            tp = price + vol * 2
-                            sl = price - vol
+                res = place_order(m, "BUY", qty)
+                if "id" in res:
+                    tp = price + vol * 4
+                    sl = price - vol * 2
+                    entry_positions[m] = ("BUY", qty, tp, sl)
 
-                            entry = (best_pair, "BUY", qty, tp, sl)
+        status["msg"] = "Running"
+        status["last"] = ist_now()
+        time.sleep(6)
 
-            status["msg"] = "Running" if not entry else f"In Trade {entry[0]}"
-            status["last"] = ist_now()
-
-        except Exception as e:
-            error_message = str(e)
-
-        time.sleep(5)
-
-    status["msg"] = "Idle"
+    status["msg"] = "Stopped"
 
 # ========= ROUTES =========
 
 @app.route("/")
 def home():
     return render_template("index.html")
+
+@app.route("/set_capital", methods=["POST"])
+def set_capital():
+    global investment_capital
+    data = request.json
+    investment_capital = float(data.get("capital", 0))
+    return jsonify({"status": "capital_set"})
 
 @app.route("/start", methods=["POST"])
 def start():
@@ -243,6 +290,7 @@ def stat():
         "status": status["msg"],
         "last": status["last"],
         "INR": bal.get("INR", 0),
+        "capital": investment_capital,
         "error": error_message
     })
 
