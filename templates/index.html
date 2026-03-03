@@ -1,72 +1,196 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>SMC Live Engine</title>
-<style>
-body { background:#0f172a; color:white; font-family:Arial; padding:20px; }
-.card { background:#1e293b; padding:20px; margin-bottom:20px; border-radius:10px; }
-button { padding:8px 15px; margin-right:10px; border:none; border-radius:5px; }
-.start { background:#16a34a; color:white; }
-.stop { background:#dc2626; color:white; }
-input { padding:8px; border-radius:5px; border:none; }
-table { width:100%; margin-top:10px; }
-th, td { padding:8px; border-bottom:1px solid #334155; }
-</style>
+    <title>Institutional SMC Engine</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <style>
+        body {
+            font-family: Arial;
+            background-color: #0e1117;
+            color: #ffffff;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        .card {
+            background: #161b22;
+            padding: 20px;
+            margin: 15px 0;
+            border-radius: 8px;
+        }
+
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .start { background: #2ecc71; color: white; }
+        .stop { background: #e74c3c; color: white; }
+        .set { background: #3498db; color: white; }
+
+        input {
+            padding: 8px;
+            width: 150px;
+            border-radius: 4px;
+            border: none;
+        }
+
+        table {
+            width: 100%;
+            margin-top: 10px;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 8px;
+            text-align: center;
+        }
+
+        th {
+            background: #222;
+        }
+
+        .success { color: #2ecc71; }
+        .error { color: #e74c3c; }
+    </style>
 </head>
+
 <body>
 
-<h2>Institutional SMC Live Trading</h2>
+<h1>SMC Live Trading Engine</h1>
 
 <div class="card">
-<input type="number" id="capital" placeholder="Capital INR">
-<button class="start" onclick="setCapital()">Set Capital</button>
-<button class="start" onclick="start()">Start</button>
-<button class="stop" onclick="stop()">Stop</button>
-<p>Status: <span id="status"></span></p>
+    <h3>Control Panel</h3>
+
+    <button class="start" onclick="startBot()">Start</button>
+    <button class="stop" onclick="stopBot()">Stop</button>
+
+    <br><br>
+
+    <input type="number" id="capitalInput" placeholder="Enter Capital">
+    <button class="set" onclick="setCapital()">Set Capital</button>
+
+    <p id="capitalStatus"></p>
 </div>
 
 <div class="card">
-<h3>Market Snapshot</h3>
-<div id="market"></div>
+    <h3>Live Dashboard</h3>
+    <p><b>Status:</b> <span id="status"></span></p>
+    <p><b>Capital:</b> ₹ <span id="capital"></span></p>
 </div>
 
 <div class="card">
-<h3>Open Positions</h3>
-<div id="positions"></div>
+    <h3>Market Snapshot</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Pair</th>
+                <th>Price</th>
+                <th>Bias</th>
+            </tr>
+        </thead>
+        <tbody id="marketTable"></tbody>
+    </table>
 </div>
 
 <div class="card">
-<h3>Trade Log</h3>
-<div id="log"></div>
+    <h3>Trade Log</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Pair</th>
+                <th>Side</th>
+                <th>PNL</th>
+            </tr>
+        </thead>
+        <tbody id="tradeLog"></tbody>
+    </table>
 </div>
 
 <script>
-function start(){ fetch("/start",{method:"POST"}); }
-function stop(){ fetch("/stop",{method:"POST"}); }
-function setCapital(){
-fetch("/set_capital",{method:"POST",headers:{"Content-Type":"application/json"},
-body:JSON.stringify({capital:document.getElementById("capital").value})});
+
+function startBot() {
+    fetch("/start", {method:"POST"});
 }
 
-function update(){
-fetch("/dashboard")
-.then(r=>r.json())
-.then(data=>{
-document.getElementById("status").innerText = data.running ? "RUNNING" : "STOPPED";
-
-let market="";
-for(let p in data.market){
-market+=p+" | ₹"+data.market[p].price+" | Bias: "+data.market[p].bias+"<br>";
-}
-document.getElementById("market").innerHTML=market;
-
-document.getElementById("positions").innerHTML=JSON.stringify(data.positions,null,2);
-document.getElementById("log").innerHTML=data.log.map(l=>JSON.stringify(l)).join("<br>");
-});
+function stopBot() {
+    fetch("/stop", {method:"POST"});
 }
 
-setInterval(update,3000);
-update();
+function setCapital() {
+    let capital = document.getElementById("capitalInput").value;
+
+    if (!capital || capital <= 0) {
+        document.getElementById("capitalStatus").innerHTML =
+            "<span class='error'>Enter valid capital amount</span>";
+        return;
+    }
+
+    fetch("/set_capital", {
+        method:"POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({capital: capital})
+    })
+    .then(res => res.text())
+    .then(data => {
+        document.getElementById("capitalStatus").innerHTML =
+            "<span class='success'>Capital Successfully Set ✔</span>";
+        document.getElementById("capitalInput").value = "";
+    })
+    .catch(() => {
+        document.getElementById("capitalStatus").innerHTML =
+            "<span class='error'>Error setting capital</span>";
+    });
+}
+
+function updateDashboard() {
+    fetch("/dashboard")
+    .then(res => res.json())
+    .then(data => {
+
+        document.getElementById("status").innerText =
+            data.running ? "Running" : "Stopped";
+
+        document.getElementById("capital").innerText =
+            data.capital;
+
+        // Market table
+        let table = "";
+        for (let pair in data.market) {
+            table += `
+                <tr>
+                    <td>${pair}</td>
+                    <td>${data.market[pair].price}</td>
+                    <td>${data.market[pair].bias || "-"}</td>
+                </tr>`;
+        }
+        document.getElementById("marketTable").innerHTML = table;
+
+        // Trade log
+        let log = "";
+        data.log.forEach(trade => {
+            log += `
+                <tr>
+                    <td>${trade.time}</td>
+                    <td>${trade.pair}</td>
+                    <td>${trade.side}</td>
+                    <td>${trade.pnl}</td>
+                </tr>`;
+        });
+        document.getElementById("tradeLog").innerHTML = log;
+    });
+}
+
+setInterval(updateDashboard, 3000);
+
 </script>
 
 </body>
