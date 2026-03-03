@@ -1,83 +1,51 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AI ML Crypto Engine</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body {
-            font-family: Arial;
-            background: #111;
-            color: #eee;
-            text-align: center;
-            padding: 30px;
-        }
-        h1 { color: #00ff99; }
-        button {
-            padding: 12px 25px;
-            margin: 10px;
-            font-size: 16px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        .start { background: #00cc66; color: white; }
-        .stop { background: #cc3333; color: white; }
-        .box {
-            margin-top: 30px;
-            padding: 20px;
-            background: #222;
-            border-radius: 10px;
-            display: inline-block;
-            min-width: 300px;
-        }
-        .status { font-size: 20px; margin: 10px 0; }
-        .label { color: #aaa; }
-    </style>
+    <title>Institutional CoinDCX Engine</title>
 </head>
 <body>
+    <h2>Institutional Capital Deployment Engine</h2>
 
-<h1>🚀 AI/ML Crypto Trading Engine</h1>
-<p>Exchange: CoinDCX India (Spot INR)</p>
+    <label>Investment Amount (INR):</label>
+    <input type="number" id="capital" placeholder="Enter INR amount">
+    <button onclick="setCapital()">Set Capital</button>
+    <br><br>
 
-<button class="start" onclick="startBot()">Start Bot</button>
-<button class="stop" onclick="stopBot()">Stop Bot</button>
+    <button onclick="startBot()">Start</button>
+    <button onclick="stopBot()">Stop</button>
 
-<div class="box">
-    <div class="status" id="botStatus">Status: Idle</div>
-    <div><span class="label">Last Update:</span> <span id="lastUpdate">--</span></div>
-    <div><span class="label">INR Balance:</span> ₹<span id="inrBalance">0</span></div>
-    <div><span class="label">Error:</span> <span id="errorMsg">None</span></div>
-</div>
+    <h3>Status:</h3>
+    <div id="status"></div>
 
 <script>
-
-function startBot() {
-    fetch('/start', {method: 'POST'})
-    .then(res => res.json())
-    .then(data => alert("Bot Started"));
-}
-
-function stopBot() {
-    fetch('/stop', {method: 'POST'})
-    .then(res => res.json())
-    .then(data => alert("Bot Stopped"));
-}
-
-function updateStatus() {
-    fetch('/status')
-    .then(res => res.json())
-    .then(data => {
-        document.getElementById("botStatus").innerText = "Status: " + data.status;
-        document.getElementById("lastUpdate").innerText = data.last;
-        document.getElementById("inrBalance").innerText = data.INR.toFixed(2);
-        document.getElementById("errorMsg").innerText = data.error || "None";
+function setCapital() {
+    fetch("/set_capital", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({capital: document.getElementById("capital").value})
     });
 }
 
-setInterval(updateStatus, 3000);
-updateStatus();
+function startBot() {
+    fetch("/start", {method: "POST"});
+}
 
+function stopBot() {
+    fetch("/stop", {method: "POST"});
+}
+
+setInterval(() => {
+    fetch("/status")
+    .then(res => res.json())
+    .then(data => {
+        document.getElementById("status").innerHTML =
+            "Bot: " + data.status +
+            "<br>Last Update: " + data.last +
+            "<br>INR Balance: " + data.INR +
+            "<br>Capital Set: " + data.capital +
+            "<br>Error: " + data.error;
+    });
+}, 4000);
 </script>
-
 </body>
 </html>
