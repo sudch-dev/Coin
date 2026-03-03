@@ -13,8 +13,8 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-API_KEY = os.getenv("COINDCX_API_KEY")
-SECRET_KEY = os.getenv("COINDCX_SECRET_KEY")
+API_KEY = os.getenv("API_KEY")
+SECRET_KEY = os.getenv("API_SECRET")
 
 BASE_URL = "https://api.coindcx.com"
 WS_URL = "wss://stream.coindcx.com"
