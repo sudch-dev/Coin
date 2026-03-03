@@ -1,6 +1,6 @@
-Flask==3.0.2
-requests==2.31.0
-numpy==1.26.4
-pytz==2024.1
-gunicorn==21.2.0
-websocket-client==1.7.0
+Flask
+requests
+numpy
+pytz
+gunicorn
+websocket-client
