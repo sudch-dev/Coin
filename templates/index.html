@@ -1,51 +1,96 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Institutional CoinDCX Engine</title>
+<title>Institutional CoinDCX Terminal</title>
+<style>
+body { background:#0f172a; color:white; font-family:Arial; margin:0; }
+.header { background:#1e293b; padding:15px; font-size:20px; }
+.container { padding:20px; display:flex; flex-wrap:wrap; }
+.panel { background:#1e293b; padding:15px; margin:10px; border-radius:8px; flex:1; min-width:300px; }
+button { padding:8px; margin:5px; border:none; border-radius:4px; cursor:pointer; }
+.start{background:#16a34a;color:white;}
+.stop{background:#dc2626;color:white;}
+.cap{background:#2563eb;color:white;}
+table{width:100%; font-size:12px;}
+th,td{padding:4px; border-bottom:1px solid #334155;}
+input{padding:6px;}
+</style>
 </head>
 <body>
-    <h2>Institutional Capital Deployment Engine</h2>
 
-    <label>Investment Amount (INR):</label>
-    <input type="number" id="capital" placeholder="Enter INR amount">
-    <button onclick="setCapital()">Set Capital</button>
-    <br><br>
+<div class="header">CoinDCX Institutional Trading Terminal</div>
 
-    <button onclick="startBot()">Start</button>
-    <button onclick="stopBot()">Stop</button>
+<div class="container">
 
-    <h3>Status:</h3>
-    <div id="status"></div>
+<div class="panel">
+<h3>Capital Control</h3>
+<input type="number" id="capitalInput" placeholder="Enter INR">
+<button class="cap" onclick="setCapital()">Set Capital</button>
+<br>
+<button class="start" onclick="startBot()">Start</button>
+<button class="stop" onclick="stopBot()">Stop</button>
+<p>Status: <span id="status"></span></p>
+<p>Capital: ₹<span id="capital"></span></p>
+<p>Open P&L: ₹<span id="openpnl"></span></p>
+<p>Realised P&L: ₹<span id="realpnl"></span></p>
+<p>Win Rate: <span id="winrate"></span>%</p>
+<p>Wins: <span id="wins"></span> | Losses: <span id="losses"></span></p>
+<p style="color:red;">Error: <span id="error"></span></p>
+</div>
+
+<div class="panel">
+<h3>Open Positions</h3>
+<table id="positions"></table>
+</div>
+
+<div class="panel">
+<h3>Trade History</h3>
+<table id="history"></table>
+</div>
+
+</div>
 
 <script>
-function setCapital() {
-    fetch("/set_capital", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({capital: document.getElementById("capital").value})
-    });
+
+function setCapital(){
+fetch("/set_capital",{method:"POST",headers:{"Content-Type":"application/json"},
+body:JSON.stringify({capital:document.getElementById("capitalInput").value})});
 }
 
-function startBot() {
-    fetch("/start", {method: "POST"});
+function startBot(){ fetch("/start",{method:"POST"}); }
+function stopBot(){ fetch("/stop",{method:"POST"}); }
+
+function update(){
+fetch("/dashboard").then(r=>r.json()).then(data=>{
+
+document.getElementById("status").innerText = data.running?"Running":"Stopped";
+document.getElementById("capital").innerText = data.capital;
+document.getElementById("openpnl").innerText = data.open_pnl;
+document.getElementById("realpnl").innerText = data.realised_pnl;
+document.getElementById("winrate").innerText = data.win_rate;
+document.getElementById("wins").innerText = data.wins;
+document.getElementById("losses").innerText = data.losses;
+document.getElementById("error").innerText = data.error;
+
+let posTable="<tr><th>Pair</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th></tr>";
+for(let p in data.open_trades){
+let t=data.open_trades[p];
+posTable+=`<tr><td>${p}</td><td>${t[1]}</td><td>${t[2]}</td><td>${t[3]}</td><td>${t[4]}</td></tr>`;
+}
+document.getElementById("positions").innerHTML=posTable;
+
+let hist="<tr><th>Time</th><th>Pair</th><th>Entry</th><th>Exit</th><th>PnL</th></tr>";
+data.trade_history.forEach(t=>{
+hist+=`<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.entry}</td><td>${t.exit}</td><td>${t.pnl}</td></tr>`;
+});
+document.getElementById("history").innerHTML=hist;
+
+});
 }
 
-function stopBot() {
-    fetch("/stop", {method: "POST"});
-}
+setInterval(update,3000);
 
-setInterval(() => {
-    fetch("/status")
-    .then(res => res.json())
-    .then(data => {
-        document.getElementById("status").innerHTML =
-            "Bot: " + data.status +
-            "<br>Last Update: " + data.last +
-            "<br>INR Balance: " + data.INR +
-            "<br>Capital Set: " + data.capital +
-            "<br>Error: " + data.error;
-    });
-}, 4000);
 </script>
+
 </body>
 </html>
