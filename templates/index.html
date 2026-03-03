@@ -1,117 +1,173 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>SMC INR Terminal</title>
-    <style>
-        body { background:#0f172a; color:white; font-family:Arial; margin:0;}
-        .header { background:#1e293b; padding:15px; font-size:20px; font-weight:bold;}
-        .container { display:flex; flex-wrap:wrap; padding:20px;}
-        .panel { background:#1e293b; margin:10px; padding:15px; border-radius:8px; flex:1; min-width:320px;}
-        button { padding:8px 12px; margin:5px 0; border:none; border-radius:4px; cursor:pointer;}
-        .start { background:#16a34a; }
-        .stop { background:#dc2626; }
-        .capital { background:#2563eb; }
-        table { width:100%; font-size:12px; border-collapse:collapse;}
-        th,td { border-bottom:1px solid #334155; padding:4px; }
-        input { padding:6px; width:150px; }
-    </style>
+<title>Institutional SMC Engine</title>
+<style>
+body{
+    background:#0f172a;
+    color:#e2e8f0;
+    font-family:Arial;
+}
+.container{
+    width:95%;
+    margin:auto;
+}
+h1{
+    text-align:center;
+}
+button{
+    padding:10px 20px;
+    margin:5px;
+    border:none;
+    background:#2563eb;
+    color:white;
+    cursor:pointer;
+}
+button:hover{
+    background:#1d4ed8;
+}
+input{
+    padding:8px;
+    margin:5px;
+    width:150px;
+}
+table{
+    width:100%;
+    margin-top:20px;
+    border-collapse:collapse;
+}
+th,td{
+    padding:8px;
+    border-bottom:1px solid #334155;
+    text-align:center;
+}
+th{
+    background:#1e293b;
+}
+.green{ color:#22c55e; }
+.red{ color:#ef4444; }
+</style>
 </head>
 <body>
 
-<div class="header">SMC INR Institutional Terminal</div>
-
 <div class="container">
 
-<div class="panel">
-<h3>Capital</h3>
-<input type="number" id="capitalInput" placeholder="Enter INR">
-<button class="capital" onclick="setCapital()">Set Capital</button>
-<p>Capital: <span id="capitalDisplay">0</span></p>
-<button class="start" onclick="startBot()">Start</button>
-<button class="stop" onclick="stopBot()">Stop</button>
-<p>Status: <span id="status"></span></p>
-<p>Error: <span id="error"></span></p>
+<h1>SMC Institutional Engine – CoinDCX INR</h1>
+
+<div>
+    <input type="number" id="capital" placeholder="Enter Capital (INR)">
+    <button onclick="setCapital()">Set Capital</button>
+    <button onclick="startBot()">Start</button>
+    <button onclick="stopBot()">Stop</button>
 </div>
 
-<div class="panel">
+<h3>Account Status</h3>
+<p>Running: <span id="running">-</span></p>
+<p>Capital: ₹<span id="capitalDisplay">0</span></p>
+
 <h3>Open Positions</h3>
 <table id="positionsTable">
-<tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th></tr>
+<tr>
+<th>Pair</th>
+<th>Side</th>
+<th>Entry</th>
+<th>Qty</th>
+</tr>
 </table>
-</div>
 
-<div class="panel">
-<h3>Market</h3>
+<h3>Market Structure</h3>
 <table id="marketTable">
-<tr><th>Pair</th><th>Price</th></tr>
+<tr>
+<th>Pair</th>
+<th>Price</th>
+<th>Bias</th>
+</tr>
 </table>
-</div>
 
-<div class="panel">
 <h3>Trade Log</h3>
-<table id="tradeTable">
-<tr><th>Time</th><th>Pair</th><th>Side</th><th>PNL</th></tr>
+<table id="logTable">
+<tr>
+<th>Time</th>
+<th>Pair</th>
+<th>Side</th>
+<th>PnL</th>
+</tr>
 </table>
-</div>
 
 </div>
 
 <script>
 
 function setCapital(){
-fetch("/set_capital",{method:"POST",headers:{"Content-Type":"application/json"},
-body:JSON.stringify({capital:document.getElementById("capitalInput").value})});
+    let capital = document.getElementById("capital").value;
+    fetch("/set_capital",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({capital:capital})
+    });
 }
 
-function startBot(){fetch("/start",{method:"POST"});}
-function stopBot(){fetch("/stop",{method:"POST"});}
+function startBot(){
+    fetch("/start",{method:"POST"});
+}
+
+function stopBot(){
+    fetch("/stop",{method:"POST"});
+}
 
 function updateDashboard(){
-fetch("/dashboard").then(res=>res.json()).then(data=>{
+    fetch("/dashboard")
+    .then(res=>res.json())
+    .then(data=>{
 
-document.getElementById("capitalDisplay").innerText=data.capital;
-document.getElementById("status").innerText=data.running?"Running":"Stopped";
-document.getElementById("error").innerText=data.error;
+        document.getElementById("running").innerText = data.running;
+        document.getElementById("capitalDisplay").innerText = data.capital;
 
-let pos=document.getElementById("positionsTable");
-pos.innerHTML="<tr><th>Pair</th><th>Side</th><th>Qty</th><th>Entry</th><th>TP</th><th>SL</th></tr>";
-for(let pair in data.positions){
-let p=data.positions[pair];
-pos.innerHTML+=`<tr>
-<td>${pair}</td>
-<td>${p.side}</td>
-<td>${p.qty.toFixed(4)}</td>
-<td>${p.entry.toFixed(2)}</td>
-<td>${p.tp.toFixed(2)}</td>
-<td>${p.sl.toFixed(2)}</td>
-</tr>`;
+        // Positions
+        let posTable = document.getElementById("positionsTable");
+        posTable.innerHTML = "<tr><th>Pair</th><th>Side</th><th>Entry</th><th>Qty</th></tr>";
+        for(let pair in data.positions){
+            let pos = data.positions[pair];
+            posTable.innerHTML += `<tr>
+            <td>${pair}</td>
+            <td class="${pos.side=='long'?'green':'red'}">${pos.side}</td>
+            <td>${pos.entry.toFixed(2)}</td>
+            <td>${pos.qty.toFixed(6)}</td>
+            </tr>`;
+        }
+
+        // Market
+        let market = document.getElementById("marketTable");
+        market.innerHTML = "<tr><th>Pair</th><th>Price</th><th>Bias</th></tr>";
+        for(let pair in data.market){
+            let bias = data.market[pair].bias;
+            market.innerHTML += `<tr>
+            <td>${pair}</td>
+            <td>${data.market[pair].price.toFixed(2)}</td>
+            <td class="${bias=='bullish'?'green':bias=='bearish'?'red':''}">
+                ${bias?bias:'-'}
+            </td>
+            </tr>`;
+        }
+
+        // Logs
+        let log = document.getElementById("logTable");
+        log.innerHTML = "<tr><th>Time</th><th>Pair</th><th>Side</th><th>PnL</th></tr>";
+        data.log.forEach(t=>{
+            log.innerHTML += `<tr>
+            <td>${t.time}</td>
+            <td>${t.pair}</td>
+            <td>${t.side}</td>
+            <td class="${t.pnl>0?'green':t.pnl<0?'red':''}">${t.pnl}</td>
+            </tr>`;
+        });
+
+    });
 }
 
-let market=document.getElementById("marketTable");
-market.innerHTML="<tr><th>Pair</th><th>Price</th></tr>";
-for(let pair in data.market){
-market.innerHTML+=`<tr>
-<td>${pair}</td>
-<td>${data.market[pair].price.toFixed(2)}</td>
-</tr>`;
-}
-
-let log=document.getElementById("tradeTable");
-log.innerHTML="<tr><th>Time</th><th>Pair</th><th>Side</th><th>PNL</th></tr>";
-data.log.forEach(t=>{
-log.innerHTML+=`<tr>
-<td>${t.time}</td>
-<td>${t.pair}</td>
-<td>${t.side}</td>
-<td>${t.pnl}</td>
-</tr>`;
-});
-
-});
-}
-
-setInterval(updateDashboard,3000);
+setInterval(updateDashboard, 4000);
 
 </script>
+
 </body>
 </html>
