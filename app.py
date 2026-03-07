@@ -2,159 +2,322 @@ import os
 import time
 import threading
 import requests
-import numpy as np
-import hmac
-import hashlib
-import json
-from flask import Flask, render_template, jsonify, request
-from datetime import datetime
-import pytz
+import pandas as pd
+from flask import Flask, render_template, request, jsonify
+from binance.client import Client
+
+# ==============================
+# CONFIG
+# ==============================
+
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+
+RENDER_URL = "https://coin-4k37.onrender.com"
+
+SYMBOLS = [
+    "BTCINR",
+    "ETHINR",
+    "SOLINR"
+]
+
+TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE
+
+capital = 0
+in_position = {}
+entry_price = {}
+
+# ==============================
+# BINANCE CLIENT
+# ==============================
+
+client = Client(API_KEY, API_SECRET)
+
+# ==============================
+# FLASK
+# ==============================
 
 app = Flask(__name__)
 
-# ================= CONFIG =================
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-BASE_URL = "https://api.coindcx.com"
-IST = pytz.timezone("Asia/Kolkata")
-# CoinDCX Public API requires the 'I-' prefix and '_' for many INR pairs
-PAIRS = ["I-BTC_INR", "I-ETH_INR", "I-SOL_INR"]
-RENDER_URL = "https://coin-4k37.onrender.com"
+# ==============================
+# KEEP ALIVE
+# ==============================
 
-# Trading State
-running = False
-investment_capital = 0
-entry_positions = {}
-trade_log = []
-market_snapshot = {pair: {"price": 0, "bias": "Scanning..."} for pair in PAIRS}
-error_message = ""
-structure_levels = {}
-price_data = {pair: [] for pair in PAIRS}
-volume_data = {pair: [] for pair in PAIRS}
+@app.route("/ping")
+def ping():
+    return "pong"
 
-# ================= DATA FETCH (DIAGNOSTIC) =================
-def get_market_data(pair):
-    try:
-        url = f"https://public.coindcx.com{pair}"
-        r = requests.get(url, timeout=5)
-        data = r.json()
-        
-        # CoinDCX 'bids' is a dict where keys are prices: {"11570.67": "0.0008"}
-        if "bids" in data and data["bids"]:
-            bid_prices = [float(p) for p in data["bids"].keys()]
-            highest_bid = max(bid_prices)
-            volume = float(data["bids"][f"{highest_bid:.8f}"])
-            return highest_bid, volume
-        
-        print(f"[DIAGNOSTIC] No data for {pair}: {data.get('message', 'Unknown Error')}")
-        return None, None
-    except Exception as e:
-        print(f"[DIAGNOSTIC] Connection Error for {pair}: {e}")
-        return None, None
-
-# ================= DYNAMIC LOGIC =================
-def get_atr(pair, period=14):
-    if len(price_data[pair]) < period + 1: return 0
-    return np.mean(np.abs(np.diff(price_data[pair][-period-1:])))
-
-def volume_spike(pair):
-    v_data = volume_data[pair]
-    if len(v_data) < 20: return False
-    std_v = np.std(v_data[-20:])
-    return (v_data[-1] - np.mean(v_data[-20:])) / std_v > 2.0 if std_v > 0 else False
-
-# ================= TRADING ENGINE =================
-def trading_loop():
-    global running, error_message
+def self_keepalive():
     while True:
-        if not running:
-            time.sleep(2)
-            continue
         try:
-            for pair in PAIRS:
-                price, volume = get_market_data(pair)
-                if not price: continue
+            requests.get(f"{RENDER_URL}/ping", timeout=5)
+        except:
+            pass
+        time.sleep(240)
 
-                price_data[pair].append(price)
-                volume_data[pair].append(volume)
-                if len(price_data[pair]) > 100:
-                    price_data[pair].pop(0)
-                    volume_data[pair].pop(0)
+threading.Thread(target=self_keepalive, daemon=True).start()
 
-                # Trailing SL (Skimming)
-                if pair in entry_positions:
-                    pos = entry_positions[pair]
-                    atr = get_atr(pair)
-                    if pos["side"] == "long":
-                        if price > pos["peak"]: pos["peak"] = price; pos["sl"] = max(pos["sl"], price - (atr * 1.5))
-                        if price < pos["sl"]: close_trade(pair, price)
-                    elif pos["side"] == "short":
-                        if price < pos["peak"]: pos["peak"] = price; pos["sl"] = min(pos["sl"], price + (atr * 1.5))
-                        if price > pos["sl"]: close_trade(pair, price)
-                    continue
+# ==============================
+# DATA FETCH
+# ==============================
 
-                # Bias & Strategy
-                if len(price_data[pair]) > 20:
-                    bias = "bullish" if price > np.mean(price_data[pair][-20:]) else "bearish"
-                    market_snapshot[pair] = {"price": price, "bias": bias}
-                    if volume_spike(pair):
-                        execute_trade(pair, "long" if bias == "bullish" else "short", price)
-            time.sleep(5)
-        except Exception as e:
-            error_message = str(e)
-            time.sleep(5)
+def get_klines(symbol):
 
-def execute_trade(pair, side, price):
-    global investment_capital
-    if investment_capital <= 0: return
-    qty = round((investment_capital * 0.02) / price, 6)
-    entry_positions[pair] = {"side": side, "qty": qty, "entry": price, "sl": price * 0.98, "peak": price}
-    trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": side, "pnl": "OPEN"})
+    klines = client.get_klines(
+        symbol=symbol,
+        interval=TIMEFRAME,
+        limit=200
+    )
 
-def close_trade(pair, price):
-    global investment_capital
-    pos = entry_positions.pop(pair)
-    pnl = (price - pos["entry"]) * pos["qty"] if pos["side"] == "long" else (pos["entry"] - price) * pos["qty"]
-    investment_capital += pnl
-    trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": "CLOSE", "pnl": round(pnl, 2)})
+    df = pd.DataFrame(klines, columns=[
+        'time','open','high','low','close','volume',
+        'ct','qav','n','tbbav','tbqav','ignore'
+    ])
 
-# ================= ROUTES =================
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+
+    return df
+
+# ==============================
+# INDICATORS
+# ==============================
+
+def ema(df, period):
+
+    return df['close'].ewm(span=period).mean()
+
+# ==============================
+# ORDER BLOCK DETECTION
+# ==============================
+
+def detect_ob(df):
+
+    last = df.iloc[-2]
+
+    if last['close'] < last['open']:
+        return "bullish"
+
+    if last['close'] > last['open']:
+        return "bearish"
+
+    return None
+
+# ==============================
+# BOS DETECTION
+# ==============================
+
+def detect_bos(df):
+
+    prev_high = df['high'].iloc[-3]
+    prev_low = df['low'].iloc[-3]
+
+    last_close = df['close'].iloc[-1]
+
+    if last_close > prev_high:
+        return "bullish"
+
+    if last_close < prev_low:
+        return "bearish"
+
+    return None
+
+# ==============================
+# CHOCH DETECTION
+# ==============================
+
+def detect_choch(df):
+
+    prev_low = df['low'].iloc[-3]
+    prev_high = df['high'].iloc[-3]
+
+    last_close = df['close'].iloc[-1]
+
+    if last_close < prev_low:
+        return "bearish"
+
+    if last_close > prev_high:
+        return "bullish"
+
+    return None
+
+# ==============================
+# ENTRY LOGIC
+# ==============================
+
+def entry_logic(symbol):
+
+    df = get_klines(symbol)
+
+    df['ema9'] = ema(df,9)
+    df['ema21'] = ema(df,21)
+
+    ob = detect_ob(df)
+
+    ema_cross = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
+
+    if ob == "bullish" and ema_cross:
+        return "buy"
+
+    if ob == "bearish" and not ema_cross:
+        return "sell"
+
+    return None
+
+# ==============================
+# EXIT LOGIC
+# ==============================
+
+def exit_logic(symbol):
+
+    df = get_klines(symbol)
+
+    choch = detect_choch(df)
+    ob = detect_ob(df)
+
+    if choch:
+        return True
+
+    if ob == "bearish" and in_position.get(symbol) == "buy":
+        return True
+
+    if ob == "bullish" and in_position.get(symbol) == "sell":
+        return True
+
+    return False
+
+# ==============================
+# CONTINUATION LOGIC
+# ==============================
+
+def continuation_logic(symbol):
+
+    df = get_klines(symbol)
+
+    bos = detect_bos(df)
+
+    if bos == "bullish" and in_position.get(symbol) == "buy":
+        return True
+
+    if bos == "bearish" and in_position.get(symbol) == "sell":
+        return True
+
+    return False
+
+# ==============================
+# EXECUTION ENGINE
+# ==============================
+
+def trade_engine():
+
+    global capital
+
+    while True:
+
+        if capital == 0:
+            time.sleep(10)
+            continue
+
+        for symbol in SYMBOLS:
+
+            try:
+
+                if symbol not in in_position:
+
+                    signal = entry_logic(symbol)
+
+                    if signal:
+
+                        price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+
+                        qty = round(capital / price, 4)
+
+                        if signal == "buy":
+
+                            client.order_market_buy(
+                                symbol=symbol,
+                                quantity=qty
+                            )
+
+                        else:
+
+                            client.order_market_sell(
+                                symbol=symbol,
+                                quantity=qty
+                            )
+
+                        entry_price[symbol] = price
+                        in_position[symbol] = signal
+
+                else:
+
+                    if exit_logic(symbol):
+
+                        qty = round(capital / entry_price[symbol],4)
+
+                        if in_position[symbol] == "buy":
+
+                            client.order_market_sell(
+                                symbol=symbol,
+                                quantity=qty
+                            )
+
+                        else:
+
+                            client.order_market_buy(
+                                symbol=symbol,
+                                quantity=qty
+                            )
+
+                        del in_position[symbol]
+
+                    else:
+
+                        continuation_logic(symbol)
+
+            except Exception as e:
+
+                print("ERROR:",e)
+
+        time.sleep(30)
+
+threading.Thread(target=trade_engine, daemon=True).start()
+
+# ==============================
+# ROUTES
+# ==============================
+
 @app.route("/")
-def home(): return render_template("index.html")
-
-@app.route("/dashboard")
-def dashboard():
-    return jsonify({
-        "running": running, "capital": round(investment_capital, 2),
-        "positions": entry_positions, "market": market_snapshot,
-        "log": trade_log[-15:], "error": error_message
-    })
-
-@app.route("/start", methods=["POST"])
-def start(): global running; running = True; return "Started"
-
-@app.route("/stop", methods=["POST"])
-def stop(): global running; running = False; return "Stopped"
+def home():
+    return render_template("index.html")
 
 @app.route("/set_capital", methods=["POST"])
 def set_capital():
-    global investment_capital
-    investment_capital = float(request.json.get("capital", 0))
-    return "Capital Set"
 
-@app.route("/ping")
-def ping(): return "pong"
+    global capital
 
-# ================= KEEP ALIVE =================
-def self_keepalive():
-    while True:
-        try: requests.get(f"{RENDER_URL}/ping", timeout=5)
-        except: pass
-        time.sleep(240)
+    capital = float(request.form["capital"])
 
-threading.Thread(target=trading_loop, daemon=True).start()
-threading.Thread(target=self_keepalive, daemon=True).start()
+    return jsonify({
+        "status":"Capital Set",
+        "capital":capital
+    })
+
+@app.route("/status")
+def status():
+
+    return jsonify({
+        "capital":capital,
+        "positions":in_position
+    })
+
+# ==============================
+# MAIN
+# ==============================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(os.environ.get("PORT",10000))
+
     app.run(host="0.0.0.0", port=port)
