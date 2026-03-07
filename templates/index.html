@@ -1,17 +1,18 @@
 <!DOCTYPE html>
 <html>
+
 <head>
 
-<title>AI SMC Trading Engine</title>
+<title>SMC Trading Engine</title>
 
 <style>
 
 body{
-font-family:Arial;
 background:#0f172a;
 color:white;
+font-family:Arial;
 text-align:center;
-padding-top:40px;
+padding-top:60px;
 }
 
 input{
@@ -21,14 +22,13 @@ font-size:16px;
 
 button{
 padding:10px 20px;
-font-size:16px;
 background:#22c55e;
 border:none;
 color:white;
 cursor:pointer;
 }
 
-#status{
+#msg{
 margin-top:20px;
 font-size:18px;
 }
@@ -39,21 +39,21 @@ font-size:18px;
 
 <body>
 
-<h1>SMC AI Trading Engine</h1>
+<h1>CoinDCX AI Trading Engine</h1>
 
-<p>Enter Capital (INR)</p>
+<p>Set Capital (INR)</p>
 
-<input id="capital" type="number"/>
+<input id="capital" type="number">
 
 <button onclick="setCapital()">Set Capital</button>
 
-<div id="status"></div>
+<div id="msg"></div>
 
 <script>
 
 function setCapital(){
 
-let capital=document.getElementById("capital").value
+let c=document.getElementById("capital").value
 
 fetch("/set_capital",{
 
@@ -61,17 +61,13 @@ method:"POST",
 headers:{
 "Content-Type":"application/x-www-form-urlencoded"
 },
-body:"capital="+capital
+body:"capital="+c
 
 })
-
 .then(res=>res.json())
-
 .then(data=>{
-
-document.getElementById("status").innerHTML =
-"Capital Set Successfully : ₹"+data.capital
-
+document.getElementById("msg").innerHTML =
+"Capital set successfully: ₹"+data.capital
 })
 
 }
