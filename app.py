@@ -45,6 +45,29 @@ def self_keepalive():
 
 threading.Thread(target=self_keepalive, daemon=True).start()
 
+@app.route("/test_api")
+def test_api():
+
+    try:
+
+        data = requests.get(
+            "https://api.coindcx.com/exchange/ticker",
+            timeout=10
+        ).json()
+
+        return {
+            "status":"connected",
+            "markets":len(data)
+        }
+
+    except Exception as e:
+
+        return {
+            "status":"error",
+            "message":str(e)
+        }
+
+
 # -----------------------------
 # SIGNATURE
 # -----------------------------
