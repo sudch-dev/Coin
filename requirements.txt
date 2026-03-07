@@ -4,3 +4,4 @@ numpy
 pytz
 gunicorn
 websocket-client
+pandas
