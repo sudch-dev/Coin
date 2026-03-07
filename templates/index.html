@@ -3,65 +3,26 @@
 
 <head>
 
-<title>CoinDCX AI Trading Engine</title>
+<title>Hedge Bot v5</title>
 
 <style>
 
 body{
-background:#0f172a;
-color:white;
 font-family:Arial;
-margin:0;
-}
-
-header{
-background:#020617;
-padding:15px;
-text-align:center;
-font-size:22px;
-}
-
-.container{
-width:900px;
-margin:auto;
-margin-top:30px;
+background:#111;
+color:#eee;
+padding:20px
 }
 
 .card{
-background:#1e293b;
-padding:20px;
-margin-bottom:20px;
-border-radius:10px;
-}
-
-input{
-width:100%;
-padding:10px;
-margin-bottom:10px;
+background:#222;
+padding:15px;
+margin-bottom:10px
 }
 
 button{
-padding:10px 20px;
-background:#22c55e;
-border:none;
-color:white;
-cursor:pointer;
-margin-right:10px;
-}
-
-.stop{
-background:#ef4444;
-}
-
-table{
-width:100%;
-border-collapse:collapse;
-margin-top:10px;
-}
-
-th,td{
 padding:10px;
-text-align:center;
+margin:5px
 }
 
 </style>
@@ -70,153 +31,102 @@ text-align:center;
 
 <body>
 
-<header>
-CoinDCX AI Trading Engine
-</header>
-
-<div class="container">
+<h2>Crypto Hedge Bot v5</h2>
 
 <div class="card">
 
-<h3>Trading Settings</h3>
-
-<label>Capital (INR)</label>
-<input id="capital">
-
-<label>Risk per Trade (%)</label>
-<input id="risk" value="1">
-
-<label>Take Profit (%)</label>
-<input id="tp" value="2">
-
-<button onclick="save()">Save Settings</button>
-
-<button onclick="startBot()">Start Bot</button>
-
-<button class="stop" onclick="stopBot()">Stop Bot</button>
-
-<div id="msg"></div>
+Status:
+<span id="status"></span>
 
 </div>
 
 <div class="card">
 
-<h3>Status</h3>
+Mode:
+<span id="mode"></span>
 
-<div id="status"></div>
+<button onclick="toggle()">Toggle Paper/Live</button>
 
 </div>
 
 <div class="card">
 
-<h3>Active Positions</h3>
+Capital:
 
-<table>
+<input id="capital" type="number">
 
-<thead>
-
-<tr>
-<th>Pair</th>
-<th>Side</th>
-<th>Entry</th>
-</tr>
-
-</thead>
-
-<tbody id="positions"></tbody>
-
-</table>
+<button onclick="setCapital()">Set</button>
 
 </div>
+
+<div class="card">
+
+<button onclick="start()">Start</button>
+
+<button onclick="stop()">Stop</button>
+
+</div>
+
+<div class="card">
+
+<h3>Positions</h3>
+
+<pre id="positions"></pre>
+
+</div>
+
+<div class="card">
+
+<h3>Logs</h3>
+
+<pre id="logs"></pre>
 
 </div>
 
 <script>
 
-function save(){
+function start(){fetch("/start")}
+function stop(){fetch("/stop")}
+function toggle(){fetch("/toggle_mode")}
 
-fetch("/set_config",{
+function setCapital(){
 
+let c=document.getElementById("capital").value
+
+fetch("/set_capital",{
 method:"POST",
-headers:{
-"Content-Type":"application/json"
-},
-
-body:JSON.stringify({
-
-capital:document.getElementById("capital").value,
-risk:document.getElementById("risk").value,
-tp:document.getElementById("tp").value
-
-})
-
-})
-
-.then(r=>r.json())
-.then(d=>{
-
-document.getElementById("msg").innerHTML="Settings saved"
-
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"capital="+c
 })
 
 }
 
-function startBot(){
-
-fetch("/start")
-.then(r=>r.json())
-.then(d=>{
-
-document.getElementById("msg").innerHTML="Bot started"
-
-})
-
-}
-
-function stopBot(){
-
-fetch("/stop")
-.then(r=>r.json())
-.then(d=>{
-
-document.getElementById("msg").innerHTML="Bot stopped"
-
-})
-
-}
-
-function load(){
+function refresh(){
 
 fetch("/status")
 .then(r=>r.json())
 .then(d=>{
 
-document.getElementById("status").innerHTML =
-"Capital: ₹"+d.capital+" | Running: "+d.running
+document.getElementById("status").innerText =
+d.running ? "RUNNING":"STOPPED"
 
-let rows=""
+document.getElementById("mode").innerText =
+d.paper ? "PAPER":"LIVE"
 
-for(let p in d.positions){
+document.getElementById("positions").innerText =
+JSON.stringify(d.positions,null,2)
 
-rows+=`
-<tr>
-<td>${p}</td>
-<td>${d.positions[p]}</td>
-<td>${d.entry[p]}</td>
-</tr>
-`
-
-}
-
-document.getElementById("positions").innerHTML=rows
+document.getElementById("logs").innerText =
+d.logs.join("\n")
 
 })
 
 }
 
-setInterval(load,5000)
+setInterval(refresh,3000)
 
 </script>
 
 </body>
+
 </html>
