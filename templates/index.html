@@ -1,75 +1,82 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <title>Algo Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+
+<title>AI SMC Trading Engine</title>
+
+<style>
+
+body{
+font-family:Arial;
+background:#0f172a;
+color:white;
+text-align:center;
+padding-top:40px;
+}
+
+input{
+padding:10px;
+font-size:16px;
+}
+
+button{
+padding:10px 20px;
+font-size:16px;
+background:#22c55e;
+border:none;
+color:white;
+cursor:pointer;
+}
+
+#status{
+margin-top:20px;
+font-size:18px;
+}
+
+</style>
+
 </head>
-<body class="bg-slate-900 text-white p-8">
-    <div class="max-w-4xl mx-auto">
-        <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
-            <h1 class="text-2xl font-bold">CoinDCX Live Bot</h1>
-            <div id="status" class="px-4 py-1 rounded bg-red-600 text-xs font-bold uppercase">Stopped</div>
-        </div>
 
-        <div class="grid grid-cols-2 gap-4 mb-8">
-            <div class="bg-slate-800 p-6 rounded-xl">
-                <p class="text-slate-400 text-sm">Active Capital</p>
-                <h2 id="cap" class="text-3xl font-mono">₹0.00</h2>
-            </div>
-            <div class="flex flex-col gap-2">
-                <input id="cap_in" type="number" placeholder="INR" class="bg-slate-800 p-2 rounded border border-slate-700">
-                <button onclick="setCap()" class="bg-blue-600 p-2 rounded font-bold">Set Capital</button>
-            </div>
-        </div>
+<body>
 
-        <div class="flex gap-2 mb-8">
-            <button onclick="cmd('start')" class="bg-emerald-600 px-8 py-2 rounded font-bold flex-1">START BOT</button>
-            <button onclick="cmd('stop')" class="bg-rose-600 px-8 py-2 rounded font-bold flex-1">STOP BOT</button>
-        </div>
+<h1>SMC AI Trading Engine</h1>
 
-        <div id="market" class="grid grid-cols-1 gap-2 mb-8"></div>
+<p>Enter Capital (INR)</p>
 
-        <div class="bg-slate-800 rounded-xl overflow-hidden">
-            <table class="w-full text-left text-sm">
-                <thead class="bg-slate-700 text-slate-400 uppercase text-[10px]">
-                    <tr><th class="p-4">Time</th><th class="p-4">Pair</th><th class="p-4">Side</th><th class="p-4">PnL</th></tr>
-                </thead>
-                <tbody id="logs"></tbody>
-            </table>
-        </div>
-    </div>
+<input id="capital" type="number"/>
 
-    <script>
-        async function cmd(c) { await fetch('/'+c, {method:'POST'}); }
-        async function setCap() { 
-            const val = document.getElementById('cap_in').value;
-            await fetch('/set_capital', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({capital:val})});
-        }
-        async function update() {
-            const res = await fetch('/dashboard');
-            const d = await res.json();
-            document.getElementById('status').className = d.running ? 'px-4 py-1 rounded bg-emerald-600 text-xs font-bold uppercase' : 'px-4 py-1 rounded bg-red-600 text-xs font-bold uppercase';
-            document.getElementById('status').innerText = d.running ? 'Running' : 'Stopped';
-            document.getElementById('cap').innerText = '₹' + d.capital;
-            
-            document.getElementById('market').innerHTML = Object.entries(d.market).map(([p,i]) => `
-                <div class="bg-slate-800 p-4 rounded flex justify-between">
-                    <span>${p}</span> <span class="font-mono">₹${i.price}</span>
-                    <span class="text-xs uppercase font-bold ${i.bias=='bullish'?'text-emerald-400':'text-rose-400'}">${i.bias}</span>
-                </div>
-            `).join('');
+<button onclick="setCapital()">Set Capital</button>
 
-            document.getElementById('logs').innerHTML = d.log.reverse().map(l => `
-                <tr class="border-t border-slate-700">
-                    <td class="p-4 text-slate-500">${l.time}</td>
-                    <td class="p-4 font-bold">${l.pair}</td>
-                    <td class="p-4 uppercase">${l.side}</td>
-                    <td class="p-4 font-mono ${l.pnl > 0 ? 'text-emerald-400' : 'text-rose-400'}">${l.pnl}</td>
-                </tr>
-            `).join('');
-        }
-        setInterval(update, 3000);
-    </script>
+<div id="status"></div>
+
+<script>
+
+function setCapital(){
+
+let capital=document.getElementById("capital").value
+
+fetch("/set_capital",{
+
+method:"POST",
+headers:{
+"Content-Type":"application/x-www-form-urlencoded"
+},
+body:"capital="+capital
+
+})
+
+.then(res=>res.json())
+
+.then(data=>{
+
+document.getElementById("status").innerHTML =
+"Capital Set Successfully : ₹"+data.capital
+
+})
+
+}
+
+</script>
+
 </body>
 </html>
