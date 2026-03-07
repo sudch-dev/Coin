@@ -24,9 +24,8 @@ running = False
 investment_capital = 0
 entry_positions = {}
 trade_log = []
-market_snapshot = {}
+market_snapshot = {pair: {"price": 0, "bias": "Scanning..."} for pair in PAIRS}
 error_message = ""
-market_bias = {}
 structure_levels = {}
 
 # Data Buffers
@@ -36,7 +35,7 @@ volume_data = {pair: [] for pair in PAIRS}
 # ================= SIGNING & API =================
 def sign_payload(payload):
     payload_json = json.dumps(payload, separators=(',', ':'))
-    signature = hmac.new(API_SECRET.encode(), payload_json.encode(), hashlib.sha256).hexdigest()
+    signature = hmac.new(API_SECRET.encode() if API_SECRET else b"", payload_json.encode(), hashlib.sha256).hexdigest()
     return signature, payload_json
 
 def place_market_order(pair, side, quantity):
@@ -58,10 +57,10 @@ def place_market_order(pair, side, quantity):
 
 def get_market_data(pair):
     try:
-        # Using public orderbook for price/volume
         url = f"https://public.coindcx.com{pair}"
         r = requests.get(url, timeout=5)
         data = r.json()
+        # Adjusted for CoinDCX Public API Structure
         price = float(data["bids"][0]["price"])
         volume = float(data["bids"][0]["quantity"])
         return price, volume
@@ -70,39 +69,31 @@ def get_market_data(pair):
 
 # ================= DYNAMIC LOGIC =================
 def get_atr(pair, period=14):
-    """Calculates volatility based on recent price movements."""
-    if len(price_data[pair]) < period + 1:
-        return 0
-    # Simplified ATR using recent price differences
+    if len(price_data[pair]) < period + 1: return 0
     diffs = np.abs(np.diff(price_data[pair][-period-1:]))
     return np.mean(diffs)
 
 def volume_spike(pair):
-    """Uses Z-Score to detect statistically significant volume anomalies."""
     v_data = volume_data[pair]
     if len(v_data) < 20: return False
-    mean_v = np.mean(v_data[-20:])
     std_v = np.std(v_data[-20:])
     if std_v == 0: return False
-    z_score = (v_data[-1] - mean_v) / std_v
-    return z_score > 2.0  # Significant spike filter
+    z_score = (v_data[-1] - np.mean(v_data[-20:])) / std_v
+    return z_score > 2.0
 
 def liquidity_sweep(pair, price):
-    """Checks if price swept liquidity beyond ATR-adjusted levels."""
     level = structure_levels.get(pair)
     atr = get_atr(pair)
     if not level or atr == 0: return False
-    # Dynamic buffer: sweeps 0.5 * ATR past known high/low
-    if price > level["high"] + (atr * 0.5): return True
-    if price < level["low"] - (atr * 0.5): return True
+    if price > level.get("high", 0) + (atr * 0.5): return True
+    if price < level.get("low", float('inf')) - (atr * 0.5): return True
     return False
 
-# ================= POSITION MANAGEMENT =================
+# ================= TRADING ENGINE =================
 def execute_trade(pair, side, price):
     global investment_capital
     if investment_capital <= 0: return
-
-    risk = investment_capital * 0.02 # 2% Risk per trade
+    risk = investment_capital * 0.02 
     qty = round(risk / price, 6)
     order_side = "buy" if side == "long" else "sell"
     
@@ -111,52 +102,18 @@ def execute_trade(pair, side, price):
 
     atr = get_atr(pair)
     entry_positions[pair] = {
-        "side": side,
-        "qty": qty,
-        "entry": price,
+        "side": side, "qty": qty, "entry": price,
         "sl": price - (atr * 2) if side == "long" else price + (atr * 2),
         "peak": price
     }
     trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": side, "pnl": "OPEN"})
 
-def update_trailing_stop(pair, current_price):
-    """Trails the SL to lock in profit as price moves favorably."""
-    pos = entry_positions[pair]
-    atr = get_atr(pair)
-    
-    if pos["side"] == "long":
-        if current_price > pos["peak"]:
-            pos["peak"] = current_price
-            pos["sl"] = max(pos["sl"], current_price - (atr * 1.5))
-        if current_price < pos["sl"]: close_trade(pair, current_price)
-            
-    elif pos["side"] == "short":
-        if current_price < pos["peak"]:
-            pos["peak"] = current_price
-            pos["sl"] = min(pos["sl"], current_price + (atr * 1.5))
-        if current_price > pos["sl"]: close_trade(pair, current_price)
-
-def close_trade(pair, price):
-    global investment_capital
-    pos = entry_positions[pair]
-    exit_side = "sell" if pos["side"] == "long" else "buy"
-    
-    place_market_order(pair, exit_side, pos["qty"])
-    pnl = (price - pos["entry"]) * pos["qty"] if pos["side"] == "long" else (pos["entry"] - price) * pos["qty"]
-    investment_capital += pnl
-    
-    trade_log.append({
-        "time": datetime.now(IST).strftime("%H:%M:%S"),
-        "pair": pair,
-        "side": "CLOSE",
-        "pnl": round(pnl, 2)
-    })
-    del entry_positions[pair]
-
-# ================= MAIN LOOP =================
 def trading_loop():
     global running, error_message
-    while running:
+    while True:
+        if not running:
+            time.sleep(2)
+            continue
         try:
             for pair in PAIRS:
                 price, volume = get_market_data(pair)
@@ -168,12 +125,19 @@ def trading_loop():
                     price_data[pair].pop(0)
                     volume_data[pair].pop(0)
 
-                # Update Trailing Stop if in position
+                # Update Trailing Stop
                 if pair in entry_positions:
-                    update_trailing_stop(pair, price)
+                    pos = entry_positions[pair]
+                    atr = get_atr(pair)
+                    if pos["side"] == "long":
+                        if price > pos["peak"]: pos["peak"] = price; pos["sl"] = max(pos["sl"], price - (atr * 1.5))
+                        if price < pos["sl"]: close_trade(pair, price)
+                    elif pos["side"] == "short":
+                        if price < pos["peak"]: pos["peak"] = price; pos["sl"] = min(pos["sl"], price + (atr * 1.5))
+                        if price > pos["sl"]: close_trade(pair, price)
                     continue
 
-                # Structure Detection (High/Low)
+                # Detect Swing Points
                 if len(price_data[pair]) > 5:
                     window = price_data[pair][-5:]
                     if window[2] == max(window): structure_levels[pair] = {**structure_levels.get(pair, {}), "high": window[2]}
@@ -185,22 +149,36 @@ def trading_loop():
 
                 if liquidity_sweep(pair, price) and volume_spike(pair):
                     execute_trade(pair, "long" if bias == "bullish" else "short", price)
-
             time.sleep(5)
         except Exception as e:
             error_message = str(e)
             time.sleep(5)
 
+def close_trade(pair, price):
+    global investment_capital
+    pos = entry_positions[pair]
+    place_market_order(pair, "sell" if pos["side"] == "long" else "buy", pos["qty"])
+    pnl = (price - pos["entry"]) * pos["qty"] if pos["side"] == "long" else (pos["entry"] - price) * pos["qty"]
+    investment_capital += pnl
+    trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": "CLOSE", "pnl": round(pnl, 2)})
+    del entry_positions[pair]
+
 # ================= ROUTES =================
 @app.route("/")
 def home(): return render_template("index.html")
 
+@app.route("/dashboard")
+def dashboard():
+    return jsonify({
+        "running": running, "capital": round(investment_capital, 2),
+        "positions": entry_positions, "market": market_snapshot,
+        "log": trade_log[-20:], "error": error_message
+    })
+
 @app.route("/start", methods=["POST"])
 def start():
     global running
-    if not running:
-        running = True
-        threading.Thread(target=trading_loop, daemon=True).start()
+    running = True
     return "Started"
 
 @app.route("/stop", methods=["POST"])
@@ -212,22 +190,14 @@ def stop():
 @app.route("/set_capital", methods=["POST"])
 def set_capital():
     global investment_capital
-    investment_capital = float(request.json["capital"])
+    investment_capital = float(request.json.get("capital", 0))
     return "Capital Set"
 
-@app.route("/dashboard")
-def dashboard():
-    return jsonify({
-        "running": running,
-        "capital": round(investment_capital, 2),
-        "positions": entry_positions,
-        "market": market_snapshot,
-        "log": trade_log[-30:],
-        "error": error_message
-    })
+# ================= LIFECYCLE =================
+# Start core loop once on startup
+threading.Thread(target=trading_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Render provides the PORT env var; default to 10000 if not found
+    # ESSENTIAL: Dynamic port for Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
