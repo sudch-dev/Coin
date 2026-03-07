@@ -344,6 +344,37 @@ def status():
 @app.route("/ping")
 def ping():
     return "pong"
+    
+    # AUTO START BOT AFTER SERVER RESTART
+
+AUTO_START = True
+
+def auto_start_bot():
+    global bot_running
+
+    time.sleep(10)
+
+    if AUTO_START:
+        bot_running = True
+        log("AUTO RESTART BOT")
+
+threading.Thread(target=auto_start_bot, daemon=True).start()
+
+######################
+
+STATE_FILE="state.json"
+
+def save_state():
+    with open(STATE_FILE,"w") as f:
+        json.dump(positions,f)
+
+def load_state():
+    global positions
+    try:
+        with open(STATE_FILE) as f:
+            positions=json.load(f)
+    except:
+        positions={}
 
 ########################################
 
