@@ -27,6 +27,37 @@ bot_running = False
 
 app = Flask(__name__)
 
+@app.route("/test_auth")
+def test_auth():
+
+    try:
+
+        timestamp = int(time.time()*1000)
+
+        payload = {
+            "timestamp": timestamp
+        }
+
+        payload_json, signature = sign_payload(payload)
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": API_KEY,
+            "X-AUTH-SIGNATURE": signature
+        }
+
+        r = requests.post(
+            "https://api.coindcx.com/exchange/v1/users/balances",
+            data=payload_json,
+            headers=headers
+        )
+
+        return r.json()
+
+    except Exception as e:
+
+        return {"error": str(e)}
+
 # -----------------------------
 # KEEP ALIVE
 # -----------------------------
