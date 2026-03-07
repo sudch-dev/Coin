@@ -8,360 +8,287 @@ import requests
 import pandas as pd
 from flask import Flask, render_template, request, jsonify
 
+app = Flask(__name__)
+
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-
-RENDER_URL = "https://coin-4k37.onrender.com"
-BASE_URL = "https://api.coindcx.com"
+RENDER_URL = os.getenv("RENDER_URL","https://coin-4k37.onrender.com")
 
 SYMBOLS = ["BTCINR","ETHINR","SOLINR"]
 
-capital = 0
-risk = 1
-tp_percent = 2
-
-positions = {}
-entry_price = {}
+MARKET_MAP = {
+"BTCINR":"B-BTC_INR",
+"ETHINR":"B-ETH_INR",
+"SOLINR":"B-SOL_INR"
+}
 
 bot_running = False
+paper_mode = True
+capital = 1000
 
-app = Flask(__name__)
+logs=[]
+positions={}
 
-@app.route("/test_auth")
-def test_auth():
-
-    try:
-
-        timestamp = int(time.time()*1000)
-
-        payload = {
-            "timestamp": timestamp
-        }
-
-        payload_json, signature = sign_payload(payload)
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-AUTH-APIKEY": API_KEY,
-            "X-AUTH-SIGNATURE": signature
-        }
-
-        r = requests.post(
-            "https://api.coindcx.com/exchange/v1/users/balances",
-            data=payload_json,
-            headers=headers
-        )
-
-        return r.json()
-
-    except Exception as e:
-
-        return {"error": str(e)}
-
-# -----------------------------
+########################################
 # KEEP ALIVE
-# -----------------------------
-
-@app.route("/ping")
-def ping():
-    return "pong"
+########################################
 
 def self_keepalive():
     while True:
         try:
-            requests.get(f"{RENDER_URL}/ping", timeout=5)
+            requests.get(f"{RENDER_URL}/ping",timeout=5)
         except:
             pass
         time.sleep(240)
 
-threading.Thread(target=self_keepalive, daemon=True).start()
+threading.Thread(target=self_keepalive,daemon=True).start()
 
-@app.route("/test_api")
-def test_api():
+########################################
+# LOG
+########################################
 
-    try:
+def log(msg):
+    global logs
+    logs.append(f"{time.strftime('%H:%M:%S')} - {msg}")
+    logs=logs[-100:]
 
-        data = requests.get(
-            "https://api.coindcx.com/exchange/ticker",
-            timeout=10
-        ).json()
-
-        return {
-            "status":"connected",
-            "markets":len(data)
-        }
-
-    except Exception as e:
-
-        return {
-            "status":"error",
-            "message":str(e)
-        }
-
-
-# -----------------------------
-# SIGNATURE
-# -----------------------------
-
-def sign_payload(payload):
-
-    secret = bytes(API_SECRET,'utf-8')
-    payload_json = json.dumps(payload, separators=(',',':'))
-
-    signature = hmac.new(
-        secret,
-        payload_json.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    return payload_json, signature
-
-# -----------------------------
+########################################
 # MARKET DATA
-# -----------------------------
-
-def get_price(symbol):
-
-    data = requests.get(
-        f"{BASE_URL}/exchange/ticker"
-    ).json()
-
-    for d in data:
-        if d["market"] == symbol:
-            return float(d["last_price"])
-
-    return None
-
-# -----------------------------
-# CANDLES
-# -----------------------------
+########################################
 
 def get_candles(symbol):
 
-    url = f"https://public.coindcx.com/market_data/candles?pair={symbol}&interval=15m"
+    try:
 
-    data = requests.get(url).json()
+        url=f"https://public.coindcx.com/market_data/candles?pair={symbol}&interval=1m"
 
-    df = pd.DataFrame(data)
+        r=requests.get(url)
 
-    df["close"]=df["close"].astype(float)
-    df["high"]=df["high"].astype(float)
-    df["low"]=df["low"].astype(float)
+        data=r.json()
 
-    return df.tail(200)
+        df=pd.DataFrame(data)
 
-# -----------------------------
-# INDICATORS
-# -----------------------------
+        df["open"]=df["open"].astype(float)
+        df["high"]=df["high"].astype(float)
+        df["low"]=df["low"].astype(float)
+        df["close"]=df["close"].astype(float)
 
-def ema(series,period):
-    return series.ewm(span=period).mean()
+        return df
 
-# -----------------------------
-# ORDER BLOCK
-# -----------------------------
+    except:
+        return None
 
-def detect_ob(df):
-
-    candle = df.iloc[-2]
-
-    if candle["close"] < candle["open"]:
-        return "bullish"
-
-    if candle["close"] > candle["open"]:
-        return "bearish"
-
-    return None
-
-# -----------------------------
-# BOS
-# -----------------------------
+########################################
+# SMC ENGINE
+########################################
 
 def detect_bos(df):
 
-    prev_high = df["high"].iloc[-3]
-    prev_low = df["low"].iloc[-3]
+    if len(df)<6:
+        return None
 
-    close = df["close"].iloc[-1]
+    if df["high"].iloc[-1] > df["high"].iloc[-5]:
+        return "BULL"
 
-    if close > prev_high:
-        return "bullish"
-
-    if close < prev_low:
-        return "bearish"
+    if df["low"].iloc[-1] < df["low"].iloc[-5]:
+        return "BEAR"
 
     return None
-
-# -----------------------------
-# CHOCH
-# -----------------------------
 
 def detect_choch(df):
 
-    prev_high = df["high"].iloc[-3]
-    prev_low = df["low"].iloc[-3]
+    df["ema20"]=df["close"].ewm(span=20).mean()
 
-    close = df["close"].iloc[-1]
+    if df["close"].iloc[-1] < df["ema20"].iloc[-1]:
+        return "BEAR"
 
-    if close < prev_low:
-        return "bearish"
-
-    if close > prev_high:
-        return "bullish"
+    if df["close"].iloc[-1] > df["ema20"].iloc[-1]:
+        return "BULL"
 
     return None
 
-# -----------------------------
-# ENTRY LOGIC
-# -----------------------------
+def detect_order_block(df):
 
-def entry_logic(symbol):
+    last=df.iloc[-2]
 
-    df = get_candles(symbol)
+    if last["close"]>last["open"]:
+        return "BULLISH_OB"
 
-    df["ema9"]=ema(df["close"],9)
-    df["ema21"]=ema(df["close"],21)
-
-    ob = detect_ob(df)
-
-    if df["ema9"].iloc[-1] > df["ema21"].iloc[-1] and ob=="bullish":
-        return "buy"
-
-    if df["ema9"].iloc[-1] < df["ema21"].iloc[-1] and ob=="bearish":
-        return "sell"
+    if last["close"]<last["open"]:
+        return "BEARISH_OB"
 
     return None
 
-# -----------------------------
-# EXIT LOGIC
-# -----------------------------
+########################################
+# SIGNAL
+########################################
 
-def exit_logic(symbol):
+def compute_signal(symbol):
 
-    df = get_candles(symbol)
+    df=get_candles(symbol)
 
-    choch = detect_choch(df)
-    ob = detect_ob(df)
+    if df is None:
+        return None
 
-    side = positions.get(symbol)
+    df["ema20"]=df["close"].ewm(span=20).mean()
+    df["ema50"]=df["close"].ewm(span=50).mean()
 
-    if choch:
-        return True
+    trend="LONG" if df["ema20"].iloc[-1] > df["ema50"].iloc[-1] else "SHORT"
 
-    if side=="buy" and ob=="bearish":
-        return True
+    bos=detect_bos(df)
+    choch=detect_choch(df)
+    ob=detect_order_block(df)
 
-    if side=="sell" and ob=="bullish":
-        return True
+    return {
+    "trend":trend,
+    "bos":bos,
+    "choch":choch,
+    "ob":ob,
+    "price":df["close"].iloc[-1]
+    }
 
-    return False
-
-# -----------------------------
+########################################
 # ORDER
-# -----------------------------
+########################################
 
-def place_order(symbol,side,quantity):
+def place_order(symbol,side,price):
 
-    timestamp = int(time.time()*1000)
+    qty=capital/price
 
-    payload={
+    if paper_mode:
+
+        log(f"PAPER {side} {symbol} @ {price}")
+
+        positions[symbol]={
+        "side":side,
+        "entry":price
+        }
+
+        return
+
+    try:
+
+        market=MARKET_MAP[symbol]
+
+        payload={
         "side":side,
         "order_type":"market_order",
-        "market":symbol,
-        "total_quantity":quantity,
-        "timestamp":timestamp
-    }
+        "market":market,
+        "total_quantity":qty,
+        "timestamp":int(time.time()*1000)
+        }
 
-    payload_json,signature = sign_payload(payload)
+        json_payload=json.dumps(payload)
 
-    headers={
-        "Content-Type":"application/json",
+        signature=hmac.new(
+        bytes(API_SECRET,'utf-8'),
+        json_payload.encode(),
+        hashlib.sha256
+        ).hexdigest()
+
+        headers={
         "X-AUTH-APIKEY":API_KEY,
         "X-AUTH-SIGNATURE":signature
-    }
+        }
 
-    r = requests.post(
-        f"{BASE_URL}/exchange/v1/orders/create",
-        data=payload_json,
+        r=requests.post(
+        "https://api.coindcx.com/exchange/v1/orders/create",
+        data=json_payload,
         headers=headers
-    )
+        )
 
-    return r.json()
+        log(r.text)
 
-# -----------------------------
+    except Exception as e:
+
+        log(str(e))
+
+########################################
 # ENGINE
-# -----------------------------
+########################################
 
-def trading_engine():
+def trading_loop():
 
-    global capital,bot_running
+    global bot_running
 
     while True:
 
-        if not bot_running or capital==0:
+        if not bot_running:
             time.sleep(5)
             continue
 
         for symbol in SYMBOLS:
 
-            try:
+            signal=compute_signal(symbol)
 
-                price = get_price(symbol)
+            if not signal:
+                continue
 
-                if symbol not in positions:
+            price=signal["price"]
 
-                    signal = entry_logic(symbol)
+            ################################
+            # ENTRY
+            ################################
 
-                    if signal:
+            if symbol not in positions:
 
-                        qty = round((capital*(risk/100))/price,6)
+                if signal["ob"]=="BULLISH_OB" and signal["trend"]=="LONG":
 
-                        place_order(symbol,signal,qty)
+                    place_order(symbol,"buy",price)
 
-                        positions[symbol]=signal
-                        entry_price[symbol]=price
+                if signal["ob"]=="BEARISH_OB" and signal["trend"]=="SHORT":
 
-                else:
+                    place_order(symbol,"sell",price)
 
-                    entry = entry_price[symbol]
+            ################################
+            # MANAGEMENT
+            ################################
 
-                    if price >= entry*(1+tp_percent/100) or exit_logic(symbol):
+            else:
 
-                        qty = round((capital*(risk/100))/entry,6)
+                entry=positions[symbol]["entry"]
 
-                        side = "sell" if positions[symbol]=="buy" else "buy"
+                pnl=(price-entry)/entry
 
-                        place_order(symbol,side,qty)
+                ################################
+                # CONTINUATION
+                ################################
 
-                        del positions[symbol]
+                if signal["bos"]:
+                    log(f"{symbol} BoS detected → continue")
 
-            except Exception as e:
-                print(e)
+                ################################
+                # EXIT
+                ################################
 
-        time.sleep(30)
+                if signal["choch"]:
 
-threading.Thread(target=trading_engine,daemon=True).start()
+                    log(f"{symbol} CHoCH exit")
 
-# -----------------------------
+                    del positions[symbol]
+
+                elif abs(pnl)>0.02:
+
+                    log(f"{symbol} TP/SL exit")
+
+                    del positions[symbol]
+
+        time.sleep(60)
+
+threading.Thread(target=trading_loop,daemon=True).start()
+
+########################################
 # ROUTES
-# -----------------------------
+########################################
 
 @app.route("/")
 def home():
-    return render_template("index.html")
 
-@app.route("/set_config",methods=["POST"])
-def set_config():
-
-    global capital,risk,tp_percent
-
-    data=request.json
-
-    capital=float(data["capital"])
-    risk=float(data["risk"])
-    tp_percent=float(data["tp"])
-
-    return jsonify({"status":"saved"})
+    return render_template(
+    "index.html",
+    capital=capital,
+    paper_mode=paper_mode
+    )
 
 @app.route("/start")
 def start():
@@ -369,7 +296,9 @@ def start():
     global bot_running
     bot_running=True
 
-    return jsonify({"status":"started"})
+    log("BOT STARTED")
+
+    return "started"
 
 @app.route("/stop")
 def stop():
@@ -377,21 +306,46 @@ def stop():
     global bot_running
     bot_running=False
 
-    return jsonify({"status":"stopped"})
+    log("BOT STOPPED")
+
+    return "stopped"
+
+@app.route("/toggle_mode")
+def toggle_mode():
+
+    global paper_mode
+    paper_mode=not paper_mode
+
+    log("MODE "+("PAPER" if paper_mode else "LIVE"))
+
+    return "ok"
+
+@app.route("/set_capital",methods=["POST"])
+def set_capital():
+
+    global capital
+    capital=float(request.form["capital"])
+
+    log(f"Capital set {capital}")
+
+    return "ok"
 
 @app.route("/status")
 def status():
 
     return jsonify({
-        "capital":capital,
-        "positions":positions,
-        "entry":entry_price,
-        "running":bot_running
+    "running":bot_running,
+    "paper":paper_mode,
+    "capital":capital,
+    "positions":positions,
+    "logs":logs
     })
 
-# -----------------------------
-# MAIN
-# -----------------------------
+@app.route("/ping")
+def ping():
+    return "pong"
+
+########################################
 
 if __name__=="__main__":
 
