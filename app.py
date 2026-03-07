@@ -18,6 +18,7 @@ API_SECRET = os.getenv("API_SECRET")
 BASE_URL = "https://api.coindcx.com"
 IST = pytz.timezone("Asia/Kolkata")
 PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
+RENDER_URL = "https://coin-4k37.onrender.com"
 
 # Trading State
 running = False
@@ -41,11 +42,8 @@ def sign_payload(payload):
 def place_market_order(pair, side, quantity):
     url = f"{BASE_URL}/exchange/v1/orders/create"
     payload = {
-        "side": side,
-        "order_type": "market_order",
-        "market": pair,
-        "total_quantity": quantity,
-        "timestamp": int(time.time() * 1000)
+        "side": side, "order_type": "market_order", "market": pair,
+        "total_quantity": quantity, "timestamp": int(time.time() * 1000)
     }
     signature, payload_json = sign_payload(payload)
     headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": signature, "Content-Type": "application/json"}
@@ -60,8 +58,7 @@ def get_market_data(pair):
         url = f"https://public.coindcx.com{pair}"
         r = requests.get(url, timeout=5)
         data = r.json()
-        # Adjusted for CoinDCX Public API Structure
-        price = float(data["bids"][0]["price"])
+        price = float(data["bids"][0]["price"]) # Fixed indexing for CoinDCX JSON
         volume = float(data["bids"][0]["quantity"])
         return price, volume
     except:
@@ -85,6 +82,7 @@ def liquidity_sweep(pair, price):
     level = structure_levels.get(pair)
     atr = get_atr(pair)
     if not level or atr == 0: return False
+    # Buffers are now volatility-dependent
     if price > level.get("high", 0) + (atr * 0.5): return True
     if price < level.get("low", float('inf')) - (atr * 0.5): return True
     return False
@@ -125,7 +123,7 @@ def trading_loop():
                     price_data[pair].pop(0)
                     volume_data[pair].pop(0)
 
-                # Update Trailing Stop
+                # Update Trailing Stop (Skimming Logic)
                 if pair in entry_positions:
                     pos = entry_positions[pair]
                     atr = get_atr(pair)
@@ -137,13 +135,13 @@ def trading_loop():
                         if price > pos["sl"]: close_trade(pair, price)
                     continue
 
-                # Detect Swing Points
+                # Reactive Swing Point Tracking
                 if len(price_data[pair]) > 5:
                     window = price_data[pair][-5:]
-                    if window[2] == max(window): structure_levels[pair] = {**structure_levels.get(pair, {}), "high": window[2]}
-                    if window[2] == min(window): structure_levels[pair] = {**structure_levels.get(pair, {}), "low": window[2]}
+                    if window[-1] == max(window): structure_levels[pair] = {**structure_levels.get(pair, {}), "high": window[-1]}
+                    if window[-1] == min(window): structure_levels[pair] = {**structure_levels.get(pair, {}), "low": window[-1]}
 
-                # Entry Logic
+                # Entry Conditions
                 bias = "bullish" if price > np.mean(price_data[pair][-50:]) else "bearish"
                 market_snapshot[pair] = {"price": price, "bias": bias}
 
@@ -193,11 +191,23 @@ def set_capital():
     investment_capital = float(request.json.get("capital", 0))
     return "Capital Set"
 
-# ================= LIFECYCLE =================
-# Start core loop once on startup
+@app.route("/ping")
+def ping(): return "pong"
+
+# ================= BACKGROUND THREADS =================
+def self_keepalive():
+    while True:
+        try:
+            # Pings the provided Render URL to prevent idling
+            requests.get(f"{RENDER_URL}/ping", timeout=5)
+        except:
+            pass
+        time.sleep(240)
+
+# Critical: Global thread startup
 threading.Thread(target=trading_loop, daemon=True).start()
+threading.Thread(target=self_keepalive, daemon=True).start()
 
 if __name__ == "__main__":
-    # ESSENTIAL: Dynamic port for Render
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
