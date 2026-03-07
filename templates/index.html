@@ -1,197 +1,164 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Institutional SMC Engine</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Crypto Bot | CoinDCX</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com"></script>
     <style>
-        body {
-            font-family: Arial;
-            background-color: #0e1117;
-            color: #ffffff;
-            padding: 20px;
-        }
-
-        h1 {
-            text-align: center;
-        }
-
-        .card {
-            background: #161b22;
-            padding: 20px;
-            margin: 15px 0;
-            border-radius: 8px;
-        }
-
-        button {
-            padding: 10px 15px;
-            margin: 5px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-
-        .start { background: #2ecc71; color: white; }
-        .stop { background: #e74c3c; color: white; }
-        .set { background: #3498db; color: white; }
-
-        input {
-            padding: 8px;
-            width: 150px;
-            border-radius: 4px;
-            border: none;
-        }
-
-        table {
-            width: 100%;
-            margin-top: 10px;
-            border-collapse: collapse;
-        }
-
-        th, td {
-            padding: 8px;
-            text-align: center;
-        }
-
-        th {
-            background: #222;
-        }
-
-        .success { color: #2ecc71; }
-        .error { color: #e74c3c; }
+        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
+        body { background: #0f172a; color: #f8fafc; }
+        .status-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
     </style>
 </head>
+<body class="p-4 md:p-8">
+    <div class="max-w-6xl mx-auto">
+        <!-- Header -->
+        <div class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
+            <div>
+                <h1 class="text-3xl font-bold bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
+                    AlgoTrader <span class="text-sm font-mono text-slate-500">v2.0 Dynamic</span>
+                </h1>
+                <div id="bot-status" class="flex items-center gap-2 mt-1">
+                    <div id="status-dot" class="w-3 h-3 rounded-full bg-red-500"></div>
+                    <span id="status-text" class="text-xs uppercase tracking-widest text-slate-400 font-bold">Stopped</span>
+                </div>
+            </div>
+            
+            <div class="flex gap-3">
+                <input id="capital-input" type="number" placeholder="Enter Capital (INR)" class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <button onclick="setCapital()" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-sm font-bold transition">Set Capital</button>
+                <button id="start-btn" onclick="toggleBot(true)" class="bg-emerald-600 hover:bg-emerald-500 px-6 py-2 rounded-lg text-sm font-bold transition">START</button>
+                <button id="stop-btn" onclick="toggleBot(false)" class="bg-rose-600 hover:bg-rose-500 px-6 py-2 rounded-lg text-sm font-bold transition">STOP</button>
+            </div>
+        </div>
 
-<body>
+        <!-- Stats Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="glass p-6 rounded-2xl">
+                <p class="text-slate-400 text-xs uppercase font-bold mb-1">Active Capital</p>
+                <h2 id="display-capital" class="text-3xl font-mono">₹0.00</h2>
+            </div>
+            <div class="glass p-6 rounded-2xl">
+                <p class="text-slate-400 text-xs uppercase font-bold mb-1">Open Positions</p>
+                <h2 id="display-pos-count" class="text-3xl font-mono">0</h2>
+            </div>
+            <div class="glass p-6 rounded-2xl">
+                <p class="text-slate-400 text-xs uppercase font-bold mb-1">System Errors</p>
+                <h2 id="display-error" class="text-sm text-rose-400 truncate">None</h2>
+            </div>
+        </div>
 
-<h1>SMC Live Trading Engine</h1>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <!-- Market Watch -->
+            <div class="glass rounded-2xl overflow-hidden">
+                <div class="bg-white/5 px-6 py-4 border-b border-white/10 flex justify-between items-center">
+                    <h3 class="font-bold flex items-center gap-2"><i data-lucide="bar-chart-3" class="w-4 h-4"></i> Market Bias (Dynamic)</h3>
+                </div>
+                <div id="market-list" class="p-6 space-y-4">
+                    <!-- Pairs will inject here -->
+                </div>
+            </div>
 
-<div class="card">
-    <h3>Control Panel</h3>
+            <!-- Trade Log -->
+            <div class="glass rounded-2xl overflow-hidden">
+                <div class="bg-white/5 px-6 py-4 border-b border-white/10 flex justify-between items-center">
+                    <h3 class="font-bold flex items-center gap-2"><i data-lucide="history" class="w-4 h-4"></i> Recent Activity</h3>
+                </div>
+                <div class="overflow-y-auto max-h-[400px]">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-white/5 text-slate-400 uppercase text-[10px]">
+                            <tr>
+                                <th class="px-6 py-3">Time</th>
+                                <th class="px-6 py-3">Pair</th>
+                                <th class="px-6 py-3">Type</th>
+                                <th class="px-6 py-3 text-right">PnL (INR)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="log-table">
+                            <!-- Logs will inject here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    <button class="start" onclick="startBot()">Start</button>
-    <button class="stop" onclick="stopBot()">Stop</button>
+    <script>
+        lucide.createIcons();
 
-    <br><br>
-
-    <input type="number" id="capitalInput" placeholder="Enter Capital">
-    <button class="set" onclick="setCapital()">Set Capital</button>
-
-    <p id="capitalStatus"></p>
-</div>
-
-<div class="card">
-    <h3>Live Dashboard</h3>
-    <p><b>Status:</b> <span id="status"></span></p>
-    <p><b>Capital:</b> ₹ <span id="capital"></span></p>
-</div>
-
-<div class="card">
-    <h3>Market Snapshot</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>Pair</th>
-                <th>Price</th>
-                <th>Bias</th>
-            </tr>
-        </thead>
-        <tbody id="marketTable"></tbody>
-    </table>
-</div>
-
-<div class="card">
-    <h3>Trade Log</h3>
-    <table>
-        <thead>
-            <tr>
-                <th>Time</th>
-                <th>Pair</th>
-                <th>Side</th>
-                <th>PNL</th>
-            </tr>
-        </thead>
-        <tbody id="tradeLog"></tbody>
-    </table>
-</div>
-
-<script>
-
-function startBot() {
-    fetch("/start", {method:"POST"});
-}
-
-function stopBot() {
-    fetch("/stop", {method:"POST"});
-}
-
-function setCapital() {
-    let capital = document.getElementById("capitalInput").value;
-
-    if (!capital || capital <= 0) {
-        document.getElementById("capitalStatus").innerHTML =
-            "<span class='error'>Enter valid capital amount</span>";
-        return;
-    }
-
-    fetch("/set_capital", {
-        method:"POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({capital: capital})
-    })
-    .then(res => res.text())
-    .then(data => {
-        document.getElementById("capitalStatus").innerHTML =
-            "<span class='success'>Capital Successfully Set ✔</span>";
-        document.getElementById("capitalInput").value = "";
-    })
-    .catch(() => {
-        document.getElementById("capitalStatus").innerHTML =
-            "<span class='error'>Error setting capital</span>";
-    });
-}
-
-function updateDashboard() {
-    fetch("/dashboard")
-    .then(res => res.json())
-    .then(data => {
-
-        document.getElementById("status").innerText =
-            data.running ? "Running" : "Stopped";
-
-        document.getElementById("capital").innerText =
-            data.capital;
-
-        // Market table
-        let table = "";
-        for (let pair in data.market) {
-            table += `
-                <tr>
-                    <td>${pair}</td>
-                    <td>${data.market[pair].price}</td>
-                    <td>${data.market[pair].bias || "-"}</td>
-                </tr>`;
+        async function toggleBot(state) {
+            const endpoint = state ? '/start' : '/stop';
+            await fetch(endpoint, { method: 'POST' });
         }
-        document.getElementById("marketTable").innerHTML = table;
 
-        // Trade log
-        let log = "";
-        data.log.forEach(trade => {
-            log += `
-                <tr>
-                    <td>${trade.time}</td>
-                    <td>${trade.pair}</td>
-                    <td>${trade.side}</td>
-                    <td>${trade.pnl}</td>
-                </tr>`;
-        });
-        document.getElementById("tradeLog").innerHTML = log;
-    });
-}
+        async function setCapital() {
+            const val = document.getElementById('capital-input').value;
+            await fetch('/set_capital', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({capital: val})
+            });
+            alert("Capital Updated!");
+        }
 
-setInterval(updateDashboard, 3000);
+        async function updateDashboard() {
+            try {
+                const res = await fetch('/dashboard');
+                const data = await res.json();
 
-</script>
+                // Update Status
+                const dot = document.getElementById('status-dot');
+                const text = document.getElementById('status-text');
+                dot.className = data.running ? 'w-3 h-3 rounded-full bg-emerald-500 status-pulse' : 'w-3 h-3 rounded-full bg-red-500';
+                text.innerText = data.running ? 'Running' : 'Stopped';
 
+                // Update Stats
+                document.getElementById('display-capital').innerText = `₹${data.capital}`;
+                document.getElementById('display-pos-count').innerText = Object.keys(data.positions).length;
+                document.getElementById('display-error').innerText = data.error || 'None';
+
+                // Update Market List
+                const marketList = document.getElementById('market-list');
+                marketList.innerHTML = Object.entries(data.market).map(([pair, info]) => `
+                    <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg">
+                        <div>
+                            <p class="font-bold">${pair}</p>
+                            <p class="text-xs text-slate-400">₹${info.price}</p>
+                        </div>
+                        <div class="text-right">
+                            <span class="px-3 py-1 rounded-full text-[10px] font-bold uppercase ${info.bias === 'bullish' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}">
+                                ${info.bias || 'Scanning...'}
+                            </span>
+                        </div>
+                    </div>
+                `).join('');
+
+                // Update Logs
+                const logTable = document.getElementById('log-table');
+                logTable.innerHTML = data.log.reverse().map(log => `
+                    <tr class="border-b border-white/5">
+                        <td class="px-6 py-4 text-slate-500">${log.time}</td>
+                        <td class="px-6 py-4 font-bold">${log.pair}</td>
+                        <td class="px-6 py-4">
+                            <span class="${log.side === 'long' ? 'text-emerald-400' : log.side === 'short' ? 'text-rose-400' : 'text-blue-400'} font-bold">
+                                ${log.side.toUpperCase()}
+                            </span>
+                        </td>
+                        <td class="px-6 py-4 text-right font-mono ${parseFloat(log.pnl) > 0 ? 'text-emerald-400' : 'text-rose-400'}">
+                            ${log.pnl}
+                        </td>
+                    </tr>
+                `).join('');
+
+            } catch (e) {
+                console.error("Dashboard update failed", e);
+            }
+        }
+
+        setInterval(updateDashboard, 3000);
+    </script>
 </body>
 </html>
