@@ -1,51 +1,41 @@
 import os
 import time
+import json
+import hmac
+import hashlib
 import threading
 import requests
 import pandas as pd
-from flask import Flask, render_template, request, jsonify
-from binance.client import Client
 
-# ==============================
+from flask import Flask, render_template, request, jsonify
+
+# =========================
 # CONFIG
-# ==============================
+# =========================
 
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 RENDER_URL = "https://coin-4k37.onrender.com"
 
-SYMBOLS = [
-    "BTCINR",
-    "ETHINR",
-    "SOLINR"
-]
+SYMBOLS = ["BTCINR","ETHINR","SOLINR"]
 
-TIMEFRAME = Client.KLINE_INTERVAL_15MINUTE
+BASE_URL = "https://api.coindcx.com"
 
 capital = 0
-in_position = {}
+positions = {}
 entry_price = {}
-
-# ==============================
-# BINANCE CLIENT
-# ==============================
-
-client = Client(API_KEY, API_SECRET)
-
-# ==============================
-# FLASK
-# ==============================
 
 app = Flask(__name__)
 
-# ==============================
-# KEEP ALIVE
-# ==============================
+# =========================
+# KEEPALIVE
+# =========================
 
 @app.route("/ping")
 def ping():
     return "pong"
+
 
 def self_keepalive():
     while True:
@@ -55,161 +45,234 @@ def self_keepalive():
             pass
         time.sleep(240)
 
+
 threading.Thread(target=self_keepalive, daemon=True).start()
 
-# ==============================
-# DATA FETCH
-# ==============================
+# =========================
+# COINDCX SIGNATURE
+# =========================
 
-def get_klines(symbol):
+def sign_payload(payload):
 
-    klines = client.get_klines(
-        symbol=symbol,
-        interval=TIMEFRAME,
-        limit=200
+    secret = bytes(API_SECRET, 'utf-8')
+    payload_json = json.dumps(payload, separators=(',', ':'))
+
+    signature = hmac.new(
+        secret,
+        payload_json.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    return payload_json, signature
+
+
+# =========================
+# MARKET DATA
+# =========================
+
+def get_price(symbol):
+
+    ticker = requests.get(
+        f"{BASE_URL}/exchange/ticker"
+    ).json()
+
+    for t in ticker:
+        if t["market"] == symbol:
+            return float(t["last_price"])
+
+    return None
+
+
+# =========================
+# ORDER EXECUTION
+# =========================
+
+def place_order(symbol, side, quantity):
+
+    timestamp = int(time.time()*1000)
+
+    payload = {
+        "side": side,
+        "order_type": "market_order",
+        "market": symbol,
+        "total_quantity": quantity,
+        "timestamp": timestamp
+    }
+
+    payload_json, signature = sign_payload(payload)
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": API_KEY,
+        "X-AUTH-SIGNATURE": signature
+    }
+
+    r = requests.post(
+        f"{BASE_URL}/exchange/v1/orders/create",
+        data=payload_json,
+        headers=headers
     )
 
-    df = pd.DataFrame(klines, columns=[
-        'time','open','high','low','close','volume',
-        'ct','qav','n','tbbav','tbqav','ignore'
-    ])
+    return r.json()
 
-    df['close'] = df['close'].astype(float)
-    df['high'] = df['high'].astype(float)
-    df['low'] = df['low'].astype(float)
 
-    return df
+# =========================
+# HISTORICAL DATA
+# =========================
 
-# ==============================
+def get_candles(symbol):
+
+    url = f"https://public.coindcx.com/market_data/candles?pair={symbol}&interval=15m"
+
+    data = requests.get(url).json()
+
+    df = pd.DataFrame(data)
+
+    df["close"] = df["close"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
+
+    return df.tail(200)
+
+
+# =========================
 # INDICATORS
-# ==============================
+# =========================
 
-def ema(df, period):
+def ema(series, period):
+    return series.ewm(span=period).mean()
 
-    return df['close'].ewm(span=period).mean()
 
-# ==============================
-# ORDER BLOCK DETECTION
-# ==============================
+# =========================
+# ORDER BLOCK
+# =========================
 
 def detect_ob(df):
 
-    last = df.iloc[-2]
+    candle = df.iloc[-2]
 
-    if last['close'] < last['open']:
+    if candle["close"] < candle["open"]:
         return "bullish"
 
-    if last['close'] > last['open']:
+    if candle["close"] > candle["open"]:
         return "bearish"
 
     return None
 
-# ==============================
-# BOS DETECTION
-# ==============================
+
+# =========================
+# BOS
+# =========================
 
 def detect_bos(df):
 
-    prev_high = df['high'].iloc[-3]
-    prev_low = df['low'].iloc[-3]
+    prev_high = df["high"].iloc[-3]
+    prev_low = df["low"].iloc[-3]
 
-    last_close = df['close'].iloc[-1]
+    close = df["close"].iloc[-1]
 
-    if last_close > prev_high:
+    if close > prev_high:
         return "bullish"
 
-    if last_close < prev_low:
+    if close < prev_low:
         return "bearish"
 
     return None
 
-# ==============================
-# CHOCH DETECTION
-# ==============================
+
+# =========================
+# CHOCH
+# =========================
 
 def detect_choch(df):
 
-    prev_low = df['low'].iloc[-3]
-    prev_high = df['high'].iloc[-3]
+    prev_high = df["high"].iloc[-3]
+    prev_low = df["low"].iloc[-3]
 
-    last_close = df['close'].iloc[-1]
+    close = df["close"].iloc[-1]
 
-    if last_close < prev_low:
+    if close < prev_low:
         return "bearish"
 
-    if last_close > prev_high:
+    if close > prev_high:
         return "bullish"
 
     return None
 
-# ==============================
+
+# =========================
 # ENTRY LOGIC
-# ==============================
+# =========================
 
 def entry_logic(symbol):
 
-    df = get_klines(symbol)
+    df = get_candles(symbol)
 
-    df['ema9'] = ema(df,9)
-    df['ema21'] = ema(df,21)
+    df["ema9"] = ema(df["close"],9)
+    df["ema21"] = ema(df["close"],21)
 
     ob = detect_ob(df)
 
-    ema_cross = df['ema9'].iloc[-1] > df['ema21'].iloc[-1]
-
-    if ob == "bullish" and ema_cross:
+    if df["ema9"].iloc[-1] > df["ema21"].iloc[-1] and ob=="bullish":
         return "buy"
 
-    if ob == "bearish" and not ema_cross:
+    if df["ema9"].iloc[-1] < df["ema21"].iloc[-1] and ob=="bearish":
         return "sell"
 
     return None
 
-# ==============================
+
+# =========================
 # EXIT LOGIC
-# ==============================
+# =========================
 
 def exit_logic(symbol):
 
-    df = get_klines(symbol)
+    df = get_candles(symbol)
 
     choch = detect_choch(df)
     ob = detect_ob(df)
 
+    side = positions.get(symbol)
+
     if choch:
         return True
 
-    if ob == "bearish" and in_position.get(symbol) == "buy":
+    if side=="buy" and ob=="bearish":
         return True
 
-    if ob == "bullish" and in_position.get(symbol) == "sell":
+    if side=="sell" and ob=="bullish":
         return True
 
     return False
 
-# ==============================
-# CONTINUATION LOGIC
-# ==============================
+
+# =========================
+# CONTINUATION
+# =========================
 
 def continuation_logic(symbol):
 
-    df = get_klines(symbol)
+    df = get_candles(symbol)
 
     bos = detect_bos(df)
 
-    if bos == "bullish" and in_position.get(symbol) == "buy":
+    side = positions.get(symbol)
+
+    if side=="buy" and bos=="bullish":
         return True
 
-    if bos == "bearish" and in_position.get(symbol) == "sell":
+    if side=="sell" and bos=="bearish":
         return True
 
     return False
 
-# ==============================
-# EXECUTION ENGINE
-# ==============================
 
-def trade_engine():
+# =========================
+# TRADING ENGINE
+# =========================
+
+def engine():
 
     global capital
 
@@ -223,74 +286,52 @@ def trade_engine():
 
             try:
 
-                if symbol not in in_position:
+                price = get_price(symbol)
+
+                if symbol not in positions:
 
                     signal = entry_logic(symbol)
 
                     if signal:
 
-                        price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                        qty = round(capital/price,6)
 
-                        qty = round(capital / price, 4)
+                        place_order(symbol, signal, qty)
 
-                        if signal == "buy":
-
-                            client.order_market_buy(
-                                symbol=symbol,
-                                quantity=qty
-                            )
-
-                        else:
-
-                            client.order_market_sell(
-                                symbol=symbol,
-                                quantity=qty
-                            )
-
+                        positions[symbol] = signal
                         entry_price[symbol] = price
-                        in_position[symbol] = signal
 
                 else:
 
                     if exit_logic(symbol):
 
-                        qty = round(capital / entry_price[symbol],4)
+                        qty = round(capital/entry_price[symbol],6)
 
-                        if in_position[symbol] == "buy":
+                        side = "sell" if positions[symbol]=="buy" else "buy"
 
-                            client.order_market_sell(
-                                symbol=symbol,
-                                quantity=qty
-                            )
+                        place_order(symbol, side, qty)
 
-                        else:
-
-                            client.order_market_buy(
-                                symbol=symbol,
-                                quantity=qty
-                            )
-
-                        del in_position[symbol]
+                        del positions[symbol]
 
                     else:
-
                         continuation_logic(symbol)
 
             except Exception as e:
-
-                print("ERROR:",e)
+                print("Error:",e)
 
         time.sleep(30)
 
-threading.Thread(target=trade_engine, daemon=True).start()
 
-# ==============================
-# ROUTES
-# ==============================
+threading.Thread(target=engine, daemon=True).start()
+
+# =========================
+# UI ROUTES
+# =========================
 
 @app.route("/")
 def home():
     return render_template("index.html")
+
 
 @app.route("/set_capital", methods=["POST"])
 def set_capital():
@@ -300,24 +341,26 @@ def set_capital():
     capital = float(request.form["capital"])
 
     return jsonify({
-        "status":"Capital Set",
+        "status":"capital set",
         "capital":capital
     })
+
 
 @app.route("/status")
 def status():
 
     return jsonify({
         "capital":capital,
-        "positions":in_position
+        "positions":positions
     })
 
-# ==============================
+
+# =========================
 # MAIN
-# ==============================
+# =========================
 
 if __name__ == "__main__":
 
     port = int(os.environ.get("PORT",10000))
 
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0",port=port)
