@@ -5,3 +5,4 @@ pytz
 gunicorn
 websocket-client
 pandas
+binance
