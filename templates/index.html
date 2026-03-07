@@ -2,163 +2,74 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dynamic Crypto Bot | CoinDCX</title>
+    <title>Algo Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com"></script>
-    <style>
-        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }
-        body { background: #0f172a; color: #f8fafc; }
-        .status-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
-    </style>
 </head>
-<body class="p-4 md:p-8">
-    <div class="max-w-6xl mx-auto">
-        <!-- Header -->
-        <div class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
-            <div>
-                <h1 class="text-3xl font-bold bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">
-                    AlgoTrader <span class="text-sm font-mono text-slate-500">v2.0 Dynamic</span>
-                </h1>
-                <div id="bot-status" class="flex items-center gap-2 mt-1">
-                    <div id="status-dot" class="w-3 h-3 rounded-full bg-red-500"></div>
-                    <span id="status-text" class="text-xs uppercase tracking-widest text-slate-400 font-bold">Stopped</span>
-                </div>
+<body class="bg-slate-900 text-white p-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+            <h1 class="text-2xl font-bold">CoinDCX Live Bot</h1>
+            <div id="status" class="px-4 py-1 rounded bg-red-600 text-xs font-bold uppercase">Stopped</div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-4 mb-8">
+            <div class="bg-slate-800 p-6 rounded-xl">
+                <p class="text-slate-400 text-sm">Active Capital</p>
+                <h2 id="cap" class="text-3xl font-mono">₹0.00</h2>
             </div>
-            
-            <div class="flex gap-3">
-                <input id="capital-input" type="number" placeholder="Enter Capital (INR)" class="bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-                <button onclick="setCapital()" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded-lg text-sm font-bold transition">Set Capital</button>
-                <button id="start-btn" onclick="toggleBot(true)" class="bg-emerald-600 hover:bg-emerald-500 px-6 py-2 rounded-lg text-sm font-bold transition">START</button>
-                <button id="stop-btn" onclick="toggleBot(false)" class="bg-rose-600 hover:bg-rose-500 px-6 py-2 rounded-lg text-sm font-bold transition">STOP</button>
+            <div class="flex flex-col gap-2">
+                <input id="cap_in" type="number" placeholder="INR" class="bg-slate-800 p-2 rounded border border-slate-700">
+                <button onclick="setCap()" class="bg-blue-600 p-2 rounded font-bold">Set Capital</button>
             </div>
         </div>
 
-        <!-- Stats Grid -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-            <div class="glass p-6 rounded-2xl">
-                <p class="text-slate-400 text-xs uppercase font-bold mb-1">Active Capital</p>
-                <h2 id="display-capital" class="text-3xl font-mono">₹0.00</h2>
-            </div>
-            <div class="glass p-6 rounded-2xl">
-                <p class="text-slate-400 text-xs uppercase font-bold mb-1">Open Positions</p>
-                <h2 id="display-pos-count" class="text-3xl font-mono">0</h2>
-            </div>
-            <div class="glass p-6 rounded-2xl">
-                <p class="text-slate-400 text-xs uppercase font-bold mb-1">System Errors</p>
-                <h2 id="display-error" class="text-sm text-rose-400 truncate">None</h2>
-            </div>
+        <div class="flex gap-2 mb-8">
+            <button onclick="cmd('start')" class="bg-emerald-600 px-8 py-2 rounded font-bold flex-1">START BOT</button>
+            <button onclick="cmd('stop')" class="bg-rose-600 px-8 py-2 rounded font-bold flex-1">STOP BOT</button>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
-            <!-- Market Watch -->
-            <div class="glass rounded-2xl overflow-hidden">
-                <div class="bg-white/5 px-6 py-4 border-b border-white/10 flex justify-between items-center">
-                    <h3 class="font-bold flex items-center gap-2"><i data-lucide="bar-chart-3" class="w-4 h-4"></i> Market Bias (Dynamic)</h3>
-                </div>
-                <div id="market-list" class="p-6 space-y-4">
-                    <!-- Pairs will inject here -->
-                </div>
-            </div>
+        <div id="market" class="grid grid-cols-1 gap-2 mb-8"></div>
 
-            <!-- Trade Log -->
-            <div class="glass rounded-2xl overflow-hidden">
-                <div class="bg-white/5 px-6 py-4 border-b border-white/10 flex justify-between items-center">
-                    <h3 class="font-bold flex items-center gap-2"><i data-lucide="history" class="w-4 h-4"></i> Recent Activity</h3>
-                </div>
-                <div class="overflow-y-auto max-h-[400px]">
-                    <table class="w-full text-left text-sm">
-                        <thead class="bg-white/5 text-slate-400 uppercase text-[10px]">
-                            <tr>
-                                <th class="px-6 py-3">Time</th>
-                                <th class="px-6 py-3">Pair</th>
-                                <th class="px-6 py-3">Type</th>
-                                <th class="px-6 py-3 text-right">PnL (INR)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="log-table">
-                            <!-- Logs will inject here -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
+        <div class="bg-slate-800 rounded-xl overflow-hidden">
+            <table class="w-full text-left text-sm">
+                <thead class="bg-slate-700 text-slate-400 uppercase text-[10px]">
+                    <tr><th class="p-4">Time</th><th class="p-4">Pair</th><th class="p-4">Side</th><th class="p-4">PnL</th></tr>
+                </thead>
+                <tbody id="logs"></tbody>
+            </table>
         </div>
     </div>
 
     <script>
-        lucide.createIcons();
-
-        async function toggleBot(state) {
-            const endpoint = state ? '/start' : '/stop';
-            await fetch(endpoint, { method: 'POST' });
+        async function cmd(c) { await fetch('/'+c, {method:'POST'}); }
+        async function setCap() { 
+            const val = document.getElementById('cap_in').value;
+            await fetch('/set_capital', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({capital:val})});
         }
+        async function update() {
+            const res = await fetch('/dashboard');
+            const d = await res.json();
+            document.getElementById('status').className = d.running ? 'px-4 py-1 rounded bg-emerald-600 text-xs font-bold uppercase' : 'px-4 py-1 rounded bg-red-600 text-xs font-bold uppercase';
+            document.getElementById('status').innerText = d.running ? 'Running' : 'Stopped';
+            document.getElementById('cap').innerText = '₹' + d.capital;
+            
+            document.getElementById('market').innerHTML = Object.entries(d.market).map(([p,i]) => `
+                <div class="bg-slate-800 p-4 rounded flex justify-between">
+                    <span>${p}</span> <span class="font-mono">₹${i.price}</span>
+                    <span class="text-xs uppercase font-bold ${i.bias=='bullish'?'text-emerald-400':'text-rose-400'}">${i.bias}</span>
+                </div>
+            `).join('');
 
-        async function setCapital() {
-            const val = document.getElementById('capital-input').value;
-            await fetch('/set_capital', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({capital: val})
-            });
-            alert("Capital Updated!");
+            document.getElementById('logs').innerHTML = d.log.reverse().map(l => `
+                <tr class="border-t border-slate-700">
+                    <td class="p-4 text-slate-500">${l.time}</td>
+                    <td class="p-4 font-bold">${l.pair}</td>
+                    <td class="p-4 uppercase">${l.side}</td>
+                    <td class="p-4 font-mono ${l.pnl > 0 ? 'text-emerald-400' : 'text-rose-400'}">${l.pnl}</td>
+                </tr>
+            `).join('');
         }
-
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/dashboard');
-                const data = await res.json();
-
-                // Update Status
-                const dot = document.getElementById('status-dot');
-                const text = document.getElementById('status-text');
-                dot.className = data.running ? 'w-3 h-3 rounded-full bg-emerald-500 status-pulse' : 'w-3 h-3 rounded-full bg-red-500';
-                text.innerText = data.running ? 'Running' : 'Stopped';
-
-                // Update Stats
-                document.getElementById('display-capital').innerText = `₹${data.capital}`;
-                document.getElementById('display-pos-count').innerText = Object.keys(data.positions).length;
-                document.getElementById('display-error').innerText = data.error || 'None';
-
-                // Update Market List
-                const marketList = document.getElementById('market-list');
-                marketList.innerHTML = Object.entries(data.market).map(([pair, info]) => `
-                    <div class="flex justify-between items-center p-3 bg-white/5 rounded-lg">
-                        <div>
-                            <p class="font-bold">${pair}</p>
-                            <p class="text-xs text-slate-400">₹${info.price}</p>
-                        </div>
-                        <div class="text-right">
-                            <span class="px-3 py-1 rounded-full text-[10px] font-bold uppercase ${info.bias === 'bullish' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-rose-500/20 text-rose-400'}">
-                                ${info.bias || 'Scanning...'}
-                            </span>
-                        </div>
-                    </div>
-                `).join('');
-
-                // Update Logs
-                const logTable = document.getElementById('log-table');
-                logTable.innerHTML = data.log.reverse().map(log => `
-                    <tr class="border-b border-white/5">
-                        <td class="px-6 py-4 text-slate-500">${log.time}</td>
-                        <td class="px-6 py-4 font-bold">${log.pair}</td>
-                        <td class="px-6 py-4">
-                            <span class="${log.side === 'long' ? 'text-emerald-400' : log.side === 'short' ? 'text-rose-400' : 'text-blue-400'} font-bold">
-                                ${log.side.toUpperCase()}
-                            </span>
-                        </td>
-                        <td class="px-6 py-4 text-right font-mono ${parseFloat(log.pnl) > 0 ? 'text-emerald-400' : 'text-rose-400'}">
-                            ${log.pnl}
-                        </td>
-                    </tr>
-                `).join('');
-
-            } catch (e) {
-                console.error("Dashboard update failed", e);
-            }
-        }
-
-        setInterval(updateDashboard, 3000);
+        setInterval(update, 3000);
     </script>
 </body>
 </html>
