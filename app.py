@@ -11,7 +11,7 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 BASE_URL = "https://api.coindcx.com"
 IST = pytz.timezone("Asia/Kolkata")
-PAIRS = ["I-BTC_INR", "I-ETH_INR", "I-SOL_INR"]
+PAIRS = ["BTCINR", "ETHINR", "SOLINR"]
 # YOUR PROVIDED RENDER URL
 RENDER_URL = "https://coin-4k37.onrender.com"
 
