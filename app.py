@@ -261,7 +261,10 @@ def main():
         st.stop()
 
     paper_trade = st.checkbox('Paper Trade Mode', value=True)
-    api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade),st.session_state.trades_df = pd.DataFrame()
+    
+    # In the main() function, after the paper_trade = st.checkbox(...) line:
+   api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
+   st.session_state.trades_df = pd.DataFrame()  # Initialize trades table
 
     col1, col2 = st.columns(2)
     with col1:
