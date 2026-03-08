@@ -2,166 +2,76 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Advanced Algo Engine | Live</title>
+    <title>AlgoTrader Pro | Live Provision</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com" rel="stylesheet">
-    <style>
-        body { font-family: 'JetBrains Mono', monospace; background-color: #050505; }
-        .glass { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); }
-        .neo-green { color: #00ff9d; text-shadow: 0 0 10px rgba(0, 255, 157, 0.3); }
-        .neo-red { color: #ff4d4d; text-shadow: 0 0 10px rgba(255, 77, 77, 0.3); }
-        .status-pulse { animation: pulse 2s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-    </style>
 </head>
-<body class="text-slate-300 p-4 md:p-10">
-
-    <div class="max-w-6xl mx-auto">
-        <!-- Header Section -->
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-10 gap-6">
+<body class="bg-black text-slate-300 p-6 font-mono">
+    <div class="max-w-5xl mx-auto">
+        <div class="flex justify-between border-b border-white/10 pb-6 mb-10">
             <div>
-                <h1 class="text-2xl font-bold text-white tracking-tighter uppercase">Advanced_Algo_v2.5</h1>
-                <div class="flex items-center gap-2 mt-1">
-                    <div id="status-indicator" class="w-2 h-2 rounded-full bg-rose-500"></div>
-                    <span id="status-text" class="text-[10px] font-bold uppercase tracking-widest text-slate-500">System_Offline</span>
-                </div>
+                <h1 class="text-2xl font-black text-white">ENGINE_PRO_v2.5</h1>
+                <div id="status" class="text-[10px] uppercase font-bold mt-1 text-rose-500">Standby</div>
             </div>
-            
-            <div class="flex flex-wrap gap-3">
-                <div class="flex bg-white/5 rounded border border-white/10 p-1">
-                    <input id="cap_val" type="number" placeholder="Set Capital" class="bg-transparent px-3 py-1 text-sm outline-none w-32 text-white">
-                    <button onclick="updateCapital()" class="bg-white/10 hover:bg-white/20 px-4 py-1 text-[10px] font-bold uppercase transition">Update</button>
-                </div>
-                <button onclick="control('start')" class="bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-400 border border-emerald-500/50 px-6 py-2 rounded text-xs font-bold transition">EXECUTE</button>
-                <button onclick="control('stop')" class="bg-rose-600/20 hover:bg-rose-600/40 text-rose-400 border border-rose-500/50 px-6 py-2 rounded text-xs font-bold transition">TERMINATE</button>
+            <div class="flex gap-4">
+                <button onclick="cmd('start')" class="border border-emerald-500 text-emerald-500 px-6 py-2 hover:bg-emerald-500/10 transition text-xs">START_BOT</button>
+                <button onclick="cmd('stop')" class="border border-rose-500 text-rose-500 px-6 py-2 hover:bg-rose-500/10 transition text-xs">STOP_BOT</button>
             </div>
         </div>
 
-        <!-- Stats Overview -->
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-            <div class="glass p-6 rounded-lg">
-                <p class="text-[10px] uppercase font-bold text-slate-500 mb-2">Available_Capital</p>
-                <h2 class="text-3xl font-bold text-white tracking-tight">₹<span id="display-cap">0.00</span></h2>
-            </div>
-            <div class="glass p-6 rounded-lg">
-                <p class="text-[10px] uppercase font-bold text-slate-500 mb-2">Open_Positions</p>
-                <h2 id="display-pos" class="text-3xl font-bold text-white tracking-tight">0</h2>
-            </div>
-            <div class="glass p-6 rounded-lg">
-                <p class="text-[10px] uppercase font-bold text-slate-500 mb-2">Server_Latency</p>
-                <h2 class="text-3xl font-bold text-emerald-500 tracking-tight">Active</h2>
+        <!-- Live Price Grid -->
+        <div id="market-grid" class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10"></div>
+
+        <div class="bg-white/5 p-6 rounded border border-white/10 mb-10">
+            <p class="text-xs uppercase text-slate-500 mb-2">Available Capital (INR)</p>
+            <div class="flex gap-6 items-center">
+                <h2 class="text-3xl font-bold text-white">₹<span id="cap">0.00</span></h2>
+                <input id="cap_in" type="number" placeholder="Set Capital" class="bg-transparent border-b border-white/20 p-2 text-xs flex-1 outline-none">
+                <button onclick="setCap()" class="text-[10px] font-bold uppercase tracking-widest hover:text-white">Update</button>
             </div>
         </div>
 
-        <!-- Market Grid (Corrected Price Provision) -->
-        <div id="market-grid" class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
-            <!-- Dynamic Cards Injected Here -->
-        </div>
-
-        <!-- Activity Logs -->
-        <div class="glass rounded-lg overflow-hidden">
-            <div class="px-6 py-4 border-b border-white/10 bg-white/5 flex justify-between items-center">
-                <h3 class="text-[10px] font-bold uppercase tracking-widest">Trade_Execution_Log</h3>
-                <span class="text-[9px] text-slate-500 italic">Auto-refreshing every 3s</span>
-            </div>
-            <div class="overflow-x-auto">
-                <table class="w-full text-left text-[11px]">
-                    <thead class="text-slate-500 uppercase border-b border-white/5">
-                        <tr>
-                            <th class="px-6 py-4 font-bold">Timestamp</th>
-                            <th class="px-6 py-4 font-bold">Asset</th>
-                            <th class="px-6 py-4 font-bold">Operation</th>
-                            <th class="px-6 py-4 font-bold text-right">PnL_INR</th>
-                        </tr>
-                    </thead>
-                    <tbody id="log-table" class="divide-y divide-white/5">
-                        <!-- Logs Injected Here -->
-                    </tbody>
-                </table>
-            </div>
+        <div class="bg-white/5 border border-white/10 rounded overflow-hidden">
+            <table class="w-full text-left text-xs">
+                <thead class="bg-white/5 text-slate-500">
+                    <tr><th class="p-4">Time</th><th class="p-4">Pair</th><th class="p-4">Action</th><th class="p-4 text-right">PnL</th></tr>
+                </thead>
+                <tbody id="logs"></tbody>
+            </table>
         </div>
     </div>
 
     <script>
-        async function control(action) {
-            await fetch(`/${action}`, {method: 'POST'});
-            updateDashboard();
+        async function cmd(c) { await fetch('/'+c, {method:'POST'}); }
+        async function setCap() {
+            const v = document.getElementById('cap_in').value;
+            await fetch('/set_capital', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({capital:v})});
         }
-
-        async function updateCapital() {
-            const capital = document.getElementById('cap_val').value;
-            if(!capital) return;
-            await fetch('/set_capital', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({capital: capital})
-            });
-            alert('Capital updated successfully.');
-        }
-
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/dashboard');
-                const data = await res.json();
-
-                // Status Update
-                const indicator = document.getElementById('status-indicator');
-                const statusText = document.getElementById('status-text');
-                if(data.running) {
-                    indicator.className = "w-2 h-2 rounded-full bg-emerald-500 status-pulse";
-                    statusText.innerText = "System_Active (Scanning)";
-                    statusText.className = "text-[10px] font-bold uppercase tracking-widest text-emerald-500";
-                } else {
-                    indicator.className = "w-2 h-2 rounded-full bg-rose-500";
-                    statusText.innerText = "System_Offline";
-                    statusText.className = "text-[10px] font-bold uppercase tracking-widest text-slate-500";
-                }
-
-                // Stats
-                document.getElementById('display-cap').innerText = data.capital.toLocaleString('en-IN');
-                document.getElementById('display-pos').innerText = Object.keys(data.positions).length;
-
-                // Market Grid (Advanced Provision)
-                const grid = document.getElementById('market-grid');
-                grid.innerHTML = Object.entries(data.market).map(([pair, info]) => `
-                    <div class="glass p-6 rounded-lg relative overflow-hidden">
-                        <div class="absolute top-0 right-0 p-2 text-[8px] font-bold text-white/20 uppercase">${pair.split('-')[1]}</div>
-                        <p class="text-[10px] font-bold text-slate-500 uppercase mb-2">${pair}</p>
-                        <h3 class="text-2xl font-bold text-white mb-4">₹${info.price.toLocaleString('en-IN')}</h3>
-                        <div class="flex justify-between items-end">
-                            <div>
-                                <p class="text-[9px] text-slate-500 uppercase">Bias</p>
-                                <p class="text-xs font-bold ${info.bias === 'Bullish' ? 'neo-green' : 'neo-red'} uppercase">${info.bias}</p>
-                            </div>
-                            <div class="text-right">
-                                <p class="text-[9px] text-slate-500 uppercase">Volatility_ATR</p>
-                                <p class="text-xs font-bold text-blue-400">±${info.atr}</p>
-                            </div>
-                        </div>
+        async function update() {
+            const res = await fetch('/dashboard');
+            const d = await res.json();
+            document.getElementById('status').innerText = d.running ? 'Running (Scanning Assets)' : 'Stopped';
+            document.getElementById('status').className = d.running ? 'text-[10px] uppercase font-bold mt-1 text-emerald-500' : 'text-[10px] uppercase font-bold mt-1 text-rose-500';
+            document.getElementById('cap').innerText = d.capital;
+            document.getElementById('market-grid').innerHTML = Object.entries(d.market).map(([p,i]) => `
+                <div class="bg-white/5 border border-white/10 p-6 rounded">
+                    <p class="text-[10px] text-slate-500 font-bold mb-1">${p}</p>
+                    <p class="text-xl text-white font-bold">₹${i.price || 'Scanning...'}</p>
+                    <div class="flex justify-between mt-4">
+                        <span class="text-[9px] uppercase font-bold ${i.bias=='Bullish'?'text-emerald-400':'text-rose-400'}">${i.bias}</span>
+                        <span class="text-[9px] text-slate-600 font-bold">ATR: ${i.atr}</span>
                     </div>
-                `).join('');
-
-                // Logs
-                const logs = document.getElementById('log-table');
-                logs.innerHTML = data.log.reverse().map(item => `
-                    <tr class="hover:bg-white/5 transition">
-                        <td class="px-6 py-4 text-slate-500">${item.time}</td>
-                        <td class="px-6 py-4 font-bold text-white">${item.pair}</td>
-                        <td class="px-6 py-4 uppercase font-bold text-[10px] ${item.side.includes('long') ? 'text-emerald-400' : 'text-rose-400'}">${item.side}</td>
-                        <td class="px-6 py-4 text-right font-bold ${parseFloat(item.pnl) >= 0 ? 'neo-green' : 'neo-red'}">
-                            ${item.pnl === 'OPEN' ? '<span class="status-pulse">ACTIVE</span>' : item.pnl}
-                        </td>
-                    </tr>
-                `).join('');
-
-            } catch (err) {
-                console.error("Connection lost to Quality Server.");
-            }
+                </div>
+            `).join('');
+            document.getElementById('logs').innerHTML = d.log.reverse().map(l => `
+                <tr class="border-b border-white/5">
+                    <td class="p-4 text-slate-500">${l.time}</td>
+                    <td class="p-4 font-bold text-slate-300">${l.pair}</td>
+                    <td class="p-4 uppercase tracking-widest text-[10px]">${l.side}</td>
+                    <td class="p-4 text-right font-bold ${l.pnl > 0 ? 'text-emerald-500' : 'text-rose-400'}">${l.pnl}</td>
+                </tr>
+            `).join('');
         }
-
-        setInterval(updateDashboard, 3000);
-        updateDashboard();
+        setInterval(update, 3000);
     </script>
 </body>
 </html>
