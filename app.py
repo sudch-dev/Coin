@@ -1,345 +1,503 @@
 import os
-import json
 import time
+import threading
 import hmac
 import hashlib
 import requests
-import threading
-import streamlit as st
-import pandas as pd
-import pandas_ta as ta  # pip install pandas_ta
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import numpy as np
+import json
+from flask import Flask, render_template, jsonify
+from datetime import datetime, timedelta
+from pytz import timezone
+from collections import deque, defaultdict
+from statistics import median
 
-# Environment variables
-API_KEY = os.getenv('API_KEY')
-API_SECRET = os.getenv('API_SECRET')
-RENDER_URL = 'https://coin-4k37.onrender.com/pi'
+app = Flask(__name__)
 
-class CoinDCXAPI:
-    def __init__(self, api_key, api_secret, paper_trade=False):
-        self.base_url = 'https://api.coindcx.com'
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.paper_trade = paper_trade
-        self.balances = {'INR': 0.0, 'BTC': 0.0, 'ETH': 0.0}  # Example, extend as needed
-        self.orders = []
-        self.trades = []
+API_KEY = os.environ.get("API_KEY")
+API_SECRET = os.environ.get("API_SECRET").encode()
+BASE_URL = "https://api.coindcx.com"
 
-    def _generate_signature(self, body):
-        timestamp = int(time.time() * 1000)
-        body['timestamp'] = timestamp
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(self.api_secret.encode(), json_body.encode(), hashlib.sha256).hexdigest()
-        return json_body, signature
+PAIRS = [
+    "BTCUSDT", "ETHUSDT", "XRPUSDT", "SHIBUSDT", "SOLUSDT",
+    "DOGEUSDT", "ADAUSDT", "AEROUSDT", "BNBUSDT", "LTCUSDT"
+]
 
-    def get_markets(self):
-        if self.paper_trade:
-            return ['BTCINR', 'ETHINR', 'XRPINR']  # Simulated
+PAIR_RULES = {
+    "BTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "ETHUSDT": {"precision": 6, "min_qty": 0.0001},
+    "XRPUSDT": {"precision": 4, "min_qty": 0.1},
+    "SHIBUSDT": {"precision": 4, "min_qty": 10000},
+    "DOGEUSDT": {"precision": 4, "min_qty": 0.01},
+    "SOLUSDT": {"precision": 4, "min_qty": 0.01},
+    "AEROUSDT": {"precision": 2, "min_qty": 0.01},
+    "ADAUSDT": {"precision": 2, "min_qty": 2},
+    "LTCUSDT": {"precision": 2, "min_qty": 0.001},
+    "BNBUSDT": {"precision": 4, "min_qty": 0.001}
+}
+
+# --- Tunables ---
+CANDLE_INTERVAL = 30                # seconds (was 60). 20–30 is snappier.
+TRADE_COOLDOWN_SEC = 300            # cooldown after an exit; can lower to 120 if you want.
+
+IST = timezone('Asia/Kolkata')
+def ist_now(): return datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')
+def ist_date(): return datetime.now(IST).strftime('%Y-%m-%d')
+def ist_yesterday(): return (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+
+tick_logs, candle_logs = {p: [] for p in PAIRS}, {p: [] for p in PAIRS}
+scan_log, trade_log, exit_orders = [], [], []
+daily_profit, pair_precision = {}, {}
+running = False
+status = {"msg": "Idle", "last": ""}
+status_epoch = 0         # heartbeat for the UI watchdog
+error_message = ""
+
+# ===== Persistent P&L state (confirmed fills only) =====
+PROFIT_STATE_FILE = "profit_state.json"
+profit_state = {
+    "cumulative_pnl": 0.0,
+    "daily": {},
+    "inventory": {},
+    "processed_orders": []
+}
+pair_cooldown_until = {p: 0 for p in PAIRS}
+
+def load_profit_state():
+    global profit_state
+    try:
+        with open(PROFIT_STATE_FILE, "r") as f:
+            data = json.load(f)
+        profit_state["cumulative_pnl"] = float(data.get("cumulative_pnl", 0.0))
+        profit_state["daily"] = dict(data.get("daily", {}))
+        profit_state["inventory"] = data.get("inventory", {})
+        profit_state["processed_orders"] = list(data.get("processed_orders", []))
+    except:
+        pass
+
+def save_profit_state():
+    tmp = {
+        "cumulative_pnl": round(profit_state.get("cumulative_pnl", 0.0), 6),
+        "daily": {k: round(v, 6) for k, v in profit_state.get("daily", {}).items()},
+        "inventory": profit_state.get("inventory", {}),
+        "processed_orders": profit_state.get("processed_orders", [])
+    }
+    try:
+        with open(PROFIT_STATE_FILE, "w") as f:
+            json.dump(tmp, f)
+    except:
+        pass
+
+def _get_inventory_deque(market):
+    inv = profit_state["inventory"].get(market, [])
+    dq = deque()
+    for lot in inv:
         try:
-            response = requests.get(f'{self.base_url}/exchange/v1/markets')
-            markets = response.json()
-            return [m for m in markets if m.endswith('INR')]
-        except Exception as e:
-            st.error(f"Error fetching markets: {e}")
-            return []
+            q, c = float(lot[0]), float(lot[1])
+            if q > 0 and c > 0:
+                dq.append([q, c])
+        except:
+            continue
+    return dq
 
-    def get_ticker(self):
-        if self.paper_trade:
-            return [{'market': 'BTCINR', 'last_price': 5000000, 'change_24_hour': '2.5'},  # Simulated
-                    {'market': 'ETHINR', 'last_price': 300000, 'change_24_hour': '-1.2'}]
-        try:
-            response = requests.get(f'{self.base_url}/exchange/ticker')
-            return response.json()
-        except Exception as e:
-            st.error(f"Error fetching ticker: {e}")
-            return []
+def _set_inventory_from_deque(market, dq):
+    profit_state["inventory"][market] = [[float(q), float(c)] for (q, c) in dq]
 
-    def get_candles(self, pair, interval='1m', limit=100):
-        if self.paper_trade:
-            # Simulated candles: [timestamp, open, high, low, close, volume]
-            np.random.seed(42)  # For reproducibility in sim
-            closes = np.cumsum(np.random.randn(limit)) + 100  # Random walk
-            return [[int(time.time()*1000 - i*60*1000), closes[i], closes[i]+0.1, closes[i]-0.1, closes[i], 10] for i in range(limit-1, -1, -1)]
-        try:
-            response = requests.get(f'{self.base_url}/market_data/candles?pair={pair}&interval={interval}')
-            return response.json()
-        except Exception as e:
-            st.error(f"Error fetching candles for {pair}: {e}")
-            return []
+def apply_fill_update(market, side, price, qty, ts_ms, order_id):
+    if not order_id: return
+    if order_id in profit_state["processed_orders"]: return
+    try:
+        price = float(price); qty = float(qty)
+    except:
+        return
+    if price <= 0 or qty <= 0: return
 
-    def get_balance(self):
-        if self.paper_trade:
-            # For paper trading, initialize some sample balances if not set
-            if self.balances['INR'] == 0:
-                self.balances['INR'] = 10000.0  # Default sim capital
-            return self.balances
-        try:
-            body = {}
-            json_body, signature = self._generate_signature(body)
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': self.api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
-            response = requests.post(f'{self.base_url}/exchange/v1/users/balances', data=json_body, headers=headers)
-            data = response.json()
-            balances = {item['currency']: float(item['balance']) for item in data}
-            self.balances.update(balances)  # Sync
-            return balances
-        except Exception as e:
-            st.error(f"Error fetching balance: {e}")
-            return {}
+    inv = _get_inventory_deque(market)
+    realized = 0.0
 
-    def place_order(self, side, order_type, market, total_quantity, price_per_unit=None):
-        if self.paper_trade:
-            # Simulate order
-            order_id = len(self.orders) + 1
-            ticker = self.get_ticker_for_pair(market)
-            price = price_per_unit or float(ticker['last_price']) if ticker else 100
-            order = {
-                'id': order_id,
-                'side': side,
-                'type': order_type,
-                'market': market,
-                'quantity': total_quantity,
-                'price': price,
-                'status': 'filled',  # Assume instant fill for paper
-                'timestamp': int(time.time() * 1000)
-            }
-            self.orders.append(order)
-            # Update balance simulation
-            if side == 'buy':
-                cost = total_quantity * price * (1 + 0.001)  # Fee
-                self.balances['INR'] -= cost
-                coin = market[:-3]
-                self.balances[coin] = self.balances.get(coin, 0) + total_quantity
+    if side.lower() == "buy":
+        inv.append([qty, price])
+    else:
+        sell_q = qty
+        while sell_q > 1e-18 and inv:
+            lot_q, lot_px = inv[0]
+            used = min(sell_q, lot_q)
+            realized += (price - lot_px) * used
+            lot_q -= used
+            sell_q -= used
+            if lot_q <= 1e-18:
+                inv.popleft()
             else:
-                proceeds = total_quantity * price * (1 - 0.001)
-                self.balances['INR'] += proceeds
-                coin = market[:-3]
-                self.balances[coin] = self.balances.get(coin, 0) - total_quantity
-            # Add to trades
-            self.trades.append({
-                'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'pair': market,
-                'action': side,
-                'pnl': 0  # Calculate later
-            })
-            return order
-        try:
-            body = {
-                'side': side,
-                'order_type': order_type,
-                'market': market,
-                'total_quantity': total_quantity
-            }
-            if price_per_unit:
-                body['price_per_unit'] = price_per_unit
-            json_body, signature = self._generate_signature(body)
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': self.api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
-            response = requests.post(f'{self.base_url}/exchange/v1/orders/create', data=json_body, headers=headers)
-            return response.json()
-        except Exception as e:
-            st.error(f"Error placing order: {e}")
-            return None
+                inv[0][0] = lot_q
 
-    def get_ticker_for_pair(self, pair):
-        tickers = self.get_ticker()
-        for t in tickers:
-            if t['market'] == pair:
-                return t
+    _set_inventory_from_deque(market, inv)
+    profit_state["processed_orders"].append(order_id)
+    profit_state["cumulative_pnl"] = float(profit_state.get("cumulative_pnl", 0.0) + realized)
+    dkey = ist_date()
+    profit_state["daily"][dkey] = float(profit_state["daily"].get(dkey, 0.0) + realized)
+    save_profit_state()
+
+# ===== end persistent P&L helpers =====
+
+def hmac_signature(payload):
+    return hmac.new(API_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+def fetch_pair_precisions():
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/v1/markets_details", timeout=10)
+        if r.ok:
+            for item in r.json():
+                if item.get("pair") in PAIRS:
+                    pair_precision[item["pair"]] = int(item.get("target_currency_precision", 6))
+    except:
+        pass
+
+def get_wallet_balances():
+    payload = json.dumps({"timestamp": int(time.time() * 1000)})
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    balances = {}
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
+        if r.ok:
+            for b in r.json():
+                balances[b['currency']] = float(b['balance'])
+    except:
+        pass
+    return balances
+
+def fetch_all_prices():
+    try:
+        r = requests.get(f"{BASE_URL}/exchange/ticker", timeout=10)
+        if r.ok:
+            now = int(time.time())
+            return {item["market"]: {"price": float(item["last_price"]), "ts": now}
+                    for item in r.json() if item.get("market") in PAIRS}
+    except:
+        pass
+    return {}
+
+def aggregate_candles(pair, interval=CANDLE_INTERVAL):
+    ticks = tick_logs[pair]
+    if not ticks: return
+    candles, candle, last_window = [], None, None
+    for ts, price in sorted(ticks, key=lambda x: x[0]):
+        wstart = ts - (ts % interval)
+        if last_window != wstart:
+            if candle: candles.append(candle)
+            candle = {"open": price, "high": price, "low": price, "close": price, "volume": 1, "start": wstart}
+            last_window = wstart
+        else:
+            candle["high"] = max(candle["high"], price)
+            candle["low"] = min(candle["low"], price)
+            candle["close"] = price   # <-- fixed (no stray ')')
+            candle["volume"] += 1
+    if candle: candles.append(candle)
+    candle_logs[pair] = candles[-50:]
+
+# ========= indicators =========
+def _compute_ema(values, n):
+    if len(values) < n: return None
+    sma = sum(values[:n]) / n
+    k = 2 / (n + 1)
+    ema = sma
+    for v in values[n:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+def _atr_14(candles):
+    if len(candles) < 15: return None
+    trs = []
+    prev_close = candles[-15]["close"]
+    for c in candles[-14:]:
+        tr = max(c["high"] - c["low"], abs(c["high"] - prev_close), abs(c["low"] - prev_close))
+        trs.append(tr)
+        prev_close = c["close"]
+    return sum(trs) / len(trs) if trs else None
+
+# ========= responsive signal (uses live price) =========
+def pa_buy_sell_signal(pair, live_price=None):
+    """
+    Responsive signal:
+    - Trend: EMAfast > EMAslow (5/13) built on completed closes + live price
+    - Breakout: price crosses Donchian channel of last N completed candles
+    - ATR(14) from completed candles for sizing
+    """
+    candles = candle_logs[pair]
+    if len(candles) < 25:
         return None
 
-# Strategy Functions
-def calculate_rsi(closes, period=14):
-    df = pd.DataFrame({'close': closes})
-    df['rsi'] = ta.rsi(df['close'], length=period)
-    return df['rsi'].iloc[-1]
+    # completed candles (exclude the currently forming one)
+    completed = candles[:-1] if len(candles) >= 2 else candles
+    if len(completed) < 20:
+        return None
 
-def select_interval(volatility):
-    # Volatility rough: std of returns
-    if volatility > 0.05:  # High vol
-        return '1m'
-    elif volatility > 0.02:
-        return '5m'
-    else:
-        return '15m'
+    closes = [c["close"] for c in completed]
+    curr_price = float(live_price) if live_price else candles[-1]["close"]
 
-def get_signal(candles):
-    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['close'] = df['close'].astype(float)
-    volatility = df['close'].pct_change().std()
-    interval = select_interval(volatility)
-    # Re-fetch if needed, but assume current is ok
+    N = 5
+    recent = completed[-N:]
+    don_high = max(c["high"] for c in recent)
+    don_low  = min(c["low"]  for c in recent)
 
-    rsi = calculate_rsi(df['close'].values)
-    # Simple strategy: RSI oversold/overbought, with momentum
-    if rsi < 30 and df['close'].iloc[-1] > df['close'].iloc[-3]:  # Buy signal: oversold + up momentum
-        return 'buy', volatility
-    elif rsi > 70 and df['close'].iloc[-1] < df['close'].iloc[-3]:  # Sell signal
-        return 'sell', volatility
-    return None, volatility
+    closes_plus_live = closes[-30:] + [curr_price]
+    ema_fast = _compute_ema(closes_plus_live, 5)
+    ema_slow = _compute_ema(closes_plus_live, 13)
 
-def find_best_pair(api, capital, fee_rate=0.001):
-    tickers = api.get_ticker()
-    candidates = []
-    for t in tickers:
-        if t['market'].endswith('INR'):
-            change = abs(float(t['change_24_hour']))
-            price = float(t['last_price'])
-            vol_rough = float(t.get('volume', 0)) / price  # Relative volume (handle missing key)
-            expected_profit = (change / 100) * 0.5 - fee_rate * 2  # Assume capture half move
-            position_size = min(capital * 0.1 / price, 100)  # Risk 10%
-            if expected_profit > 0.005 and vol_rough > 1:  # Min 0.5% profit, liquid
-                candidates.append((t, expected_profit, vol_rough))
-    if candidates:
-        candidates.sort(key=lambda x: x[1] * x[2], reverse=True)  # Profit * liquidity
-        return candidates[0][0]['market']
+    atr14 = _atr_14(completed)
+    if ema_fast is None or ema_slow is None or atr14 is None:
+        return None
+
+    if curr_price > don_high and ema_fast > ema_slow:
+        return {
+            "side": "BUY",
+            "entry": curr_price,
+            "atr": atr14,
+            "msg": f"BUY: live breakout > Donchian({N}) & EMA5>EMA13"
+        }
+    if curr_price < don_low and ema_fast < ema_slow:
+        return {
+            "side": "SELL",
+            "entry": curr_price,
+            "atr": atr14,
+            "msg": f"SELL: live breakdown < Donchian({N}) & EMA5<EMA13"
+        }
     return None
 
-# Keepalive
-def keepalive():
-    while True:
+def _signed_post(url, body):
+    payload = json.dumps(body, separators=(',', ':'))
+    sig = hmac_signature(payload)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(url, headers=headers, data=payload, timeout=12)
+        if r.ok:
+            return r.json()
+    except:
+        pass
+    return {}
+
+def place_order(pair, side, qty):
+    payload = {"market": pair, "side": side.lower(), "order_type": "market_order", "total_quantity": str(qty),
+               "timestamp": int(time.time() * 1000)}
+    body = json.dumps(payload)
+    sig = hmac_signature(body)
+    headers = {"X-AUTH-APIKEY": API_KEY, "X-AUTH-SIGNATURE": sig, "Content-Type": "application/json"}
+    try:
+        r = requests.post(f"{BASE_URL}/exchange/v1/orders/create", headers=headers, data=body, timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+def get_order_status(order_id=None, client_order_id=None):
+    body = {"timestamp": int(time.time() * 1000)}
+    if order_id: body["id"] = order_id
+    if client_order_id: body["client_order_id"] = client_order_id
+    res = _signed_post(f"{BASE_URL}/exchange/v1/orders/status", body)
+    return res if isinstance(res, dict) else {}
+
+def _record_fill_from_status(market, side, st, order_id):
+    try:
+        total_q = float(st.get("total_quantity", 0))
+        remain_q = float(st.get("remaining_quantity", 0))
+        filled = max(0.0, total_q - remain_q)
+        avg_px = float(st.get("avg_price", 0))
+    except:
+        filled, avg_px = 0.0, 0.0
+
+    if filled > 0 and avg_px > 0:
+        ts_field = st.get("updated_at") or st.get("created_at") or st.get("timestamp") or int(time.time()*1000)
         try:
-            requests.get(RENDER_URL)
+            ts_ms = int(ts_field)
+            if ts_ms < 10**12: ts_ms *= 1000
         except:
-            pass
-        time.sleep(240)
+            ts_ms = int(time.time() * 1000)
+        apply_fill_update(market, side, avg_px, filled, ts_ms, order_id)
 
-# Main Bot Loop with Debug Logs
-def bot_loop(api, capital, running):
-    trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
-    while running[0]:
-        try:
-            print(f"[DEBUG] Scanning at {datetime.now()} | Capital: ₹{capital}")  # Log timestamp
-            best_pair = find_best_pair(api, capital)
-            print(f"[DEBUG] Best pair selected: {best_pair}")  # Will show None if no candidates
-            if best_pair:
-                candles = api.get_candles(best_pair)
-                if not candles:
-                    print(f"[DEBUG] No candles for {best_pair}")
-                    time.sleep(60)
-                    continue
-                signal, vol = get_signal(candles)
-                closes = [c[4] for c in candles]
-                rsi_val = calculate_rsi(closes)
-                print(f"[DEBUG] Signal for {best_pair}: {signal} | Vol: {vol:.2%} | RSI: {rsi_val:.1f}")  # Log RSI too
-                if signal:
-                    ticker = api.get_ticker_for_pair(best_pair)
-                    price = float(ticker['last_price'])
-                    quantity = min(capital * 0.05 / price, 10)
-                    print(f"[DEBUG] Executing {signal} {quantity} @ ₹{price} for {best_pair}")
-                    order = api.place_order(signal, 'market_order', best_pair, quantity)
-                    if order:
-                        new_trade = {
-                            'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'Pair': best_pair,
-                            'Action': signal,
-                            'PnL': 0.0
-                        }
-                        trades_df = pd.concat([trades_df, pd.DataFrame([new_trade])], ignore_index=True)
-                        st.session_state.trades_df = trades_df  # Update UI live
-                        st.session_state.last_update = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last update time
-                        print(f"[DEBUG] Trade executed: {order}")
-                        if signal == 'buy':
-                            capital -= quantity * price * 0.001  # Sim update
+def monitor_exits(prices):
+    global error_message
+    to_remove = []
+    for ex in exit_orders:
+        pair, side, qty, tp, sl, entry = ex.values()
+        price = prices.get(pair, {}).get("price")
+        if not price: continue
+        if side == "BUY" and (price >= tp or price <= sl):
+            res = place_order(pair, "SELL", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT SELL {qty} @ {price} | {res}")
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "SELL", st, order_id)
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+        elif side == "SELL" and (price <= tp or price >= sl):
+            res = place_order(pair, "BUY", qty)
+            scan_log.append(f"{ist_now()} | {pair} | EXIT BUY {qty} @ {price} | {res}")
+            try:
+                order_id = (res.get("orders") or [{}])[0].get("id")
+            except:
+                order_id = None
+            if order_id:
+                st = get_order_status(order_id=order_id)
+                _record_fill_from_status(pair, "BUY", st, order_id)
+            if "error" in res: error_message = res["error"]
+            to_remove.append(ex)
+            pair_cooldown_until[pair] = int(time.time()) + TRADE_COOLDOWN_SEC
+    for ex in to_remove: exit_orders.remove(ex)
+
+def _has_open_exit_for(pair):
+    for ex in exit_orders:
+        if ex.get("pair") == pair:
+            return True
+    return False
+
+def scan_loop():
+    global running, error_message, status_epoch
+    scan_log.clear()
+    last_candle_ts = {p: 0 for p in PAIRS}
+    interval = CANDLE_INTERVAL
+
+    while running:
+        prices = fetch_all_prices()
+        now = int(time.time())
+        monitor_exits(prices)
+        balances = get_wallet_balances()
+
+        for pair in PAIRS:
+            if pair not in prices:
+                continue
+
+            price = prices[pair]["price"]
+            tick_logs[pair].append((now, price))
+            if len(tick_logs[pair]) > 1000:
+                tick_logs[pair] = tick_logs[pair][-1000:]
+
+            # build/refresh candles
+            aggregate_candles(pair, interval)
+            last_candle = candle_logs[pair][-1] if candle_logs[pair] else None
+
+            if last_candle:
+                # Evaluate signal EVERY LOOP using live price
+                # Respect cooldown & pending exits first
+                if int(time.time()) < pair_cooldown_until.get(pair, 0) or _has_open_exit_for(pair):
+                    scan_log.append(f"{ist_now()} | {pair} | Cooldown/Exit pending — skip")
                 else:
-                    print(f"[DEBUG] No signal—skipping {best_pair}")
-            else:
-                print("[DEBUG] No qualifying pair—idling")
-            st.session_state.last_scan = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last scan time
-            time.sleep(60)
-        except Exception as e:
-            print(f"[DEBUG] Bot error: {e}")
-            time.sleep(10)
-    st.session_state.trades_df = trades_df
-    return trades_df
+                    signal = pa_buy_sell_signal(pair, price)
+                    if signal:
+                        error_message = ""
+                        entry = signal["entry"]
+                        atr = signal.get("atr", None)
 
-# Streamlit UI
-def main():
-    st.set_page_config(page_title='CoinDCX Trading Bot', layout='wide')
-    st.title('ENGINE_PRO_v2.5')
-    
-    # Time Display in Indian Time (IST)
-    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    st.caption(f"Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Auto-refresh every 30 seconds via JavaScript (for live status updates)
-    st.components.v1.html("""
-    <script>
-        setTimeout(function() {
-            window.location.reload();
-        }, 30000);  // 30 seconds
-    </script>
-    """, height=0)
-    
-    if st.button('Start Keepalive Thread (for Render)'):
-        threading.Thread(target=keepalive, daemon=True).start()
-        st.success('Keepalive started')
+                        usdt_bal = balances.get("USDT", 0.0)
+                        risk_amt = 0.005 * usdt_bal        # 0.5% risk per trade
+                        min_tick_risk = entry * 0.0015     # tighter for responsiveness
+                        risk_unit = max((0.9 * atr) if atr else 0, min_tick_risk)
 
-    if not API_KEY or not API_SECRET:
-        st.warning('Set API_KEY and API_SECRET env vars')
-        st.stop()
+                        if signal["side"] == "BUY":
+                            sl = round(entry - risk_unit, 6)
+                            tp = round(entry + 1.8 * risk_unit, 6)
+                            risk_per_unit = max(entry - sl, 1e-9)
+                            qty_risk = risk_amt / risk_per_unit
+                            qty_cap = (0.3 * usdt_bal) / entry
+                            qty = min(qty_risk, qty_cap)
+                        else:
+                            sl = round(entry + risk_unit, 6)
+                            tp = round(entry - 1.8 * risk_unit, 6)
+                            coin = pair[:-4]
+                            qty = balances.get(coin, 0.0)
 
-    paper_trade = st.checkbox('Paper Trade Mode', value=True)
-    api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
-    st.session_state.trades_df = pd.DataFrame()  # Initialize trades table
+                        # Precision & min qty
+                        qty = round(qty, pair_precision.get(pair, 6))
+                        rule = PAIR_RULES.get(pair, {"precision": 6, "min_qty": 0.0001})
+                        qty = max(qty, rule["min_qty"])
+                        qty = round(qty, rule["precision"])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        capital = st.number_input('Available Capital (INR)', value=10000.0, step=1000.0)
-    with col2:
-        balances = api.get_balance()
-        st.metric('INR Balance', f"₹ {balances.get('INR', 0):,.2f}")
+                        if qty <= 0:
+                            scan_log.append(f"{ist_now()} | {pair} | Signal {signal['side']} but qty too small.")
+                        else:
+                            res = place_order(pair, signal["side"], qty)
 
-    portfolio_df = pd.DataFrame([
-        {'Coin': k, 'Balance': v} for k, v in balances.items() if k != 'INR'
-    ])
-    if not portfolio_df.empty:
-        st.subheader('Portfolio')
-        st.dataframe(portfolio_df)
+                            scan_log.append(f"{ist_now()} | {pair} | {signal['side']} @ {entry} | SL {sl} | TP {tp} | {res}")
+                            trade_log.append({
+                                "time": ist_now(), "pair": pair, "side": signal["side"], "entry": entry,
+                                "msg": signal["msg"], "tp": tp, "sl": sl, "qty": qty, "order_result": res
+                            })
+                            exit_orders.append({
+                                "pair": pair, "side": signal["side"], "qty": qty,
+                                "tp": tp, "sl": sl, "entry": entry
+                            })
 
-    col3, col4 = st.columns(2)
-    with col3:
-        if st.button('Start Bot'):
-            running = [True]
-            st.session_state.running = running
-            thread = threading.Thread(target=bot_loop, args=(api, capital, running))
-            thread.daemon = True
-            thread.start()
-            st.success('Bot started')
-    with col4:
-        if st.button('Stop Bot'):
-            if 'running' in st.session_state:
-                st.session_state.running[0] = False
-            st.success('Bot stopped')
+                            # Confirm from order success -> update P&L
+                            try:
+                                order_id = (res.get("orders") or [{}])[0].get("id")
+                            except:
+                                order_id = None
+                            if order_id:
+                                st = get_order_status(order_id=order_id)
+                                _record_fill_from_status(pair, signal["side"], st, order_id)
 
-    # Running Status Indicator
-    st.subheader('Bot Status')
-    if 'running' in st.session_state and st.session_state.running[0]:
-        st.success('🟢 Running')
-    else:
-        st.warning('🔴 Stopped')
-    
-    st.subheader('Trades')
-    if 'trades_df' in st.session_state and not st.session_state.trades_df.empty:
-        st.dataframe(st.session_state.trades_df)
-        # Show last update time if available
-        if 'last_update' in st.session_state:
-            st.caption(f"Last Trade Update (IST): {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
-    else:
-        st.info('No trades yet—check Render logs for debug info')
-        # Show last scan time if bot running
-        if 'last_scan' in st.session_state:
-            st.caption(f"Last Scan (IST): {st.session_state.last_scan.strftime('%Y-%m-%d %H:%M:%S')}")
+                            if "error" in res:
+                                error_message = res["error"]
+                    else:
+                        scan_log.append(f"{ist_now()} | {pair} | No Signal")
 
-if __name__ == '__main__':
-    if 'trades_df' not in st.session_state:
-        st.session_state.trades_df = pd.DataFrame()
-    main()
+        status["msg"], status["last"] = "Running", ist_now()
+        status_epoch = int(time.time())  # heartbeat for watchdog
+        time.sleep(5)
+
+    status["msg"] = "Idle"
+
+def compute_realized_pnl_today():
+    return round(profit_state["daily"].get(ist_date(), 0.0), 6)
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/start", methods=["POST"])
+def start():
+    global running
+    if not running:
+        running = True
+        t = threading.Thread(target=scan_loop)
+        t.daemon = True
+        t.start()
+    return jsonify({"status": "started"})
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    global running
+    running = False
+    return jsonify({"status": "stopped"})
+
+@app.route("/status")
+def get_status():
+    balances = get_wallet_balances()
+    coins = {pair[:-4]: balances.get(pair[:-4], 0.0) for pair in PAIRS}
+    profit_today = compute_realized_pnl_today()
+    profit_yesterday = round(profit_state["daily"].get(ist_yesterday(), 0.0), 6)
+    cumulative_pnl = round(profit_state.get("cumulative_pnl", 0.0), 6)
+
+    return jsonify({
+        "status": status["msg"],
+        "last": status["last"],
+        "status_epoch": status_epoch,  # for frontend watchdog
+        "usdt": balances.get("USDT", 0.0),
+        "profit_today": profit_today,
+        "profit_yesterday": profit_yesterday,
+        "pnl_cumulative": cumulative_pnl,
+        "coins": coins,
+        "trades": trade_log[-10:][::-1],
+        "scans": scan_log[-30:][::-1],
+        "error": error_message
+    })
+
+@app.route("/ping")
+def ping(): return "pong"
+
+if __name__ == "__main__":
+    load_profit_state()
+    fetch_pair_precisions()
+    app.run(host="0.0.0.0", port=10000)
