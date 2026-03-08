@@ -1,77 +1,146 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>AlgoTrader Pro | Live Provision</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="utf-8" />
+  <title>CoinDCX Auto Trader</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f7f7f7; --border:#e5e5e5; }
+    body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
+    h2 { margin: 0 0 12px; }
+    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
+    button { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
+    button:hover { background:#fafafa; }
+    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:300px; overflow:auto; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
+  </style>
 </head>
-<body class="bg-black text-slate-300 p-6 font-mono">
-    <div class="max-w-5xl mx-auto">
-        <div class="flex justify-between border-b border-white/10 pb-6 mb-10">
-            <div>
-                <h1 class="text-2xl font-black text-white">ENGINE_PRO_v2.5</h1>
-                <div id="status" class="text-[10px] uppercase font-bold mt-1 text-rose-500">Standby</div>
-            </div>
-            <div class="flex gap-4">
-                <button onclick="cmd('start')" class="border border-emerald-500 text-emerald-500 px-6 py-2 hover:bg-emerald-500/10 transition text-xs">START_BOT</button>
-                <button onclick="cmd('stop')" class="border border-rose-500 text-rose-500 px-6 py-2 hover:bg-rose-500/10 transition text-xs">STOP_BOT</button>
-            </div>
-        </div>
+<body>
+  <h2>CoinDCX Auto Trader <span class="pill" id="lblEpoch">—</span></h2>
 
-        <!-- Live Price Grid -->
-        <div id="market-grid" class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10"></div>
+  <div class="row" style="margin-bottom:10px">
+    <button id="btnStart">Start</button>
+    <button id="btnStop">Stop</button>
+    <span>Status: <b id="lblStatus">Idle</b></span>
+    <span>Last: <span id="lblLast">—</span></span>
+  </div>
 
-        <div class="bg-white/5 p-6 rounded border border-white/10 mb-10">
-            <p class="text-xs uppercase text-slate-500 mb-2">Available Capital (INR)</p>
-            <div class="flex gap-6 items-center">
-                <h2 class="text-3xl font-bold text-white">₹<span id="cap">0.00</span></h2>
-                <input id="cap_in" type="number" placeholder="Set Capital" class="bg-transparent border-b border-white/20 p-2 text-xs flex-1 outline-none">
-                <button onclick="setCap()" class="text-[10px] font-bold uppercase tracking-widest hover:text-white">Update</button>
-            </div>
-        </div>
-
-        <div class="bg-white/5 border border-white/10 rounded overflow-hidden">
-            <table class="w-full text-left text-xs">
-                <thead class="bg-white/5 text-slate-500">
-                    <tr><th class="p-4">Time</th><th class="p-4">Pair</th><th class="p-4">Action</th><th class="p-4 text-right">PnL</th></tr>
-                </thead>
-                <tbody id="logs"></tbody>
-            </table>
-        </div>
+  <div class="row" style="margin-bottom:16px">
+    <div class="card">
+      <div>USDT: <b id="lblUSDT">0.00</b></div>
+      <div>Today P&L (USDT): <b id="lblPNLT">0.00</b></div>
+      <div>Yesterday P&L (USDT): <b id="lblPNLY">0.00</b></div>
+      <div>Total P&L (USDT): <b id="lblPNLAll">0.00</b></div>
     </div>
+  </div>
 
-    <script>
-        async function cmd(c) { await fetch('/'+c, {method:'POST'}); }
-        async function setCap() {
-            const v = document.getElementById('cap_in').value;
-            await fetch('/set_capital', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({capital:v})});
+  <h3>Scans (latest 30)</h3>
+  <pre id="scanLog">—</pre>
+
+  <h3>Trades (latest 10)</h3>
+  <pre id="tradeLog">—</pre>
+
+  <script>
+    // --- basic Start/Stop buttons ---
+    document.getElementById('btnStart').onclick = async () => {
+      try { const r = await fetch('/start', { method:'POST' }); console.log('start', await r.json()); } catch(e){ console.warn(e); }
+    };
+    document.getElementById('btnStop').onclick = async () => {
+      try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
+    };
+
+    // --- watchdog + keepalive ---
+    (() => {
+      const PING_MS = 60 * 1000;     // ping /ping to keep the dyno warm
+      const CHECK_MS = 60 * 1000;    // poll /status cadence
+      const STALE_SEC = 120;         // if heartbeat older than this -> auto-start
+      const START_RETRY_MS = 10 * 1000;
+
+      let lastEpoch = 0;
+
+      async function safeFetch(url, opts = {}, timeoutMs = 8000) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), timeoutMs);
+        try {
+          const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
+          clearTimeout(t);
+          return res;
+        } catch (e) {
+          clearTimeout(t);
+          throw e;
         }
-        async function update() {
-            const res = await fetch('/dashboard');
-            const d = await res.json();
-            document.getElementById('status').innerText = d.running ? 'Running (Scanning Assets)' : 'Stopped';
-            document.getElementById('status').className = d.running ? 'text-[10px] uppercase font-bold mt-1 text-emerald-500' : 'text-[10px] uppercase font-bold mt-1 text-rose-500';
-            document.getElementById('cap').innerText = d.capital;
-            document.getElementById('market-grid').innerHTML = Object.entries(d.market).map(([p,i]) => `
-                <div class="bg-white/5 border border-white/10 p-6 rounded">
-                    <p class="text-[10px] text-slate-500 font-bold mb-1">${p}</p>
-                    <p class="text-xl text-white font-bold">₹${i.price || 'Scanning...'}</p>
-                    <div class="flex justify-between mt-4">
-                        <span class="text-[9px] uppercase font-bold ${i.bias=='Bullish'?'text-emerald-400':'text-rose-400'}">${i.bias}</span>
-                        <span class="text-[9px] text-slate-600 font-bold">ATR: ${i.atr}</span>
-                    </div>
-                </div>
-            `).join('');
-            document.getElementById('logs').innerHTML = d.log.reverse().map(l => `
-                <tr class="border-b border-white/5">
-                    <td class="p-4 text-slate-500">${l.time}</td>
-                    <td class="p-4 font-bold text-slate-300">${l.pair}</td>
-                    <td class="p-4 uppercase tracking-widest text-[10px]">${l.side}</td>
-                    <td class="p-4 text-right font-bold ${l.pnl > 0 ? 'text-emerald-500' : 'text-rose-400'}">${l.pnl}</td>
-                </tr>
-            `).join('');
+      }
+
+      async function keepAlive() {
+        try { await safeFetch('/ping', {}, 4000); } catch (_) {}
+      }
+
+      async function startScanner() {
+        try {
+          const res = await safeFetch('/start', { method:'POST' }, 6000);
+          console.log('[auto-start]', await res.json());
+        } catch (e) {
+          console.warn('[auto-start] failed, retrying', e);
+          setTimeout(startScanner, START_RETRY_MS);
         }
-        setInterval(update, 3000);
-    </script>
+      }
+
+      function renderStatus(d) {
+        document.getElementById('lblStatus').textContent = d.status || '—';
+        document.getElementById('lblLast').textContent = d.last || '—';
+        document.getElementById('lblUSDT').textContent = Number(d.usdt ?? 0).toFixed(2);
+        document.getElementById('lblPNLT').textContent = Number(d.profit_today ?? 0).toFixed(2);
+        document.getElementById('lblPNLY').textContent = Number(d.profit_yesterday ?? 0).toFixed(2);
+        document.getElementById('lblPNLAll').textContent = Number(d.pnl_cumulative ?? 0).toFixed(2);
+        document.getElementById('lblEpoch').textContent = d.status_epoch ? `hb:${d.status_epoch}` : '—';
+
+        const scans = Array.isArray(d.scans) ? d.scans.join('\n') : '';
+        const trades = Array.isArray(d.trades) ? d.trades.map(t => {
+          try { return JSON.stringify(t); } catch { return String(t); }
+        }).join('\n') : '';
+        document.getElementById('scanLog').textContent = scans || '—';
+        document.getElementById('tradeLog').textContent = trades || '—';
+      }
+
+      async function checkStatusAndAutostart() {
+        try {
+          const res = await safeFetch('/status', {}, 8000);
+          if (!res.ok) throw new Error('status not ok');
+          const data = await res.json();
+          renderStatus(data);
+
+          const nowSec = Math.floor(Date.now() / 1000);
+          const epoch = Number(data.status_epoch || 0);
+          const isIdle = (data.status || '').toLowerCase() !== 'running';
+          const isStale = epoch && (nowSec - epoch > STALE_SEC);
+
+          if (isIdle || isStale) {
+            console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
+            startScanner();
+          }
+          lastEpoch = epoch || lastEpoch;
+        } catch (e) {
+          console.warn('[watchdog] /status failed; nudging /start', e);
+          setTimeout(startScanner, START_RETRY_MS);
+        }
+      }
+
+      // initial kicks
+      keepAlive();
+      checkStatusAndAutostart();
+      startScanner();
+
+      // repeaters
+      setInterval(keepAlive, PING_MS);
+      setInterval(checkStatusAndAutostart, CHECK_MS);
+
+      // on tab focus (when mobile wakes)
+      window.addEventListener('focus', () => {
+        keepAlive();
+        checkStatusAndAutostart();
+      });
+    })();
+  </script>
 </body>
 </html>
