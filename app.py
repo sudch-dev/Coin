@@ -9,6 +9,7 @@ import streamlit as st
 import pandas as pd
 import pandas_ta as ta  # pip install pandas_ta
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import numpy as np
 
 # Environment variables
@@ -70,6 +71,9 @@ class CoinDCXAPI:
 
     def get_balance(self):
         if self.paper_trade:
+            # For paper trading, initialize some sample balances if not set
+            if self.balances['INR'] == 0:
+                self.balances['INR'] = 10000.0  # Default sim capital
             return self.balances
         try:
             body = {}
@@ -92,27 +96,30 @@ class CoinDCXAPI:
         if self.paper_trade:
             # Simulate order
             order_id = len(self.orders) + 1
+            ticker = self.get_ticker_for_pair(market)
+            price = price_per_unit or float(ticker['last_price']) if ticker else 100
             order = {
                 'id': order_id,
                 'side': side,
                 'type': order_type,
                 'market': market,
                 'quantity': total_quantity,
-                'price': price_per_unit or self.get_ticker_for_pair(market)['last_price'],
+                'price': price,
                 'status': 'filled',  # Assume instant fill for paper
                 'timestamp': int(time.time() * 1000)
             }
             self.orders.append(order)
             # Update balance simulation
-            price = order['price']
             if side == 'buy':
                 cost = total_quantity * price * (1 + 0.001)  # Fee
                 self.balances['INR'] -= cost
-                self.balances[market[:-3]] += total_quantity
+                coin = market[:-3]
+                self.balances[coin] = self.balances.get(coin, 0) + total_quantity
             else:
                 proceeds = total_quantity * price * (1 - 0.001)
                 self.balances['INR'] += proceeds
-                self.balances[market[:-3]] -= total_quantity
+                coin = market[:-3]
+                self.balances[coin] = self.balances.get(coin, 0) - total_quantity
             # Add to trades
             self.trades.append({
                 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -186,7 +193,7 @@ def find_best_pair(api, capital, fee_rate=0.001):
         if t['market'].endswith('INR'):
             change = abs(float(t['change_24_hour']))
             price = float(t['last_price'])
-            vol_rough = float(t['volume']) / price  # Relative volume
+            vol_rough = float(t.get('volume', 0)) / price  # Relative volume (handle missing key)
             expected_profit = (change / 100) * 0.5 - fee_rate * 2  # Assume capture half move
             position_size = min(capital * 0.1 / price, 100)  # Risk 10%
             if expected_profit > 0.005 and vol_rough > 1:  # Min 0.5% profit, liquid
@@ -205,7 +212,8 @@ def keepalive():
             pass
         time.sleep(240)
 
-# def bot_loop(api, capital, running):
+# Main Bot Loop with Debug Logs
+def bot_loop(api, capital, running):
     trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
     while running[0]:
         try:
@@ -219,7 +227,9 @@ def keepalive():
                     time.sleep(60)
                     continue
                 signal, vol = get_signal(candles)
-                print(f"[DEBUG] Signal for {best_pair}: {signal} | Vol: {vol:.2%} | RSI: {calculate_rsi([c[4] for c in candles]):.1f}")  # Log RSI too
+                closes = [c[4] for c in candles]
+                rsi_val = calculate_rsi(closes)
+                print(f"[DEBUG] Signal for {best_pair}: {signal} | Vol: {vol:.2%} | RSI: {rsi_val:.1f}")  # Log RSI too
                 if signal:
                     ticker = api.get_ticker_for_pair(best_pair)
                     price = float(ticker['last_price'])
@@ -235,12 +245,15 @@ def keepalive():
                         }
                         trades_df = pd.concat([trades_df, pd.DataFrame([new_trade])], ignore_index=True)
                         st.session_state.trades_df = trades_df  # Update UI live
+                        st.session_state.last_update = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last update time
                         print(f"[DEBUG] Trade executed: {order}")
-                        capital -= quantity * price * 0.001 if signal == 'buy' else 0  # Sim update
+                        if signal == 'buy':
+                            capital -= quantity * price * 0.001  # Sim update
                 else:
                     print(f"[DEBUG] No signal—skipping {best_pair}")
             else:
                 print("[DEBUG] No qualifying pair—idling")
+            st.session_state.last_scan = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last scan time
             time.sleep(60)
         except Exception as e:
             print(f"[DEBUG] Bot error: {e}")
@@ -252,6 +265,11 @@ def keepalive():
 def main():
     st.set_page_config(page_title='CoinDCX Trading Bot', layout='wide')
     st.title('ENGINE_PRO_v2.5')
+    
+    # Time Display in Indian Time (IST)
+    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    st.caption(f"Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     if st.button('Start Keepalive Thread (for Render)'):
         threading.Thread(target=keepalive, daemon=True).start()
         st.success('Keepalive started')
@@ -261,10 +279,8 @@ def main():
         st.stop()
 
     paper_trade = st.checkbox('Paper Trade Mode', value=True)
-    
-    # In the main() function, after the paper_trade = st.checkbox(...) line:
-   api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
-   st.session_state.trades_df = pd.DataFrame()  # Initialize trades table
+    api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
+    st.session_state.trades_df = pd.DataFrame()  # Initialize trades table
 
     col1, col2 = st.columns(2)
     with col1:
@@ -296,10 +312,16 @@ def main():
             st.success('Bot stopped')
 
     st.subheader('Trades')
-    if 'trades_df' in st.session_state:
+    if 'trades_df' in st.session_state and not st.session_state.trades_df.empty:
         st.dataframe(st.session_state.trades_df)
+        # Show last update time if available
+        if 'last_update' in st.session_state:
+            st.caption(f"Last Trade Update (IST): {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
-        st.info('No trades yet')
+        st.info('No trades yet—check Render logs for debug info')
+        # Show last scan time if bot running
+        if 'last_scan' in st.session_state:
+            st.caption(f"Last Scan (IST): {st.session_state.last_scan.strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == '__main__':
     if 'trades_df' not in st.session_state:
