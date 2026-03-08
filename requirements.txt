@@ -5,4 +5,5 @@ pytz
 gunicorn
 websocket-client
 pandas
-binance
+streamlit
+pandas_ta
