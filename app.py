@@ -205,22 +205,28 @@ def keepalive():
             pass
         time.sleep(240)
 
-# Main Bot Loop
-def bot_loop(api, capital, running):
+# def bot_loop(api, capital, running):
     trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
     while running[0]:
         try:
+            print(f"[DEBUG] Scanning at {datetime.now()} | Capital: ₹{capital}")  # Log timestamp
             best_pair = find_best_pair(api, capital)
+            print(f"[DEBUG] Best pair selected: {best_pair}")  # Will show None if no candidates
             if best_pair:
                 candles = api.get_candles(best_pair)
+                if not candles:
+                    print(f"[DEBUG] No candles for {best_pair}")
+                    time.sleep(60)
+                    continue
                 signal, vol = get_signal(candles)
+                print(f"[DEBUG] Signal for {best_pair}: {signal} | Vol: {vol:.2%} | RSI: {calculate_rsi([c[4] for c in candles]):.1f}")  # Log RSI too
                 if signal:
                     ticker = api.get_ticker_for_pair(best_pair)
                     price = float(ticker['last_price'])
-                    quantity = min(capital * 0.05 / price, 10)  # 5% allocation
+                    quantity = min(capital * 0.05 / price, 10)
+                    print(f"[DEBUG] Executing {signal} {quantity} @ ₹{price} for {best_pair}")
                     order = api.place_order(signal, 'market_order', best_pair, quantity)
                     if order:
-                        # Calculate PnL later, for now 0
                         new_trade = {
                             'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             'Pair': best_pair,
@@ -228,12 +234,18 @@ def bot_loop(api, capital, running):
                             'PnL': 0.0
                         }
                         trades_df = pd.concat([trades_df, pd.DataFrame([new_trade])], ignore_index=True)
-                        # Update capital simulation or real
-                        capital -= quantity * price * 0.001 if signal == 'buy' else 0
-            time.sleep(60)  # Scan every minute
+                        st.session_state.trades_df = trades_df  # Update UI live
+                        print(f"[DEBUG] Trade executed: {order}")
+                        capital -= quantity * price * 0.001 if signal == 'buy' else 0  # Sim update
+                else:
+                    print(f"[DEBUG] No signal—skipping {best_pair}")
+            else:
+                print("[DEBUG] No qualifying pair—idling")
+            time.sleep(60)
         except Exception as e:
-            st.error(f"Bot error: {e}")
+            print(f"[DEBUG] Bot error: {e}")
             time.sleep(10)
+    st.session_state.trades_df = trades_df
     return trades_df
 
 # Streamlit UI
