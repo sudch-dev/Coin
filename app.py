@@ -1,385 +1,153 @@
-import os
-import time
-import json
-import hmac
-import hashlib
-import threading
-import requests
-import pandas as pd
-from flask import Flask, render_template, request, jsonify
+import os, time, threading, requests, json, hmac, hashlib
+from datetime import datetime
+import numpy as np
+import pytz
+from flask import Flask, render_template, jsonify, request
 
 app = Flask(__name__)
 
+# ================= CONFIG =================
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
-RENDER_URL = os.getenv("RENDER_URL","https://coin-4k37.onrender.com")
+BASE_URL = "https://api.coindcx.com"
+IST = pytz.timezone("Asia/Kolkata")
+PAIRS = ["I-BTC_INR", "I-ETH_INR", "I-SOL_INR"]
+# YOUR PROVIDED RENDER URL
+RENDER_URL = "https://coin-4k37.onrender.com"
 
-SYMBOLS = ["BTCINR","ETHINR","SOLINR"]
+# Global System State
+running = False
+investment_capital = 0.0
+entry_positions = {}
+trade_log = []
+market_snapshot = {p: {"price": 0, "bias": "Scanning...", "atr": 0} for p in PAIRS}
 
-MARKET_MAP = {
-"BTCINR":"B-BTC_INR",
-"ETHINR":"B-ETH_INR",
-"SOLINR":"B-SOL_INR"
-}
+# Data Buffers
+price_history = {p: [] for p in PAIRS}
+volume_history = {p: [] for p in PAIRS}
 
-bot_running = False
-paper_mode = True
-capital = 1000
+# ================= ADVANCED DATA PARSER =================
+def fetch_market_data(pair):
+    try:
+        url = f"https://public.coindcx.com{pair}"
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        if "bids" in data and data["bids"]:
+            prices = [float(p) for p in data["bids"].keys()]
+            top_price = max(prices)
+            volume = float(data["bids"][f"{top_price:.8f}"])
+            return top_price, volume
+    except:
+        return None, None
 
-logs=[]
-positions={}
+# ================= MATHEMATICAL ENGINE =================
+def get_atr(pair, period=14):
+    if len(price_history[pair]) < period + 1: return 0
+    return np.mean(np.abs(np.diff(price_history[pair][-period-1:])))
 
-########################################
-# KEEP ALIVE
-########################################
+def get_volume_zscore(pair):
+    v_data = volume_history[pair]
+    if len(v_data) < 20: return 0
+    std_v = np.std(v_data[-20:])
+    return (v_data[-1] - np.mean(v_data[-20:])) / std_v if std_v > 0 else 0
 
-def self_keepalive():
+# ================= TRADING CORE =================
+def advanced_trading_loop():
+    global running, investment_capital
+    while True:
+        if not running:
+            time.sleep(2); continue
+        for pair in PAIRS:
+            price, vol = fetch_market_data(pair)
+            if not price: continue
+
+            price_history[pair].append(price)
+            volume_history[pair].append(vol)
+            if len(price_history[pair]) > 150:
+                price_history[pair].pop(0); volume_history[pair].pop(0)
+
+            atr = get_atr(pair)
+            market_snapshot[pair].update({"price": round(price, 2), "atr": round(atr, 2)})
+
+            if pair in entry_positions:
+                pos = entry_positions[pair]
+                if pos["side"] == "long":
+                    if price > pos["peak"]: 
+                        pos["peak"] = price
+                        pos["sl"] = max(pos["sl"], price - (atr * 1.5))
+                    if price < pos["sl"]: close_trade(pair, price, "SL/Trailing")
+                continue
+
+            if len(price_history[pair]) > 30:
+                z_score = get_volume_zscore(pair)
+                bias = "bullish" if price > np.mean(price_history[pair][-30:]) else "bearish"
+                market_snapshot[pair]["bias"] = bias.capitalize()
+
+                # Entry Signal: High Volume + Trend
+                if z_score > 2.0 and investment_capital > 100:
+                    execute_trade(pair, "long" if bias == "bullish" else "short", price, atr)
+        time.sleep(10)
+
+def execute_trade(pair, side, price, atr):
+    global investment_capital
+    risk = investment_capital * 0.05
+    qty = round(risk / price, 6)
+    entry_positions[pair] = {
+        "side": side, "qty": qty, "entry": price, "peak": price,
+        "sl": price - (atr * 2) if side == "long" else price + (atr * 2)
+    }
+    trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": side, "pnl": "OPEN"})
+
+def close_trade(pair, price, reason):
+    global investment_capital
+    pos = entry_positions.pop(pair)
+    pnl = (price - pos["entry"]) * pos["qty"] if pos["side"] == "long" else (pos["entry"] - price) * pos["qty"]
+    investment_capital += pnl
+    trade_log.append({"time": datetime.now(IST).strftime("%H:%M:%S"), "pair": pair, "side": f"CLOSE ({reason})", "pnl": round(pnl, 2)})
+
+# ================= ROUTES =================
+@app.route("/")
+def home(): return render_template("index.html")
+
+@app.route("/dashboard")
+def dashboard():
+    return jsonify({
+        "running": running, "capital": round(investment_capital, 2),
+        "positions": entry_positions, "market": market_snapshot,
+        "log": trade_log[-15:]
+    })
+
+@app.route("/start", methods=["POST"])
+def start(): global running; running = True; return "OK"
+
+@app.route("/stop", methods=["POST"])
+def stop(): global running; running = False; return "OK"
+
+@app.route("/set_capital", methods=["POST"])
+def set_capital():
+    global investment_capital
+    investment_capital = float(request.json.get("capital", 0))
+    return "OK"
+
+# THE MISSING PROVISION: PING ROUTE
+@app.route("/ping")
+def ping(): return "pong", 200
+
+# ================= KEEP ALIVE ENGINE =================
+def keep_alive_loop():
+    """Pings the Render URL every 4 minutes to prevent idling."""
     while True:
         try:
-            requests.get(f"{RENDER_URL}/ping",timeout=5)
+            requests.get(f"{RENDER_URL}/ping", timeout=10)
         except:
             pass
         time.sleep(240)
 
-threading.Thread(target=self_keepalive,daemon=True).start()
-
-########################################
-# LOG
-########################################
-
-def log(msg):
-    global logs
-    logs.append(f"{time.strftime('%H:%M:%S')} - {msg}")
-    logs=logs[-100:]
-
-########################################
-# MARKET DATA
-########################################
-
-def get_candles(symbol):
-
-    try:
-
-        url=f"https://public.coindcx.com/market_data/candles?pair={symbol}&interval=1m"
-
-        r=requests.get(url)
-
-        data=r.json()
-
-        df=pd.DataFrame(data)
-
-        df["open"]=df["open"].astype(float)
-        df["high"]=df["high"].astype(float)
-        df["low"]=df["low"].astype(float)
-        df["close"]=df["close"].astype(float)
-
-        return df
-
-    except:
-        return None
-
-########################################
-# SMC ENGINE
-########################################
-
-def detect_bos(df):
-
-    if len(df)<6:
-        return None
-
-    if df["high"].iloc[-1] > df["high"].iloc[-5]:
-        return "BULL"
-
-    if df["low"].iloc[-1] < df["low"].iloc[-5]:
-        return "BEAR"
-
-    return None
-
-def detect_choch(df):
-
-    df["ema20"]=df["close"].ewm(span=20).mean()
-
-    if df["close"].iloc[-1] < df["ema20"].iloc[-1]:
-        return "BEAR"
-
-    if df["close"].iloc[-1] > df["ema20"].iloc[-1]:
-        return "BULL"
-
-    return None
-
-def detect_order_block(df):
-
-    last=df.iloc[-2]
-
-    if last["close"]>last["open"]:
-        return "BULLISH_OB"
-
-    if last["close"]<last["open"]:
-        return "BEARISH_OB"
-
-    return None
-
-########################################
-# SIGNAL
-########################################
-
-def compute_signal(symbol):
-
-    df=get_candles(symbol)
-
-    if df is None:
-        return None
-
-    df["ema20"]=df["close"].ewm(span=20).mean()
-    df["ema50"]=df["close"].ewm(span=50).mean()
-
-    trend="LONG" if df["ema20"].iloc[-1] > df["ema50"].iloc[-1] else "SHORT"
-
-    bos=detect_bos(df)
-    choch=detect_choch(df)
-    ob=detect_order_block(df)
-
-    return {
-    "trend":trend,
-    "bos":bos,
-    "choch":choch,
-    "ob":ob,
-    "price":df["close"].iloc[-1]
-    }
-
-########################################
-# ORDER
-########################################
-
-def place_order(symbol,side,price):
-
-    qty=capital/price
-
-    if paper_mode:
-
-        log(f"PAPER {side} {symbol} @ {price}")
-
-        positions[symbol]={
-        "side":side,
-        "entry":price
-        }
-
-        return
-
-    try:
-
-        market=MARKET_MAP[symbol]
-
-        payload={
-        "side":side,
-        "order_type":"market_order",
-        "market":market,
-        "total_quantity":qty,
-        "timestamp":int(time.time()*1000)
-        }
-
-        json_payload=json.dumps(payload)
-
-        signature=hmac.new(
-        bytes(API_SECRET,'utf-8'),
-        json_payload.encode(),
-        hashlib.sha256
-        ).hexdigest()
-
-        headers={
-        "X-AUTH-APIKEY":API_KEY,
-        "X-AUTH-SIGNATURE":signature
-        }
-
-        r=requests.post(
-        "https://api.coindcx.com/exchange/v1/orders/create",
-        data=json_payload,
-        headers=headers
-        )
-
-        log(r.text)
-
-    except Exception as e:
-
-        log(str(e))
-
-########################################
-# ENGINE
-########################################
-
-def trading_loop():
-
-    global bot_running
-
-    while True:
-
-        if not bot_running:
-            time.sleep(5)
-            continue
-
-        for symbol in SYMBOLS:
-
-            signal=compute_signal(symbol)
-
-            if not signal:
-                continue
-
-            price=signal["price"]
-
-            ################################
-            # ENTRY
-            ################################
-
-            if symbol not in positions:
-
-                if signal["ob"]=="BULLISH_OB" and signal["trend"]=="LONG":
-
-                    place_order(symbol,"buy",price)
-
-                if signal["ob"]=="BEARISH_OB" and signal["trend"]=="SHORT":
-
-                    place_order(symbol,"sell",price)
-
-            ################################
-            # MANAGEMENT
-            ################################
-
-            else:
-
-                entry=positions[symbol]["entry"]
-
-                pnl=(price-entry)/entry
-
-                ################################
-                # CONTINUATION
-                ################################
-
-                if signal["bos"]:
-                    log(f"{symbol} BoS detected → continue")
-
-                ################################
-                # EXIT
-                ################################
-
-                if signal["choch"]:
-
-                    log(f"{symbol} CHoCH exit")
-
-                    del positions[symbol]
-
-                elif abs(pnl)>0.02:
-
-                    log(f"{symbol} TP/SL exit")
-
-                    del positions[symbol]
-
-        time.sleep(60)
-
-threading.Thread(target=trading_loop,daemon=True).start()
-
-########################################
-# ROUTES
-########################################
-
-@app.route("/")
-def home():
-
-    return render_template(
-    "index.html",
-    capital=capital,
-    paper_mode=paper_mode
-    )
-
-@app.route("/start")
-def start():
-
-    global bot_running
-    bot_running=True
-
-    log("BOT STARTED")
-
-    return "started"
-
-@app.route("/stop")
-def stop():
-
-    global bot_running
-    bot_running=False
-
-    log("BOT STOPPED")
-
-    return "stopped"
-
-@app.route("/toggle_mode")
-def toggle_mode():
-
-    global paper_mode
-    paper_mode=not paper_mode
-
-    log("MODE "+("PAPER" if paper_mode else "LIVE"))
-
-    return "ok"
-
-@app.route("/set_capital",methods=["POST"])
-def set_capital():
-
-    global capital
-    capital=float(request.form["capital"])
-
-    log(f"Capital set {capital}")
-
-    return "ok"
-
-@app.route("/status")
-def status():
-
-    return jsonify({
-    "running":bot_running,
-    "paper":paper_mode,
-    "capital":capital,
-    "positions":positions,
-    "logs":logs
-    })
-
-@app.route("/ping")
-def ping():
-    return "pong"
-    
-    # AUTO START BOT AFTER SERVER RESTART
-
-AUTO_START = True
-
-def auto_start_bot():
-    global bot_running
-
-    time.sleep(10)
-
-    if AUTO_START:
-        bot_running = True
-        log("AUTO RESTART BOT")
-
-threading.Thread(target=auto_start_bot, daemon=True).start()
-
-######################
-
-STATE_FILE="state.json"
-
-def save_state():
-    with open(STATE_FILE,"w") as f:
-        json.dump(positions,f)
-
-def load_state():
-    global positions
-    try:
-        with open(STATE_FILE) as f:
-            positions=json.load(f)
-    except:
-        positions={}
-
-########################################
-
-if __name__=="__main__":
-
-    port=int(os.environ.get("PORT",10000))
-
-    app.run(host="0.0.0.0",port=port)
+# Start all background threads
+threading.Thread(target=advanced_trading_loop, daemon=True).start()
+threading.Thread(target=keep_alive_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    # Render Dynamic Port
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
