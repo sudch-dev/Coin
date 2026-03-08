@@ -270,6 +270,15 @@ def main():
     ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
     st.caption(f"Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
     
+    # Auto-refresh every 30 seconds via JavaScript (for live status updates)
+    st.components.v1.html("""
+    <script>
+        setTimeout(function() {
+            window.location.reload();
+        }, 30000);  // 30 seconds
+    </script>
+    """, height=0)
+    
     if st.button('Start Keepalive Thread (for Render)'):
         threading.Thread(target=keepalive, daemon=True).start()
         st.success('Keepalive started')
@@ -311,6 +320,13 @@ def main():
                 st.session_state.running[0] = False
             st.success('Bot stopped')
 
+    # Running Status Indicator
+    st.subheader('Bot Status')
+    if 'running' in st.session_state and st.session_state.running[0]:
+        st.success('🟢 Running')
+    else:
+        st.warning('🔴 Stopped')
+    
     st.subheader('Trades')
     if 'trades_df' in st.session_state and not st.session_state.trades_df.empty:
         st.dataframe(st.session_state.trades_df)
