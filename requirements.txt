@@ -1,9 +1,8 @@
-Flask
+fastapi
+uvicorn
+gunicorn
+pandas
+pandas_ta
 requests
 numpy
-pytz
-gunicorn
-websocket-client
-pandas
-streamlit
-pandas_ta
+jinja2
