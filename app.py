@@ -238,6 +238,10 @@ def keep_alive():
             pass
 
         time.sleep(240)
+        
+        @app.route("/ping")
+def ping():
+    return "pong"
 
 
 # ==================================
