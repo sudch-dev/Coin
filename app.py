@@ -5,166 +5,54 @@ import hmac
 import hashlib
 import requests
 import threading
-import streamlit as st
-import pandas as pd
-import pandas_ta as ta  # pip install pandas_ta
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import numpy as np
+import pandas as pd
+import pandas_ta as ta
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 
-# Environment variables
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")  # Create a 'templates' folder in repo for HTML
+app.mount("/static", StaticFiles(directory="static"), name="static")  # Optional for CSS/JS
+
+# Env vars
 API_KEY = os.getenv('API_KEY')
 API_SECRET = os.getenv('API_SECRET')
 RENDER_URL = 'https://coin-4k37.onrender.com/pi'
 
+# Global state (for simplicity; use Redis for prod)
+bot_running = False
+trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
+last_scan = None
+last_update = None
+capital = 10000.0
+paper_trade = True
+
 class CoinDCXAPI:
+    # (Same as before - paste the full class here from previous app.py)
     def __init__(self, api_key, api_secret, paper_trade=False):
         self.base_url = 'https://api.coindcx.com'
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper_trade = paper_trade
-        self.balances = {'INR': 0.0, 'BTC': 0.0, 'ETH': 0.0}  # Example, extend as needed
+        self.balances = {'INR': 10000.0 if paper_trade else 0.0}  # Default for paper
         self.orders = []
         self.trades = []
 
-    def _generate_signature(self, body):
-        timestamp = int(time.time() * 1000)
-        body['timestamp'] = timestamp
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(self.api_secret.encode(), json_body.encode(), hashlib.sha256).hexdigest()
-        return json_body, signature
+    # ... (include all methods: _generate_signature, get_markets, get_ticker, get_candles, get_balance, place_order, get_ticker_for_pair)
 
-    def get_markets(self):
-        if self.paper_trade:
-            return ['BTCINR', 'ETHINR', 'XRPINR']  # Simulated
-        try:
-            response = requests.get(f'{self.base_url}/exchange/v1/markets')
-            markets = response.json()
-            return [m for m in markets if m.endswith('INR')]
-        except Exception as e:
-            st.error(f"Error fetching markets: {e}")
-            return []
-
-    def get_ticker(self):
-        if self.paper_trade:
-            return [{'market': 'BTCINR', 'last_price': 5000000, 'change_24_hour': '2.5'},  # Simulated
-                    {'market': 'ETHINR', 'last_price': 300000, 'change_24_hour': '-1.2'}]
-        try:
-            response = requests.get(f'{self.base_url}/exchange/ticker')
-            return response.json()
-        except Exception as e:
-            st.error(f"Error fetching ticker: {e}")
-            return []
-
-    def get_candles(self, pair, interval='1m', limit=100):
-        if self.paper_trade:
-            # Simulated candles: [timestamp, open, high, low, close, volume]
-            np.random.seed(42)  # For reproducibility in sim
-            closes = np.cumsum(np.random.randn(limit)) + 100  # Random walk
-            return [[int(time.time()*1000 - i*60*1000), closes[i], closes[i]+0.1, closes[i]-0.1, closes[i], 10] for i in range(limit-1, -1, -1)]
-        try:
-            response = requests.get(f'{self.base_url}/market_data/candles?pair={pair}&interval={interval}')
-            return response.json()
-        except Exception as e:
-            st.error(f"Error fetching candles for {pair}: {e}")
-            return []
-
-    def get_balance(self):
-        if self.paper_trade:
-            # For paper trading, initialize some sample balances if not set
-            if self.balances['INR'] == 0:
-                self.balances['INR'] = 10000.0  # Default sim capital
-            return self.balances
-        try:
-            body = {}
-            json_body, signature = self._generate_signature(body)
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': self.api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
-            response = requests.post(f'{self.base_url}/exchange/v1/users/balances', data=json_body, headers=headers)
-            data = response.json()
-            balances = {item['currency']: float(item['balance']) for item in data}
-            self.balances.update(balances)  # Sync
-            return balances
-        except Exception as e:
-            st.error(f"Error fetching balance: {e}")
-            return {}
-
-    def place_order(self, side, order_type, market, total_quantity, price_per_unit=None):
-        if self.paper_trade:
-            # Simulate order
-            order_id = len(self.orders) + 1
-            ticker = self.get_ticker_for_pair(market)
-            price = price_per_unit or float(ticker['last_price']) if ticker else 100
-            order = {
-                'id': order_id,
-                'side': side,
-                'type': order_type,
-                'market': market,
-                'quantity': total_quantity,
-                'price': price,
-                'status': 'filled',  # Assume instant fill for paper
-                'timestamp': int(time.time() * 1000)
-            }
-            self.orders.append(order)
-            # Update balance simulation
-            if side == 'buy':
-                cost = total_quantity * price * (1 + 0.001)  # Fee
-                self.balances['INR'] -= cost
-                coin = market[:-3]
-                self.balances[coin] = self.balances.get(coin, 0) + total_quantity
-            else:
-                proceeds = total_quantity * price * (1 - 0.001)
-                self.balances['INR'] += proceeds
-                coin = market[:-3]
-                self.balances[coin] = self.balances.get(coin, 0) - total_quantity
-            # Add to trades
-            self.trades.append({
-                'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'pair': market,
-                'action': side,
-                'pnl': 0  # Calculate later
-            })
-            return order
-        try:
-            body = {
-                'side': side,
-                'order_type': order_type,
-                'market': market,
-                'total_quantity': total_quantity
-            }
-            if price_per_unit:
-                body['price_per_unit'] = price_per_unit
-            json_body, signature = self._generate_signature(body)
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': self.api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
-            response = requests.post(f'{self.base_url}/exchange/v1/orders/create', data=json_body, headers=headers)
-            return response.json()
-        except Exception as e:
-            st.error(f"Error placing order: {e}")
-            return None
-
-    def get_ticker_for_pair(self, pair):
-        tickers = self.get_ticker()
-        for t in tickers:
-            if t['market'] == pair:
-                return t
-        return None
-
-# Strategy Functions
+# Strategy functions (same as before)
 def calculate_rsi(closes, period=14):
     df = pd.DataFrame({'close': closes})
     df['rsi'] = ta.rsi(df['close'], length=period)
     return df['rsi'].iloc[-1]
 
 def select_interval(volatility):
-    # Volatility rough: std of returns
-    if volatility > 0.05:  # High vol
+    if volatility > 0.05:
         return '1m'
     elif volatility > 0.02:
         return '5m'
@@ -175,14 +63,10 @@ def get_signal(candles):
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['close'] = df['close'].astype(float)
     volatility = df['close'].pct_change().std()
-    interval = select_interval(volatility)
-    # Re-fetch if needed, but assume current is ok
-
     rsi = calculate_rsi(df['close'].values)
-    # Simple strategy: RSI oversold/overbought, with momentum
-    if rsi < 30 and df['close'].iloc[-1] > df['close'].iloc[-3]:  # Buy signal: oversold + up momentum
+    if rsi < 30 and df['close'].iloc[-1] > df['close'].iloc[-3]:
         return 'buy', volatility
-    elif rsi > 70 and df['close'].iloc[-1] < df['close'].iloc[-3]:  # Sell signal
+    elif rsi > 70 and df['close'].iloc[-1] < df['close'].iloc[-3]:
         return 'sell', volatility
     return None, volatility
 
@@ -193,17 +77,16 @@ def find_best_pair(api, capital, fee_rate=0.001):
         if t['market'].endswith('INR'):
             change = abs(float(t['change_24_hour']))
             price = float(t['last_price'])
-            vol_rough = float(t.get('volume', 0)) / price  # Relative volume (handle missing key)
-            expected_profit = (change / 100) * 0.5 - fee_rate * 2  # Assume capture half move
-            position_size = min(capital * 0.1 / price, 100)  # Risk 10%
-            if expected_profit > 0.005 and vol_rough > 1:  # Min 0.5% profit, liquid
+            vol_rough = float(t.get('volume', 0)) / price
+            expected_profit = (change / 100) * 0.5 - fee_rate * 2
+            if expected_profit > 0.005 and vol_rough > 1:
                 candidates.append((t, expected_profit, vol_rough))
     if candidates:
-        candidates.sort(key=lambda x: x[1] * x[2], reverse=True)  # Profit * liquidity
+        candidates.sort(key=lambda x: x[1] * x[2], reverse=True)
         return candidates[0][0]['market']
     return None
 
-# Keepalive
+# Keepalive thread
 def keepalive():
     while True:
         try:
@@ -212,134 +95,114 @@ def keepalive():
             pass
         time.sleep(240)
 
-# Main Bot Loop with Debug Logs
-def bot_loop(api, capital, running):
-    trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
-    while running[0]:
+# Bot loop (modified for global state)
+def bot_loop(api):
+    global bot_running, trades_df, last_scan, last_update, capital
+    while bot_running:
         try:
-            print(f"[DEBUG] Scanning at {datetime.now()} | Capital: ₹{capital}")  # Log timestamp
+            print(f"[DEBUG] Scanning at {datetime.now()} | Capital: ₹{capital}")
             best_pair = find_best_pair(api, capital)
-            print(f"[DEBUG] Best pair selected: {best_pair}")  # Will show None if no candidates
+            print(f"[DEBUG] Best pair: {best_pair}")
             if best_pair:
                 candles = api.get_candles(best_pair)
-                if not candles:
-                    print(f"[DEBUG] No candles for {best_pair}")
-                    time.sleep(60)
-                    continue
-                signal, vol = get_signal(candles)
-                closes = [c[4] for c in candles]
-                rsi_val = calculate_rsi(closes)
-                print(f"[DEBUG] Signal for {best_pair}: {signal} | Vol: {vol:.2%} | RSI: {rsi_val:.1f}")  # Log RSI too
-                if signal:
-                    ticker = api.get_ticker_for_pair(best_pair)
-                    price = float(ticker['last_price'])
-                    quantity = min(capital * 0.05 / price, 10)
-                    print(f"[DEBUG] Executing {signal} {quantity} @ ₹{price} for {best_pair}")
-                    order = api.place_order(signal, 'market_order', best_pair, quantity)
-                    if order:
-                        new_trade = {
-                            'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'Pair': best_pair,
-                            'Action': signal,
-                            'PnL': 0.0
-                        }
-                        trades_df = pd.concat([trades_df, pd.DataFrame([new_trade])], ignore_index=True)
-                        st.session_state.trades_df = trades_df  # Update UI live
-                        st.session_state.last_update = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last update time
-                        print(f"[DEBUG] Trade executed: {order}")
-                        if signal == 'buy':
-                            capital -= quantity * price * 0.001  # Sim update
-                else:
-                    print(f"[DEBUG] No signal—skipping {best_pair}")
-            else:
-                print("[DEBUG] No qualifying pair—idling")
-            st.session_state.last_scan = datetime.now(ZoneInfo("Asia/Kolkata"))  # Update last scan time
+                if candles:
+                    signal, vol = get_signal(candles)
+                    closes = [c[4] for c in candles]
+                    rsi_val = calculate_rsi(closes)
+                    print(f"[DEBUG] Signal: {signal} | Vol: {vol:.2%} | RSI: {rsi_val:.1f}")
+                    if signal:
+                        ticker = api.get_ticker_for_pair(best_pair)
+                        price = float(ticker['last_price'])
+                        quantity = min(capital * 0.05 / price, 10)
+                        order = api.place_order(signal, 'market_order', best_pair, quantity)
+                        if order:
+                            new_trade = {'Time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'Pair': best_pair, 'Action': signal, 'PnL': 0.0}
+                            trades_df = pd.concat([trades_df, pd.DataFrame([new_trade])], ignore_index=True)
+                            last_update = datetime.now(ZoneInfo("Asia/Kolkata"))
+                            if signal == 'buy':
+                                capital -= quantity * price * 0.001
+            last_scan = datetime.now(ZoneInfo("Asia/Kolkata"))
             time.sleep(60)
         except Exception as e:
-            print(f"[DEBUG] Bot error: {e}")
+            print(f"[DEBUG] Error: {e}")
             time.sleep(10)
-    st.session_state.trades_df = trades_df
-    return trades_df
 
-# Streamlit UI
-def main():
-    st.set_page_config(page_title='CoinDCX Trading Bot', layout='wide')
-    st.title('ENGINE_PRO_v2.5')
-    
-    # Time Display in Indian Time (IST)
+api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
     ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    st.caption(f"Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
+    balances = api.get_balance()
+    portfolio = [{'Coin': k, 'Balance': v} for k, v in balances.items() if k != 'INR']
+    status = "🟢 Running" if bot_running else "🔴 Stopped"
+    last_scan_str = last_scan.strftime('%Y-%m-%d %H:%M:%S') if last_scan else "N/A"
+    last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S') if last_update else "N/A"
     
-    # Auto-refresh every 30 seconds via JavaScript (for live status updates)
-    st.components.v1.html("""
-    <script>
-        setTimeout(function() {
-            window.location.reload();
-        }, 30000);  // 30 seconds
-    </script>
-    """, height=0)
-    
-    if st.button('Start Keepalive Thread (for Render)'):
-        threading.Thread(target=keepalive, daemon=True).start()
-        st.success('Keepalive started')
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>ENGINE_PRO_v2.5</title><meta charset="UTF-8"></head>
+    <body style="font-family: Arial; background: #000; color: #fff; padding: 20px;">
+        <h1>ENGINE_PRO_v2.5</h1>
+        <p>Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p>Bot Status: {status}</p>
+        <p>Last Scan (IST): {last_scan_str} | Last Update (IST): {last_update_str}</p>
+        
+        <form method="post" action="/set_params">
+            <label>Capital (INR): <input type="number" name="capital" value="{capital}" step="1000"></label><br>
+            <label>Paper Mode: <input type="checkbox" name="paper_trade" {'checked' if paper_trade else ''}></label><br>
+            <input type="submit" value="Update">
+        </form>
+        
+        <h3>Portfolio</h3>
+        <table border="1" style="color: #fff;">
+            <tr><th>Coin</th><th>Balance</th></tr>
+            {' '.join(f'<tr><td>{row["Coin"]}</td><td>{row["Balance"]}</td></tr>' for row in portfolio)}
+        </table>
+        
+        <h3>Controls</h3>
+        <form method="post" action="/start_bot"><input type="submit" value="Start Bot"></form>
+        <form method="post" action="/stop_bot"><input type="submit" value="Stop Bot"></form>
+        <form method="post" action="/keepalive"><input type="submit" value="Start Keepalive"></form>
+        
+        <h3>Trades</h3>
+        <table border="1" style="color: #fff;">
+            <tr><th>Time</th><th>Pair</th><th>Action</th><th>PnL</th></tr>
+            {' '.join(f'<tr><td>{row["Time"]}</td><td>{row["Pair"]}</td><td>{row["Action"]}</td><td>{row["PnL"]}</td></tr>' for _, row in trades_df.iterrows()) or '<tr><td colspan="4">No trades yet</td></tr>'}
+        </table>
+        <p><a href="/">Refresh (every 30s manually)</a></p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
-    if not API_KEY or not API_SECRET:
-        st.warning('Set API_KEY and API_SECRET env vars')
-        st.stop()
+@app.post("/set_params")
+async def set_params(capital: float = Form(...), paper_trade: bool = Form(False)):
+    global capital_global, paper_trade_global  # Update globals
+    capital = float(capital)
+    paper_trade = paper_trade == "on"  # Checkbox hack
+    api.paper_trade = paper_trade
+    return {"status": "Updated", "capital": capital, "paper": paper_trade}
 
-    paper_trade = st.checkbox('Paper Trade Mode', value=True)
-    api = CoinDCXAPI(API_KEY, API_SECRET, paper_trade)
-    st.session_state.trades_df = pd.DataFrame()  # Initialize trades table
+@app.post("/start_bot")
+async def start_bot():
+    global bot_running
+    if not bot_running:
+        bot_running = True
+        threading.Thread(target=bot_loop, args=(api,), daemon=True).start()
+    return {"status": "Bot started"}
 
-    col1, col2 = st.columns(2)
-    with col1:
-        capital = st.number_input('Available Capital (INR)', value=10000.0, step=1000.0)
-    with col2:
-        balances = api.get_balance()
-        st.metric('INR Balance', f"₹ {balances.get('INR', 0):,.2f}")
+@app.post("/stop_bot")
+async def stop_bot():
+    global bot_running
+    bot_running = False
+    return {"status": "Bot stopped"}
 
-    portfolio_df = pd.DataFrame([
-        {'Coin': k, 'Balance': v} for k, v in balances.items() if k != 'INR'
-    ])
-    if not portfolio_df.empty:
-        st.subheader('Portfolio')
-        st.dataframe(portfolio_df)
+@app.post("/keepalive")
+async def start_keepalive():
+    threading.Thread(target=keepalive, daemon=True).start()
+    return {"status": "Keepalive started"}
 
-    col3, col4 = st.columns(2)
-    with col3:
-        if st.button('Start Bot'):
-            running = [True]
-            st.session_state.running = running
-            thread = threading.Thread(target=bot_loop, args=(api, capital, running))
-            thread.daemon = True
-            thread.start()
-            st.success('Bot started')
-    with col4:
-        if st.button('Stop Bot'):
-            if 'running' in st.session_state:
-                st.session_state.running[0] = False
-            st.success('Bot stopped')
-
-    # Running Status Indicator
-    st.subheader('Bot Status')
-    if 'running' in st.session_state and st.session_state.running[0]:
-        st.success('🟢 Running')
-    else:
-        st.warning('🔴 Stopped')
-    
-    st.subheader('Trades')
-    if 'trades_df' in st.session_state and not st.session_state.trades_df.empty:
-        st.dataframe(st.session_state.trades_df)
-        # Show last update time if available
-        if 'last_update' in st.session_state:
-            st.caption(f"Last Trade Update (IST): {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}")
-    else:
-        st.info('No trades yet—check Render logs for debug info')
-        # Show last scan time if bot running
-        if 'last_scan' in st.session_state:
-            st.caption(f"Last Scan (IST): {st.session_state.last_scan.strftime('%Y-%m-%d %H:%M:%S')}")
-
-if __name__ == '__main__':
-    if 'trades_df' not in st.session_state:
-        st.session_state.trades_df = pd.DataFrame()
-    main()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
