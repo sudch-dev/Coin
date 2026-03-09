@@ -12,19 +12,15 @@ import pandas as pd
 import pandas_ta as ta
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")  # Create a 'templates' folder in repo for HTML
-app.mount("/static", StaticFiles(directory="static"), name="static")  # Optional for CSS/JS
 
 # Env vars
 API_KEY = os.getenv('API_KEY')
 API_SECRET = os.getenv('API_SECRET')
 RENDER_URL = 'https://coin-4k37.onrender.com/pi'
 
-# Global state (for simplicity; use Redis for prod)
+# Global state
 bot_running = False
 trades_df = pd.DataFrame(columns=['Time', 'Pair', 'Action', 'PnL'])
 last_scan = None
@@ -33,31 +29,130 @@ capital = 10000.0
 paper_trade = True
 
 class CoinDCXAPI:
-    # (Same as before - paste the full class here from previous app.py)
     def __init__(self, api_key, api_secret, paper_trade=False):
         self.base_url = 'https://api.coindcx.com'
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper_trade = paper_trade
-        self.balances = {'INR': 10000.0 if paper_trade else 0.0}  # Default for paper
+        self.balances = {'INR': 10000.0 if paper_trade else 0.0}
         self.orders = []
         self.trades = []
 
-    # ... (include all methods: _generate_signature, get_markets, get_ticker, get_candles, get_balance, place_order, get_ticker_for_pair)
+    def _generate_signature(self, body):
+        timestamp = int(time.time() * 1000)
+        body['timestamp'] = timestamp
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(self.api_secret.encode(), json_body.encode(), hashlib.sha256).hexdigest()
+        return json_body, signature
 
-# Strategy functions (same as before)
+    def get_markets(self):
+        if self.paper_trade:
+            return ['BTCINR', 'ETHINR', 'XRPINR']
+        try:
+            response = requests.get(f'{self.base_url}/exchange/v1/markets')
+            markets = response.json()
+            return [m for m in markets if m.endswith('INR')]
+        except Exception as e:
+            print(f"Error fetching markets: {e}")
+            return []
+
+    def get_ticker(self):
+        if self.paper_trade:
+            return [
+                {'market': 'BTCINR', 'last_price': 5000000, 'change_24_hour': '2.5', 'volume': 1000000},
+                {'market': 'ETHINR', 'last_price': 300000, 'change_24_hour': '-1.2', 'volume': 500000}
+            ]
+        try:
+            response = requests.get(f'{self.base_url}/exchange/ticker')
+            return response.json()
+        except Exception as e:
+            print(f"Error fetching ticker: {e}")
+            return []
+
+    def get_candles(self, pair, interval='1m', limit=100):
+        if self.paper_trade:
+            np.random.seed(42)
+            closes = np.cumsum(np.random.randn(limit)) + 100
+            return [[int(time.time()*1000 - i*60*1000), closes[i], closes[i]+0.1, closes[i]-0.1, closes[i], 10] for i in range(limit-1, -1, -1)]
+        try:
+            response = requests.get(f'{self.base_url}/market_data/candles?pair={pair}&interval={interval}')
+            return response.json()
+        except Exception as e:
+            print(f"Error fetching candles for {pair}: {e}")
+            return []
+
+    def get_balance(self):
+        if self.paper_trade:
+            return self.balances
+        try:
+            body = {}
+            json_body, signature = self._generate_signature(body)
+            headers = {
+                'Content-Type': 'application/json',
+                'X-AUTH-APIKEY': self.api_key,
+                'X-AUTH-SIGNATURE': signature
+            }
+            response = requests.post(f'{self.base_url}/exchange/v1/users/balances', data=json_body, headers=headers)
+            data = response.json()
+            balances = {item['currency']: float(item['balance']) for item in data}
+            self.balances.update(balances)
+            return balances
+        except Exception as e:
+            print(f"Error fetching balance: {e}")
+            return {}
+
+    def place_order(self, side, order_type, market, total_quantity, price_per_unit=None):
+        if self.paper_trade:
+            order_id = len(self.orders) + 1
+            ticker = self.get_ticker_for_pair(market)
+            price = price_per_unit or float(ticker['last_price']) if ticker else 100
+            order = {
+                'id': order_id, 'side': side, 'type': order_type, 'market': market,
+                'quantity': total_quantity, 'price': price, 'status': 'filled',
+                'timestamp': int(time.time() * 1000)
+            }
+            self.orders.append(order)
+            if side == 'buy':
+                cost = total_quantity * price * 1.001
+                self.balances['INR'] -= cost
+                coin = market[:-3]
+                self.balances[coin] = self.balances.get(coin, 0) + total_quantity
+            else:
+                proceeds = total_quantity * price * 0.999
+                self.balances['INR'] += proceeds
+                coin = market[:-3]
+                self.balances[coin] = self.balances.get(coin, 0) - total_quantity
+            self.trades.append({'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'pair': market, 'action': side, 'pnl': 0})
+            return order
+        try:
+            body = {'side': side, 'order_type': order_type, 'market': market, 'total_quantity': total_quantity}
+            if price_per_unit:
+                body['price_per_unit'] = price_per_unit
+            json_body, signature = self._generate_signature(body)
+            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': self.api_key, 'X-AUTH-SIGNATURE': signature}
+            response = requests.post(f'{self.base_url}/exchange/v1/orders/create', data=json_body, headers=headers)
+            return response.json()
+        except Exception as e:
+            print(f"Error placing order: {e}")
+            return None
+
+    def get_ticker_for_pair(self, pair):
+        tickers = self.get_ticker()
+        for t in tickers:
+            if t['market'] == pair:
+                return t
+        return None
+
+# Strategy (unchanged)
 def calculate_rsi(closes, period=14):
     df = pd.DataFrame({'close': closes})
     df['rsi'] = ta.rsi(df['close'], length=period)
     return df['rsi'].iloc[-1]
 
 def select_interval(volatility):
-    if volatility > 0.05:
-        return '1m'
-    elif volatility > 0.02:
-        return '5m'
-    else:
-        return '15m'
+    if volatility > 0.05: return '1m'
+    elif volatility > 0.02: return '5m'
+    else: return '15m'
 
 def get_signal(candles):
     df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -86,7 +181,7 @@ def find_best_pair(api, capital, fee_rate=0.001):
         return candidates[0][0]['market']
     return None
 
-# Keepalive thread
+# Threads
 def keepalive():
     while True:
         try:
@@ -95,7 +190,6 @@ def keepalive():
             pass
         time.sleep(240)
 
-# Bot loop (modified for global state)
 def bot_loop(api):
     global bot_running, trades_df, last_scan, last_update, capital
     while bot_running:
@@ -137,28 +231,31 @@ async def dashboard(request: Request):
     status = "🟢 Running" if bot_running else "🔴 Stopped"
     last_scan_str = last_scan.strftime('%Y-%m-%d %H:%M:%S') if last_scan else "N/A"
     last_update_str = last_update.strftime('%Y-%m-%d %H:%M:%S') if last_update else "N/A"
+    portfolio_rows = ''.join(f'<tr><td>{row["Coin"]}</td><td>{row["Balance"]:.4f}</td></tr>' for row in portfolio) or '<tr><td colspan="2">No holdings</td></tr>'
+    trades_rows = ''.join(f'<tr><td>{row["Time"]}</td><td>{row["Pair"]}</td><td>{row["Action"]}</td><td>{row["PnL"]}</td></tr>' for _, row in trades_df.iterrows()) or '<tr><td colspan="4">No trades yet</td></tr>'
     
     html_content = f"""
     <!DOCTYPE html>
     <html>
-    <head><title>ENGINE_PRO_v2.5</title><meta charset="UTF-8"></head>
-    <body style="font-family: Arial; background: #000; color: #fff; padding: 20px;">
+    <head>
+        <title>ENGINE_PRO_v2.5</title>
+        <meta charset="UTF-8">
+        <meta http-equiv="refresh" content="30">  <!-- Auto-refresh every 30s -->
+        <style>body {{ font-family: Arial; background: #000; color: #fff; padding: 20px; }} table {{ border-collapse: collapse; width: 100%; }} th, td {{ border: 1px solid #fff; padding: 8px; text-align: left; }} form {{ margin: 10px 0; }}</style>
+    </head>
+    <body>
         <h1>ENGINE_PRO_v2.5</h1>
         <p>Current Time (IST): {ist_now.strftime('%Y-%m-%d %H:%M:%S')}</p>
-        <p>Bot Status: {status}</p>
-        <p>Last Scan (IST): {last_scan_str} | Last Update (IST): {last_update_str}</p>
+        <p>Bot Status: {status} | Last Scan: {last_scan_str} | Last Update: {last_update_str}</p>
         
         <form method="post" action="/set_params">
-            <label>Capital (INR): <input type="number" name="capital" value="{capital}" step="1000"></label><br>
-            <label>Paper Mode: <input type="checkbox" name="paper_trade" {'checked' if paper_trade else ''}></label><br>
+            Capital (INR): <input type="number" name="capital" value="{capital}" step="1000"><br>
+            Paper Mode: <input type="checkbox" name="paper_trade" {'checked' if paper_trade else ''} value="on"><br>
             <input type="submit" value="Update">
         </form>
         
         <h3>Portfolio</h3>
-        <table border="1" style="color: #fff;">
-            <tr><th>Coin</th><th>Balance</th></tr>
-            {' '.join(f'<tr><td>{row["Coin"]}</td><td>{row["Balance"]}</td></tr>' for row in portfolio)}
-        </table>
+        <table><tr><th>Coin</th><th>Balance</th></tr>{portfolio_rows}</table>
         
         <h3>Controls</h3>
         <form method="post" action="/start_bot"><input type="submit" value="Start Bot"></form>
@@ -166,23 +263,21 @@ async def dashboard(request: Request):
         <form method="post" action="/keepalive"><input type="submit" value="Start Keepalive"></form>
         
         <h3>Trades</h3>
-        <table border="1" style="color: #fff;">
-            <tr><th>Time</th><th>Pair</th><th>Action</th><th>PnL</th></tr>
-            {' '.join(f'<tr><td>{row["Time"]}</td><td>{row["Pair"]}</td><td>{row["Action"]}</td><td>{row["PnL"]}</td></tr>' for _, row in trades_df.iterrows()) or '<tr><td colspan="4">No trades yet</td></tr>'}
-        </table>
-        <p><a href="/">Refresh (every 30s manually)</a></p>
+        <table><tr><th>Time</th><th>Pair</th><th>Action</th><th>PnL</th></tr>{trades_rows}</table>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
 
 @app.post("/set_params")
-async def set_params(capital: float = Form(...), paper_trade: bool = Form(False)):
-    global capital_global, paper_trade_global  # Update globals
+async def set_params(request: Request, capital: float = Form(10000.0), paper_trade: str = Form("off")):
+    global capital, paper_trade
     capital = float(capital)
-    paper_trade = paper_trade == "on"  # Checkbox hack
+    paper_trade = paper_trade == "on"
     api.paper_trade = paper_trade
-    return {"status": "Updated", "capital": capital, "paper": paper_trade}
+    if paper_trade:
+        api.balances['INR'] = capital
+    return HTMLResponse(content=f"<p>Updated: Capital ₹{capital}, Paper: {paper_trade}</p><a href='/'>Back</a>")
 
 @app.post("/start_bot")
 async def start_bot():
@@ -190,19 +285,19 @@ async def start_bot():
     if not bot_running:
         bot_running = True
         threading.Thread(target=bot_loop, args=(api,), daemon=True).start()
-    return {"status": "Bot started"}
+    return HTMLResponse(content="<p>Bot started!</p><a href='/'>Back</a>")
 
 @app.post("/stop_bot")
 async def stop_bot():
     global bot_running
     bot_running = False
-    return {"status": "Bot stopped"}
+    return HTMLResponse(content="<p>Bot stopped!</p><a href='/'>Back</a>")
 
 @app.post("/keepalive")
 async def start_keepalive():
     threading.Thread(target=keepalive, daemon=True).start()
-    return {"status": "Keepalive started"}
+    return HTMLResponse(content="<p>Keepalive started!</p><a href='/'>Back</a>")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
