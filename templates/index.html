@@ -1,146 +1,83 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html>
 <head>
-  <meta charset="utf-8" />
-  <title>CoinDCX Auto Trader</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f7f7f7; --border:#e5e5e5; }
-    body { margin:20px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:var(--fg); background:var(--bg); }
-    h2 { margin: 0 0 12px; }
-    .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    .card { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--bg); min-width:260px; }
-    button { padding:8px 14px; border:1px solid var(--border); background:#fff; border-radius:8px; cursor:pointer; }
-    button:hover { background:#fafafa; }
-    pre { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px; max-height:300px; overflow:auto; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); background:#fff; font-size:12px; color:var(--muted); }
-  </style>
+
+<title>CoinDCX AI Trading Bot</title>
+
+<style>
+
+body{
+font-family:Arial;
+background:#0f172a;
+color:white;
+text-align:center;
+}
+
+.container{
+margin-top:40px;
+}
+
+.card{
+background:#1e293b;
+padding:20px;
+margin:15px;
+border-radius:10px;
+display:inline-block;
+width:200px;
+}
+
+.signal{
+font-size:28px;
+font-weight:bold;
+}
+
+.buy{color:#22c55e}
+.sell{color:#ef4444}
+.hold{color:#eab308}
+
+</style>
+
 </head>
+
 <body>
-  <h2>CoinDCX Auto Trader <span class="pill" id="lblEpoch">—</span></h2>
 
-  <div class="row" style="margin-bottom:10px">
-    <button id="btnStart">Start</button>
-    <button id="btnStop">Stop</button>
-    <span>Status: <b id="lblStatus">Idle</b></span>
-    <span>Last: <span id="lblLast">—</span></span>
-  </div>
+<h1>CoinDCX AI Trading Dashboard</h1>
 
-  <div class="row" style="margin-bottom:16px">
-    <div class="card">
-      <div>USDT: <b id="lblUSDT">0.00</b></div>
-      <div>Today P&L (USDT): <b id="lblPNLT">0.00</b></div>
-      <div>Yesterday P&L (USDT): <b id="lblPNLY">0.00</b></div>
-      <div>Total P&L (USDT): <b id="lblPNLAll">0.00</b></div>
-    </div>
-  </div>
+<div class="container" id="signals"></div>
 
-  <h3>Scans (latest 30)</h3>
-  <pre id="scanLog">—</pre>
+<script>
 
-  <h3>Trades (latest 10)</h3>
-  <pre id="tradeLog">—</pre>
+async function loadSignals(){
 
-  <script>
-    // --- basic Start/Stop buttons ---
-    document.getElementById('btnStart').onclick = async () => {
-      try { const r = await fetch('/start', { method:'POST' }); console.log('start', await r.json()); } catch(e){ console.warn(e); }
-    };
-    document.getElementById('btnStop').onclick = async () => {
-      try { const r = await fetch('/stop', { method:'POST' }); console.log('stop', await r.json()); } catch(e){ console.warn(e); }
-    };
+let res = await fetch('/signals')
 
-    // --- watchdog + keepalive ---
-    (() => {
-      const PING_MS = 60 * 1000;     // ping /ping to keep the dyno warm
-      const CHECK_MS = 60 * 1000;    // poll /status cadence
-      const STALE_SEC = 120;         // if heartbeat older than this -> auto-start
-      const START_RETRY_MS = 10 * 1000;
+let data = await res.json()
 
-      let lastEpoch = 0;
+let html = ""
 
-      async function safeFetch(url, opts = {}, timeoutMs = 8000) {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), timeoutMs);
-        try {
-          const res = await fetch(url, { keepalive: true, signal: ctrl.signal, ...opts });
-          clearTimeout(t);
-          return res;
-        } catch (e) {
-          clearTimeout(t);
-          throw e;
-        }
-      }
+for (let s in data){
 
-      async function keepAlive() {
-        try { await safeFetch('/ping', {}, 4000); } catch (_) {}
-      }
+let sig = data[s]
 
-      async function startScanner() {
-        try {
-          const res = await safeFetch('/start', { method:'POST' }, 6000);
-          console.log('[auto-start]', await res.json());
-        } catch (e) {
-          console.warn('[auto-start] failed, retrying', e);
-          setTimeout(startScanner, START_RETRY_MS);
-        }
-      }
+let cls = sig.toLowerCase()
 
-      function renderStatus(d) {
-        document.getElementById('lblStatus').textContent = d.status || '—';
-        document.getElementById('lblLast').textContent = d.last || '—';
-        document.getElementById('lblUSDT').textContent = Number(d.usdt ?? 0).toFixed(2);
-        document.getElementById('lblPNLT').textContent = Number(d.profit_today ?? 0).toFixed(2);
-        document.getElementById('lblPNLY').textContent = Number(d.profit_yesterday ?? 0).toFixed(2);
-        document.getElementById('lblPNLAll').textContent = Number(d.pnl_cumulative ?? 0).toFixed(2);
-        document.getElementById('lblEpoch').textContent = d.status_epoch ? `hb:${d.status_epoch}` : '—';
+html += `
+<div class="card">
+<h2>${s}</h2>
+<div class="signal ${cls}">${sig}</div>
+</div>
+`
+}
 
-        const scans = Array.isArray(d.scans) ? d.scans.join('\n') : '';
-        const trades = Array.isArray(d.trades) ? d.trades.map(t => {
-          try { return JSON.stringify(t); } catch { return String(t); }
-        }).join('\n') : '';
-        document.getElementById('scanLog').textContent = scans || '—';
-        document.getElementById('tradeLog').textContent = trades || '—';
-      }
+document.getElementById("signals").innerHTML = html
 
-      async function checkStatusAndAutostart() {
-        try {
-          const res = await safeFetch('/status', {}, 8000);
-          if (!res.ok) throw new Error('status not ok');
-          const data = await res.json();
-          renderStatus(data);
+}
 
-          const nowSec = Math.floor(Date.now() / 1000);
-          const epoch = Number(data.status_epoch || 0);
-          const isIdle = (data.status || '').toLowerCase() !== 'running';
-          const isStale = epoch && (nowSec - epoch > STALE_SEC);
+loadSignals()
 
-          if (isIdle || isStale) {
-            console.log('[watchdog] idle/stale -> auto-start', { isIdle, isStale, epoch });
-            startScanner();
-          }
-          lastEpoch = epoch || lastEpoch;
-        } catch (e) {
-          console.warn('[watchdog] /status failed; nudging /start', e);
-          setTimeout(startScanner, START_RETRY_MS);
-        }
-      }
+setInterval(loadSignals,10000)
 
-      // initial kicks
-      keepAlive();
-      checkStatusAndAutostart();
-      startScanner();
+</script>
 
-      // repeaters
-      setInterval(keepAlive, PING_MS);
-      setInterval(checkStatusAndAutostart, CHECK_MS);
-
-      // on tab focus (when mobile wakes)
-      window.addEventListener('focus', () => {
-        keepAlive();
-        checkStatusAndAutostart();
-      });
-    })();
-  </script>
 </body>
 </html>
