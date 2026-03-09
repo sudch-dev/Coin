@@ -6,3 +6,4 @@ pandas_ta
 requests
 numpy
 jinja2
+python-multipart
