@@ -7,3 +7,4 @@ requests
 numpy
 jinja2
 python-multipart
+flask
