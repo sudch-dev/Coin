@@ -1,182 +1,49 @@
 <!DOCTYPE html>
 <html>
-
 <head>
-
-<title>CoinDCX Trading Dashboard</title>
-
-<style>
-
-body{
-background:#0f172a;
-color:white;
-font-family:Arial;
-text-align:center;
-}
-
-.card{
-background:#1e293b;
-padding:15px;
-margin:10px;
-display:inline-block;
-width:200px;
-border-radius:8px;
-}
-
-.buy{color:#22c55e}
-.sell{color:#ef4444}
-.hold{color:#eab308}
-
-button{
-padding:10px;
-margin:5px;
-border:none;
-border-radius:5px;
-cursor:pointer;
-}
-
-.panel{
-width:70%;
-margin:auto;
-background:#1e293b;
-padding:10px;
-height:150px;
-overflow:auto;
-text-align:left;
-margin-top:20px;
-}
-
-</style>
-
+    <title>CoinDCX Live Dashboard</title>
+    <meta http-equiv="refresh" content="30">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net">
+    <style>
+        body { background: #0b0e11; color: #eaecef; font-family: sans-serif; }
+        .card { background: #1e2329; border: 1px solid #474d57; color: white; margin-bottom: 20px; }
+        .log-container { height: 250px; overflow-y: auto; background: #000; color: #00ff00; font-family: monospace; padding: 10px; border-radius: 5px; }
+        .text-buy { color: #0ecb81; } .text-sell { color: #f6465d; }
+    </style>
 </head>
+<body class="container py-4">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>CoinDCX Bot <span class="badge bg-warning text-dark">{{ mode.upper() }}</span></h2>
+        <div class="text-muted">Last Sync: {{ state.last_sync }}</div>
+    </div>
 
-<body>
+    <div class="row">
+        {% for sym, price in state.prices.items() %}
+        <div class="col-md-4">
+            <div class="card p-3 shadow">
+                <h5>{{ sym }}</h5>
+                <h2 class="my-2">${{ price }}</h2>
+                <small class="text-muted">EMA5: {{ state.emas[sym].ema5 }} | EMA10: {{ state.emas[sym].ema10 }}</small>
+                <hr>
+                <div>Status: 
+                    {% if state.positions[sym] %}
+                        <b class="{{ 'text-buy' if state.positions[sym].side == 'BUY' else 'text-sell' }}">
+                            {{ state.positions[sym].side }} @ {{ state.positions[sym].price }}
+                        </b>
+                    {% else %}
+                        <span class="text-muted">FLAT</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
 
-<h1>CoinDCX AI Trading Terminal</h1>
-
-<a href="https://coindcx.com/exchange" target="_blank">
-Open CoinDCX Exchange
-</a>
-
-<br><br>
-
-Mode:
-<select id="modeToggle" onchange="setMode()">
-<option value="paper">Paper</option>
-<option value="live">Live</option>
-</select>
-
-<br><br>
-
-<button onclick="startBot()">Start Bot</button>
-<button onclick="stopBot()">Stop Bot</button>
-<button onclick="loadAll()">Refresh</button>
-
-<h2>Market Signals</h2>
-
-<div id="market"></div>
-
-<h2>Trade Log</h2>
-<div class="panel" id="tradeLog"></div>
-
-<h2>Error Log</h2>
-<div class="panel" id="errorLog"></div>
-
-<script>
-
-async function loadSignals(){
-
-let res=await fetch("/signals")
-let data=await res.json()
-
-let html=""
-
-for(let s in data){
-
-let price=await fetch("/price/"+s)
-let p=await price.json()
-
-let sig=data[s]
-
-html+=`
-<div class="card">
-
-<h3>${s}</h3>
-
-<div>₹ ${p.price}</div>
-
-<div class="${sig.toLowerCase()}">${sig}</div>
-
-</div>
-`
-}
-
-document.getElementById("market").innerHTML=html
-
-}
-
-
-async function loadTradeLog(){
-
-let r=await fetch("/trade_log")
-let d=await r.json()
-
-document.getElementById("tradeLog").innerHTML=d.join("<br>")
-}
-
-async function loadErrorLog(){
-
-let r=await fetch("/error_log")
-let d=await r.json()
-
-document.getElementById("errorLog").innerHTML=d.join("<br>")
-}
-
-async function startBot(){
-
-await fetch("/start")
-alert("Bot Started")
-}
-
-async function stopBot(){
-
-await fetch("/stop")
-alert("Bot Stopped")
-}
-
-async function setMode(){
-
-let mode=document.getElementById("modeToggle").value
-
-await fetch("/mode",{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({mode:mode})
-})
-
-}
-
-async function loadMode(){
-
-let r=await fetch("/mode")
-let d=await r.json()
-
-document.getElementById("modeToggle").value=d.mode
-}
-
-function loadAll(){
-
-loadSignals()
-loadTradeLog()
-loadErrorLog()
-}
-
-loadMode()
-loadAll()
-
-setInterval(loadAll,10000)
-
-</script>
-
+    <h4>Terminal Logs</h4>
+    <div class="log-container border border-secondary">
+        {% for log in state.logs %}
+            <div>> {{ log }}</div>
+        {% endfor %}
+    </div>
 </body>
 </html>
